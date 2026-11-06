@@ -87,7 +87,13 @@
 
 ### 安装到 DSH
 
-克隆或下载本仓库后，在 DSH 会话中调用：
+推荐直接从 GitHub 安装：
+
+```bash
+dsh plugin --profile <你的 profile> add github:xiayifan1024/dsh-pdf-math-reader
+```
+
+也可以克隆仓库后使用本地 bundle：
 
 ```text
 plugin_manager install_bundle target=<本仓库绝对路径>
@@ -218,19 +224,22 @@ npm test
 由 DSH 浏览器模块表提供。
 
 ```text
-index.js                 Host：静态资源 / 翻译 / 问答 / Skill / 安全校验
+index.js                 Host 插件入口：路由、模型调用、Skill、安全校验
+lib/                     可独立测试的 Host 纯函数（翻译/问答提示词与解析）
 src/plugin.jsx           主面板、阅读器、笔记、AI 阅读交互
 src/pdf.js               PDF.js 加载、文本重建、缩略图、目录
 src/api.js               同源 HTTP API 客户端
 src/locales.js           中英文界面文案
 src/styles.js            使用 --dsw-alias-* 主题 token 的样式
 assets/                  PDF.js 4.10.38、CMaps、标准字体（Apache-2.0）
+tests/                   node:test 纯函数单测
 scripts/                 构建与 Node 侧冒烟测试
 client.js                构建产物
 ```
 
 测试覆盖：
 
+- `node:test` 纯函数单测：翻译 JSON 严格解析、术语表、批次切分、问答历史与提示词。
 - Host 路由、翻译 JSON 严格解析、Skill 读取、资源路径越界、客户端断开取消。
 - 客户端模块加载器包装与 Slot 注册。
 - 相邻文本片段拼接、双栏段落边界。

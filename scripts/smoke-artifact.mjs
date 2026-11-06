@@ -6,7 +6,7 @@ let definition
 const window = { __ModuleLoader__: { load(value) { definition = value } } }
 const sandbox = { window, console, setTimeout, clearTimeout, URL, Blob, fetch, document: {}, navigator: {} }
 vm.runInNewContext(code, sandbox, { filename: 'client.js' })
-assert.equal(definition.id, '@local/pdf-math-reader')
+assert.equal(definition.id, 'dsh-pdf-math-reader')
 const React = {
   Component: class {},
   createElement() {},

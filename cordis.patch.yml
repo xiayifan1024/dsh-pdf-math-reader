@@ -1,6 +1,6 @@
 - insert:
     - id: pdf-math-reader
-      name: '@local/pdf-math-reader'
+      name: 'dsh-pdf-math-reader'
       config:
         maxSegmentsPerRequest: 5
         maxCharsPerRequest: 3800
