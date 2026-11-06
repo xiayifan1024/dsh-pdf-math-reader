@@ -1,0 +1,7 @@
+- insert:
+    - id: pdf-math-reader
+      name: '@local/pdf-math-reader'
+      config:
+        maxSegmentsPerRequest: 5
+        maxCharsPerRequest: 3800
+        timeoutMs: 180000

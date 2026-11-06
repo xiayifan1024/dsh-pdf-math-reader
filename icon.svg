@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="PDF reader and translator">
+  <defs>
+    <linearGradient id="bg" x1="16" y1="10" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#0e7490"/>
+    </linearGradient>
+    <linearGradient id="page" x1="40" y1="26" x2="92" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e6f2ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#bg)"/>
+  <path d="M34 24h38l22 22v58a4 4 0 0 1-4 4H34a4 4 0 0 1-4-4V28a4 4 0 0 1 4-4z" fill="url(#page)"/>
+  <path d="M72 24v18a4 4 0 0 0 4 4h18" fill="#bfdbfe"/>
+  <path d="M44 58h28M44 68h22M44 78h16" stroke="#1e3a8a" stroke-width="4" stroke-linecap="round" opacity=".8"/>
+  <path d="M62 96l10-22 10 22M66 89h12" stroke="#0891b2" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M92 58v8m0 0-4-4m4 4 4-4" stroke="#f59e0b" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="102" cy="48" r="12" fill="#f59e0b" opacity=".16"/>
+  <path d="M99 44l4 4 4-4M103 48v9" stroke="#f59e0b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "PDF reader and translator",
+    "description": "Read PDFs locally, translate papers paragraph by paragraph with formula-safe prompts, and run whole-document translation."
+  },
+  "panel": {
+    "title": "PDF reader"
+  }
+}
