@@ -13,6 +13,14 @@
     "translation",
     "pdfjs"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiayifan1024/dsh-pdf-math-reader.git"
+  },
+  "homepage": "https://github.com/xiayifan1024/dsh-pdf-math-reader",
+  "bugs": {
+    "url": "https://github.com/xiayifan1024/dsh-pdf-math-reader/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

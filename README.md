@@ -1,13 +1,15 @@
-# PDF Math Reader
+# dsh-pdf-math-reader
 
-> 在 DeepSeek Harness 中阅读、翻译、记笔记与 AI 问答一体化的学术 PDF 工作台。
+> PDF Math Reader — 在 DeepSeek Harness 中阅读、翻译、记笔记与 AI 问答一体化的学术 PDF 工作台。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PDF.js](https://img.shields.io/badge/PDF.js-4.10.38-orange)](assets/PDFJS-LICENSE)
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-plugin-4f46e5)](https://github.com/deepseek-ai/deepseek-harness)
+[![GitHub](https://img.shields.io/badge/GitHub-xiayifan1024%2Fdsh--pdf--math--reader-181717?logo=github)](https://github.com/xiayifan1024/dsh-pdf-math-reader)
 
-PDF Math Reader 是一个运行在 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-Web UI 中的 PDF 阅读与学术翻译插件。设计参考
+**dsh-pdf-math-reader**（界面名称：PDF Math Reader）是一个运行在
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web UI 中的 PDF
+阅读与学术翻译插件。设计参考
 [PDFMathTranslate](https://github.com/PDFMathTranslate/PDFMathTranslate)
 “保持公式、引用与版式语义”的学术文档阅读思路，但以 **本地阅读 + 段落级双语对照**
 的方式落地，不修改原 PDF。
@@ -94,7 +96,7 @@ plugin_manager install_bundle target=<本仓库绝对路径>
 例如：
 
 ```text
-plugin_manager install_bundle target=D:\plugins\pdf-math-reader
+plugin_manager install_bundle target=D:\plugins\dsh-pdf-math-reader
 ```
 
 安装成功后，侧边栏会出现「PDF 阅读」图标。若安装前 Web UI 已经打开，请刷新页面
