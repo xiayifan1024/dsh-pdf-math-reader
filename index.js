@@ -26,7 +26,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ASSETS = join(HERE, 'assets')
 const ROUTE = '/pdf-reader'
 const ASSET_PREFIX = '/pdf-reader/assets/'
-const VERSION = '1.1.0'
+const VERSION = '1.2.0'
 
 const DEFAULTS = {
   provider: '',
