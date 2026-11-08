@@ -176,7 +176,9 @@ var PdfMathReaderPlugin = (() => {
     file: ["M6 3h8l5 5v13H6z", "M14 3v5h5"],
     refresh: ["M20 7v5h-5", "M4 17v-5h5", "M6.1 8a7 7 0 0 1 11.5-1L20 12", "M4 12l2.4 5a7 7 0 0 0 11.5-1"],
     search: ["M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z", "M16 16l4.5 4.5"],
-    quote: ["M7 7h4v4H7z", "M13 7h4v4h-4z", "M7 11v4a2 2 0 0 0 2 2", "M13 11v4a2 2 0 0 0 2 2"]
+    quote: ["M7 7h4v4H7z", "M13 7h4v4h-4z", "M7 11v4a2 2 0 0 0 2 2", "M13 11v4a2 2 0 0 0 2 2"],
+    crop: ["M4 4h5", "M15 4h5", "M4 20h5", "M15 20h5", "M4 9v6", "M20 9v6"],
+    expand: ["M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5"]
   };
   function Icon({ name, size = 18, strokeWidth = 1.7, style, ...rest }) {
     const paths = PATHS[name] ?? PATHS.file;
@@ -198,6 +200,835 @@ var PdfMathReaderPlugin = (() => {
         children: paths.map((d, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d }, index))
       }
     );
+  }
+
+  // src/equations.js
+  var MATH_SYMBOL_SOURCE = "[=+\\u2212\\u00d7\\u00f7\\u00b1\\u2213\\u2211\\u220f\\u222b\\u222e\\u221a\\u221e\\u2202\\u2207\\u2248\\u2243\\u2264\\u2265\\u2260\\u2261\\u223c\\u226a\\u226b\\u2192\\u2190\\u2194\\u21d2\\u21d4\\u2208\\u2209\\u220b\\u2282\\u2283\\u2286\\u2287\\u222a\\u2229\\u2200\\u2203\\u22c5\\u00b7\\u2218\\u2297\\u2295\\u0394\\u03a9\\u0393\\u039b\\u0398\\u03a3\\u03a6\\u03a8\\u03b1-\\u03c9]";
+  var MATH_SYMBOL_RE = new RegExp(MATH_SYMBOL_SOURCE, "u");
+  var MATH_SYMBOL_RE_GLOBAL = new RegExp(MATH_SYMBOL_SOURCE, "gu");
+  var EQUATION_NUMBER_RE = /^[(（]\s*[0-9]{1,3}[a-zA-Z]?\s*[)）]$/;
+  var SECTION_NUMBER_RE = /^[0-9]+(?:\.[0-9]+)+$/;
+  var CORE_EQUATION_RE = /[=≈≃≠≤≥<>→←↔⇒⇔∈∉∋⊂⊃⊆⊇∑∏∫∮√∂∇≡∼≪≫]/u;
+  var CJK_RE = /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3040-\u30ff\uac00-\ud7af]/;
+  var PROSE_STOP_WORDS = /* @__PURE__ */ new Set([
+    "a",
+    "an",
+    "the",
+    "of",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "in",
+    "on",
+    "at",
+    "to",
+    "from",
+    "by",
+    "for",
+    "with",
+    "as",
+    "and",
+    "or",
+    "but",
+    "not",
+    "no",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+    "we",
+    "you",
+    "they",
+    "he",
+    "she",
+    "his",
+    "her",
+    "their",
+    "our",
+    "has",
+    "have",
+    "had",
+    "can",
+    "could",
+    "should",
+    "would",
+    "may",
+    "might",
+    "will",
+    "shall",
+    "do",
+    "does",
+    "did",
+    "i",
+    "if",
+    "then",
+    "than",
+    "so",
+    "such",
+    "all",
+    "any",
+    "each",
+    "other",
+    "into",
+    "over",
+    "under",
+    "between",
+    "about",
+    "after",
+    "before",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "whose",
+    "why",
+    "how",
+    "both",
+    "more",
+    "most",
+    "some",
+    "only",
+    "also",
+    "very",
+    "just"
+  ]);
+  var MATH_FUNCTION_RE = /^(?:sin|cos|tan|cot|sec|csc|log|ln|exp|max|min|arg|lim|sup|inf|det|dim|rank|tr|diag|softmax|relu|sigmoid)$/u;
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+  function isEquationNumber(text) {
+    return EQUATION_NUMBER_RE.test(String(text ?? "").trim());
+  }
+  function countMathSymbols(text) {
+    MATH_SYMBOL_RE_GLOBAL.lastIndex = 0;
+    let count = 0;
+    for (const _match of String(text ?? "").matchAll(MATH_SYMBOL_RE_GLOBAL)) count += 1;
+    return count;
+  }
+  function looksLikeProse(text) {
+    return /[A-Za-z\u00c0-\u024f]{3,}\s+[A-Za-z\u00c0-\u024f]{3,}/u.test(text);
+  }
+  function isMathToken(text) {
+    const value = text.replace(/^[([{]+/u, "").replace(/[)\]}]+$/u, "").replace(/[.,;:]+$/u, "");
+    if (value === "") return false;
+    if (PROSE_STOP_WORDS.has(value.toLowerCase())) return false;
+    if (MATH_SYMBOL_RE.test(value)) return true;
+    if (/^[A-Za-z\u0370-\u03ff]$/u.test(value)) return true;
+    if (/^[\u0370-\u03ff]{1,3}$/u.test(value)) return true;
+    if (/^\d+(?:[.,]\d+)?$/u.test(value)) return true;
+    if (/^[A-Za-z][A-Za-z0-9]*\d[A-Za-z0-9]*$/u.test(value)) return true;
+    if (/^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+$/u.test(value)) return true;
+    if (/^[A-Z]{2,3}$/u.test(value)) return true;
+    if (MATH_FUNCTION_RE.test(value.toLowerCase())) return true;
+    if (/^[()[\]{},:]+$/u.test(text)) return true;
+    return false;
+  }
+  function splitTextAtom(atom) {
+    const text = String(atom.text ?? "");
+    if (text.trim() === "" || !MATH_SYMBOL_RE.test(text)) return [atom];
+    const tokens = [];
+    const tokenPattern = /\S+/gu;
+    let match;
+    while ((match = tokenPattern.exec(text)) !== null) {
+      tokens.push({
+        text: match[0],
+        start: match.index,
+        end: match.index + match[0].length
+      });
+    }
+    if (tokens.length < 2) return [atom];
+    if (!tokens.some((token) => /^[A-Za-z\u00c0-\u024f]{3,}$/u.test(token.text))) {
+      return [atom];
+    }
+    const mathTokens = /* @__PURE__ */ new Set();
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (MATH_SYMBOL_RE.test(tokens[index].text)) mathTokens.add(index);
+    }
+    if (mathTokens.size === 0) return [atom];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let index = 0; index < tokens.length; index += 1) {
+        if (mathTokens.has(index)) continue;
+        const adjacent = mathTokens.has(index - 1) || mathTokens.has(index + 1);
+        if (adjacent && isMathToken(tokens[index].text)) {
+          mathTokens.add(index);
+          changed = true;
+        }
+      }
+    }
+    const groups = [];
+    let group;
+    let previous = -2;
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (!mathTokens.has(index)) {
+        group = void 0;
+        previous = -2;
+        continue;
+      }
+      if (group !== void 0 && previous === index - 1) {
+        group.end = tokens[index].end;
+      } else {
+        group = { start: tokens[index].start, end: tokens[index].end };
+        groups.push(group);
+      }
+      previous = index;
+    }
+    if (groups.length === 0) return [atom];
+    const segments = [];
+    let cursor = 0;
+    for (const current of groups) {
+      if (current.start > cursor) {
+        segments.push({ text: text.slice(cursor, current.start), math: false });
+      }
+      segments.push({ text: text.slice(current.start, current.end), math: true });
+      cursor = current.end;
+    }
+    if (cursor < text.length) {
+      segments.push({ text: text.slice(cursor), math: false });
+    }
+    if (segments.length < 2) return [atom];
+    const originalWidth = atom.width > 0 ? atom.width : text.length * Math.max(1, atom.height) * 0.48;
+    const charWidth = originalWidth / text.length;
+    let offset = 0;
+    const sourceIndex = atom.sourceIndex ?? atom.index;
+    return segments.map((segment, position) => {
+      const start = offset;
+      offset += segment.text.length;
+      return {
+        ...atom,
+        index: atom.index + (position + 1) / (segments.length + 1),
+        sourceIndex,
+        text: segment.text,
+        x: atom.x + charWidth * start,
+        endX: atom.x + charWidth * offset,
+        width: charWidth * (offset - start),
+        top: atom.top,
+        bottom: atom.bottom,
+        height: atom.height,
+        fontName: atom.fontName
+      };
+    });
+  }
+  function horizontalOverlapRatio(left, right) {
+    const width = Math.min(left[2], right[2]) - Math.max(left[0], right[0]);
+    const smaller = Math.min(left[2] - left[0], right[2] - right[0]);
+    if (width <= 0 || smaller <= 0) return 0;
+    return width / smaller;
+  }
+  function median(values, fallback) {
+    if (!Array.isArray(values) || values.length === 0) return fallback;
+    const sorted = [...values].sort((left, right) => left - right);
+    return sorted[Math.floor(sorted.length / 2)];
+  }
+  function unionBox(boxes) {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (const box of boxes) {
+      if (box === null || box === void 0) continue;
+      x0 = Math.min(x0, box[0]);
+      y0 = Math.min(y0, box[1]);
+      x1 = Math.max(x1, box[2]);
+      y1 = Math.max(y1, box[3]);
+    }
+    if (!Number.isFinite(x0)) return [0, 0, 0, 0];
+    return [x0, y0, x1, y1];
+  }
+  function expandBox(box, padding, pageWidth, pageHeight) {
+    const left = Math.max(0, box[0] - padding);
+    const top = Math.max(0, box[1] - padding);
+    const right = pageWidth === void 0 ? box[2] + padding : Math.min(pageWidth, box[2] + padding);
+    const bottom = pageHeight === void 0 ? box[3] + padding : Math.min(pageHeight, box[3] + padding);
+    return [left, top, Math.max(left + 0.5, right), Math.max(top + 0.5, bottom)];
+  }
+  function boxArea(box) {
+    return Math.max(0, box[2] - box[0]) * Math.max(0, box[3] - box[1]);
+  }
+  function intersectionArea(left, right) {
+    const width = Math.max(0, Math.min(left[2], right[2]) - Math.max(left[0], right[0]));
+    const height = Math.max(0, Math.min(left[3], right[3]) - Math.max(left[1], right[1]));
+    return width * height;
+  }
+  function overlapRatio(left, right) {
+    const area = Math.min(boxArea(left), boxArea(right));
+    if (area <= 0) return 0;
+    return intersectionArea(left, right) / area;
+  }
+  function atomBox(atom) {
+    return [atom.x, atom.top, atom.endX, atom.bottom];
+  }
+  function dominantFont(atoms) {
+    const counts = /* @__PURE__ */ new Map();
+    for (const atom of atoms) {
+      const text = atom.text.trim();
+      if (text === "") continue;
+      counts.set(atom.fontName, (counts.get(atom.fontName) ?? 0) + text.length);
+    }
+    let best = void 0;
+    let bestCount = -1;
+    for (const [font, count] of counts) {
+      if (count > bestCount) {
+        best = font;
+        bestCount = count;
+      }
+    }
+    return best;
+  }
+  function bodyFontSize(atoms, fallback = 10) {
+    const heights = atoms.filter((atom) => atom.text.trim() !== "").map((atom) => atom.height).filter((height) => Number.isFinite(height) && height > 0);
+    const medianHeight = median(heights, fallback);
+    const tall = heights.filter((height) => height >= medianHeight * 0.85);
+    return median(tall, medianHeight);
+  }
+  function joinRowText(left, right) {
+    if (left === "") return right;
+    if (right === "") return left;
+    return `${left} ${right}`;
+  }
+  function rowText(items, bodySize) {
+    let text = "";
+    let previous;
+    for (const atom of items) {
+      const value = atom.text.trim();
+      if (value === "") continue;
+      if (previous === void 0) {
+        text = value;
+        previous = atom;
+        continue;
+      }
+      const gap = atom.x - previous.endX;
+      const space = gap > Math.max(1.2, Math.max(atom.height, previous.height) * 0.16);
+      text = space ? joinRowText(text, value) : `${text}${value}`;
+      previous = atom;
+    }
+    return text.replace(/\s+/g, " ").trim();
+  }
+  function buildTextRows(atoms, options = {}) {
+    const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
+    const rows = [];
+    let current;
+    const flush = () => {
+      if (current === void 0) return;
+      current.text = rowText(current.items, bodySize);
+      current.x = Math.min(...current.items.map((atom) => atom.x));
+      current.right = Math.max(...current.items.map((atom) => atom.endX));
+      current.top = Math.min(...current.items.map((atom) => atom.top));
+      current.bottom = Math.max(...current.items.map((atom) => atom.bottom));
+      current.height = current.bottom - current.top;
+      current.order = Math.min(...current.items.map((atom) => atom.index));
+      if (current.text !== "") rows.push(current);
+      current = void 0;
+    };
+    for (const atom of atoms) {
+      if (atom.text.trim() === "") continue;
+      const sameLine = current !== void 0 && Math.abs(atom.y - current.baseline) <= Math.max(1.2, Math.max(current.height, atom.height) * 0.55);
+      const backwards = current !== void 0 && atom.x < current.x - Math.max(2, bodySize * 2);
+      const nextIsNumber = isEquationNumber(atom.text);
+      const wideGap = current !== void 0 && atom.x - current.right > bodySize * 6 && !nextIsNumber;
+      if (!sameLine || backwards || wideGap) {
+        flush();
+      }
+      if (current === void 0) {
+        current = {
+          items: [atom],
+          x: atom.x,
+          right: atom.endX,
+          baseline: atom.y,
+          top: atom.top,
+          bottom: atom.bottom,
+          height: atom.height,
+          bodyChars: 0,
+          totalChars: 0
+        };
+      } else {
+        current.items.push(atom);
+        current.right = Math.max(current.right, atom.endX);
+        current.x = Math.min(current.x, atom.x);
+        current.top = Math.min(current.top, atom.top);
+        current.bottom = Math.max(current.bottom, atom.bottom);
+        current.height = current.bottom - current.top;
+      }
+    }
+    flush();
+    return rows;
+  }
+  function annotateRows(rows, atoms, bodyFont, bodySize) {
+    for (let position = 0; position < rows.length; position += 1) {
+      const row = rows[position];
+      row.items.sort((left, right) => left.x - right.x);
+      row.text = rowText(row.items, bodySize);
+      row.totalChars = row.items.reduce((sum, atom) => sum + atom.text.trim().length, 0);
+      row.bodyChars = row.items.reduce(
+        (sum, atom) => sum + (atom.fontName === bodyFont ? atom.text.trim().length : 0),
+        0
+      );
+      row.bodyRatio = row.totalChars === 0 ? 1 : row.bodyChars / row.totalChars;
+      row.mathSymbols = countMathSymbols(row.text);
+      row.scriptCount = row.items.filter(
+        (atom) => Math.abs(atom.y - row.baseline) > bodySize * 0.22 && atom.height <= bodySize * 0.96 && atom.text.trim() !== ""
+      ).length;
+      row.equationNumbers = [];
+      let previous;
+      for (const atom of row.items) {
+        if (isEquationNumber(atom.text)) {
+          const gap = previous === void 0 ? Infinity : atom.x - previous.endX;
+          if (gap > bodySize * 1.4 || previous === void 0) row.equationNumbers.push(atom);
+        }
+        previous = atom;
+      }
+      row.position = position;
+      for (const atom of row.items) atom.rowPosition = position;
+    }
+    for (const row of rows) {
+      let above = Number.POSITIVE_INFINITY;
+      let below = Number.POSITIVE_INFINITY;
+      let aboveRow;
+      let belowRow;
+      let overlapped = false;
+      for (const other of rows) {
+        if (other === row) continue;
+        if (horizontalOverlapRatio([row.x, 0, row.right, 0], [other.x, 0, other.right, 0]) < 0.05) {
+          continue;
+        }
+        const overlap = Math.min(row.bottom, other.bottom) - Math.max(row.top, other.top);
+        if (overlap > Math.max(0.6, Math.min(row.height, other.height) * 0.3)) {
+          overlapped = true;
+          continue;
+        }
+        if (other.top < row.top) {
+          const gap = row.top - other.bottom;
+          if (gap < above) {
+            above = gap;
+            aboveRow = other;
+          }
+        } else if (other.top > row.top) {
+          const gap = other.top - row.bottom;
+          if (gap < below) {
+            below = gap;
+            belowRow = other;
+          }
+        }
+      }
+      row.gapAbove = overlapped ? Number.NEGATIVE_INFINITY : above;
+      row.gapBelow = overlapped ? Number.NEGATIVE_INFINITY : below;
+      row.nearestAbove = aboveRow;
+      row.nearestBelow = belowRow;
+    }
+    return rows;
+  }
+  function detectColumns(rows, pageWidth) {
+    const single = [{ index: 0, x0: 0, x1: pageWidth, twoColumn: false }];
+    const bodyRows = rows.filter(
+      (row) => row.bodyRatio >= 0.5 && row.text.length >= 12 && row.right - row.x > pageWidth * 0.08
+    );
+    if (bodyRows.length < 8 || pageWidth <= 0) return single;
+    const center = pageWidth / 2;
+    const tolerance = pageWidth * 0.03;
+    const leftRows = [];
+    const rightRows = [];
+    const crossing = [];
+    for (const row of bodyRows) {
+      if (row.right <= center + tolerance) leftRows.push(row);
+      else if (row.x >= center - tolerance) rightRows.push(row);
+      else crossing.push(row);
+    }
+    if (leftRows.length < 3 || rightRows.length < 3 || crossing.length > Math.max(3, bodyRows.length * 0.25)) {
+      return single;
+    }
+    const leftEdge = median(leftRows.map((row) => row.x), 0);
+    const leftRight = median(leftRows.map((row) => row.right), center);
+    const rightLeft = median(rightRows.map((row) => row.x), center);
+    const rightEdge = median(rightRows.map((row) => row.right), pageWidth);
+    if (leftRight > center + pageWidth * 0.04 || rightLeft < center - pageWidth * 0.04) {
+      return single;
+    }
+    if (rightLeft - leftRight < pageWidth * 0.03) return single;
+    return [
+      { index: 0, x0: leftEdge, x1: leftRight, twoColumn: true },
+      { index: 1, x0: rightLeft, x1: rightEdge, twoColumn: true }
+    ];
+  }
+  function columnForX(x, columns, pageWidth) {
+    if (columns.length < 2) return columns[0];
+    const gutter = (columns[0].x1 + columns[1].x0) / 2;
+    return x <= gutter ? columns[0] : columns[1];
+  }
+  function rowIsMarker(row) {
+    if (SECTION_NUMBER_RE.test(row.text)) return true;
+    if (/^[0-9]{1,3}$/.test(row.text)) return true;
+    if (/^[ivxlcdm]{1,7}$/i.test(row.text)) return true;
+    return row.text.length < 2;
+  }
+  function bandStats(items, bodyFont, bodySize) {
+    const text = rowText(items, bodySize);
+    const totalChars = items.reduce((sum, atom) => sum + atom.text.trim().length, 0);
+    const bodyChars = items.reduce(
+      (sum, atom) => sum + (atom.fontName === bodyFont ? atom.text.trim().length : 0),
+      0
+    );
+    return {
+      text,
+      totalChars,
+      bodyRatio: totalChars === 0 ? 1 : bodyChars / totalChars,
+      mathSymbols: countMathSymbols(text),
+      hasMathFont: items.some((atom) => atom.fontName !== bodyFont),
+      scriptCount: items.filter((atom) => atom.height < bodySize * 0.85).length
+    };
+  }
+  function isMathDominantRow(row) {
+    return row.bodyRatio <= 0.45 && (row.mathSymbols >= 1 || row.scriptCount >= 1);
+  }
+  function numberedBand(row, atoms, bodyFont, bodySize, pageWidth, columns) {
+    const number = row.equationNumbers[0];
+    if (number === void 0) return void 0;
+    const column = columnForX(number.x, columns, pageWidth);
+    if (number.x < column.x0 - bodySize * 2 || number.x > column.x1 + bodySize * 3) {
+      return void 0;
+    }
+    const rightNeighbour = atoms.find(
+      (atom) => atom !== number && atom.text.trim() !== "" && Math.abs(atom.y - number.y) <= bodySize * 0.4 && atom.x >= number.endX - 0.5 && atom.x <= column.x1 + bodySize * 3
+    );
+    if (rightNeighbour !== void 0) return void 0;
+    const leftEdge = Math.max(0, column.x0 - bodySize * 2);
+    const band = atoms.filter(
+      (atom) => atom !== number && atom.text.trim() !== "" && atom.x >= leftEdge && atom.x < number.x && atom.endX >= column.x0 - bodySize * 2 && Math.abs(atom.y - number.y) <= bodySize * 0.55
+    );
+    if (band.length === 0) return void 0;
+    const stats = bandStats(band, bodyFont, bodySize);
+    if (stats.bodyRatio > 0.78) return void 0;
+    if (!stats.hasMathFont && stats.mathSymbols < 1) return void 0;
+    if (!CORE_EQUATION_RE.test(stats.text)) return void 0;
+    const leftAtoms = band.filter((atom) => atom.endX <= number.x + 0.5);
+    const nearestEnd = leftAtoms.length === 0 ? number.x : Math.max(...leftAtoms.map((atom) => atom.endX));
+    if (number.x - nearestEnd < bodySize * 2.5) return void 0;
+    return { number, band };
+  }
+  function unnumberedCandidate(row, bodySize, pageWidth, columns) {
+    if (row.equationNumbers.length > 0) return false;
+    if (rowIsMarker(row)) return false;
+    if (row.text.length > 110) return false;
+    const column = columnForX((row.x + row.right) / 2, columns, pageWidth);
+    if (row.x < column.x0 - bodySize * 2 || row.right > column.x1 + bodySize * 2) {
+      return false;
+    }
+    const widthLimit = Math.min(
+      pageWidth * 0.82,
+      (column.x1 - column.x0) * 1.02 + bodySize
+    );
+    if (row.right - row.x > widthLimit) return false;
+    if (row.bodyRatio > 0.42) return false;
+    if (row.mathSymbols < 1 && row.scriptCount < 2) return false;
+    if (!CORE_EQUATION_RE.test(row.text)) return false;
+    const limit = bodySize * 0.45;
+    const isolated = row.gapAbove >= limit && row.gapBelow >= limit;
+    if (isolated) return true;
+    const aboveMath = row.nearestAbove !== void 0 && isMathDominantRow(row.nearestAbove);
+    const belowMath = row.nearestBelow !== void 0 && isMathDominantRow(row.nearestBelow);
+    return aboveMath || belowMath;
+  }
+  function growRegion(seed, atoms, assigned, bodySize) {
+    const items = seed.slice();
+    const used = new Set(seed.map((atom) => atom.index));
+    const horizontalPad = bodySize * 0.6;
+    const verticalPad = bodySize * 0.28;
+    let box = unionBox(items.map(atomBox));
+    for (let guard = 0; guard < atoms.length + 4; guard += 1) {
+      let changed = false;
+      for (const atom of atoms) {
+        if (used.has(atom.index) || assigned.has(atom.index)) continue;
+        if (atom.text.trim() === "") continue;
+        const horizontal = atom.endX >= box[0] - horizontalPad && atom.x <= box[2] + horizontalPad;
+        const vertical = atom.bottom >= box[1] - verticalPad && atom.top <= box[3] + verticalPad;
+        if (!horizontal || !vertical) continue;
+        items.push(atom);
+        used.add(atom.index);
+        box = unionBox([box, atomBox(atom)]);
+        changed = true;
+      }
+      if (!changed) break;
+    }
+    return { items, box };
+  }
+  function mergeEquationRegions(equations, bodySize) {
+    const remaining = equations.slice();
+    let merged = true;
+    while (merged) {
+      merged = false;
+      outer: for (let left = 0; left < remaining.length; left += 1) {
+        for (let right = left + 1; right < remaining.length; right += 1) {
+          const first = remaining[left];
+          const second = remaining[right];
+          const verticalGap = Math.max(0, Math.max(first.box[1], second.box[1]) - Math.min(first.box[3], second.box[3]));
+          if (verticalGap > bodySize * 0.3) continue;
+          const horizontal = horizontalOverlapRatio(first.box, second.box);
+          if (horizontal < 0.25) continue;
+          const items = [...first.items, ...second.items];
+          const numbers = [...equationNumberUnion(first, second)];
+          remaining[left] = {
+            items,
+            box: unionBox([first.box, second.box]),
+            equationNumbers: numbers,
+            detectionSource: first.detectionSource === "manual" || second.detectionSource === "manual" ? "manual" : "automatic"
+          };
+          remaining.splice(right, 1);
+          merged = true;
+          break outer;
+        }
+      }
+    }
+    return remaining;
+  }
+  function* equationNumberUnion(first, second) {
+    const seen = /* @__PURE__ */ new Set();
+    for (const atom of [...first.equationNumbers ?? [], ...second.equationNumbers ?? []]) {
+      if (seen.has(atom.text)) continue;
+      seen.add(atom.text);
+      yield atom;
+    }
+  }
+  function applyOverrides(equations, atoms, overrides, bodySize, pageWidth) {
+    const removed = Array.isArray(overrides?.removed) ? overrides.removed : [];
+    const added = Array.isArray(overrides?.added) ? overrides.added : [];
+    let output = equations.filter(
+      (equation) => !removed.some((box) => Array.isArray(box) && overlapRatio(box, equation.box) > 0.35)
+    );
+    for (const entry of added) {
+      const raw = entry?.bbox;
+      if (!Array.isArray(raw) || raw.length !== 4) continue;
+      const box = [
+        Math.min(raw[0], raw[2]),
+        Math.min(raw[1], raw[3]),
+        Math.max(raw[0], raw[2]),
+        Math.max(raw[1], raw[3])
+      ];
+      if (box[2] - box[0] < 2 || box[3] - box[1] < 2) continue;
+      const items = atoms.filter((atom) => {
+        if (atom.text.trim() === "") return false;
+        const atomArea = boxArea(atomBox(atom));
+        if (atomArea <= 0) return false;
+        if (intersectionArea(box, atomBox(atom)) < atomArea * 0.45) return false;
+        const centerX = (atom.x + atom.endX) / 2;
+        const centerY = (atom.top + atom.bottom) / 2;
+        return centerX >= box[0] && centerX <= box[2] && centerY >= box[1] && centerY <= box[3] || intersectionArea(box, atomBox(atom)) >= atomArea * 0.45;
+      });
+      if (items.length === 0) continue;
+      output = output.filter((equation) => overlapRatio(box, equation.box) <= 0.25);
+      const numbers = items.filter((atom) => isEquationNumber(atom.text));
+      let expanded = unionBox([box, ...items.map(atomBox)]);
+      if (numbers.length === 0) {
+        const centerY = (box[1] + box[3]) / 2;
+        const nearby = atoms.find(
+          (atom) => isEquationNumber(atom.text) && Math.abs((atom.top + atom.bottom) / 2 - centerY) <= Math.max(8, bodySize) && atom.x >= expanded[2] - 2 && atom.x <= expanded[2] + Math.max(60, pageWidth * 0.15)
+        );
+        if (nearby !== void 0) {
+          items.push(nearby);
+          numbers.push(nearby);
+          expanded = unionBox([expanded, atomBox(nearby)]);
+        }
+      }
+      output.push({
+        items,
+        box: expanded,
+        equationNumbers: numbers,
+        detectionSource: "manual"
+      });
+    }
+    return output;
+  }
+  function analyzeEquations(atoms, options = {}) {
+    const bodyFont = options.bodyFont ?? dominantFont(atoms);
+    const bodySize = options.bodySize ?? bodyFontSize(atoms);
+    const pageWidth = Number.isFinite(options.pageWidth) ? options.pageWidth : 612;
+    const pageHeight = Number.isFinite(options.pageHeight) ? options.pageHeight : 792;
+    const overrides = options.overrides ?? {};
+    const rows = annotateRows(buildTextRows(atoms, { bodySize }), atoms, bodyFont, bodySize);
+    const columns = detectColumns(rows, pageWidth);
+    const assigned = /* @__PURE__ */ new Set();
+    const equations = [];
+    const addRegion = (seed, numbers) => {
+      const available = seed.filter((atom) => !assigned.has(atom.index));
+      if (available.length === 0) return;
+      const grown = growRegion(available, atoms, assigned, bodySize);
+      const equationItems = grown.items.filter((atom) => atom.text.trim() !== "");
+      if (equationItems.length === 0) return;
+      const numberAtoms = equationItems.filter((atom) => isEquationNumber(atom.text));
+      for (const atom of equationItems) assigned.add(atom.index);
+      equations.push({
+        items: equationItems,
+        box: grown.box,
+        equationNumbers: numberAtoms.length > 0 ? numberAtoms : numbers,
+        detectionSource: "automatic"
+      });
+    };
+    for (const row of rows) {
+      if (row.equationNumbers.length === 0) continue;
+      if (row.items.every((atom) => assigned.has(atom.index))) continue;
+      const anchor = numberedBand(row, atoms, bodyFont, bodySize, pageWidth, columns);
+      if (anchor === void 0) continue;
+      addRegion([...anchor.band, anchor.number], [anchor.number]);
+    }
+    for (const row of rows) {
+      if (row.equationNumbers.length > 0) continue;
+      if (!unnumberedCandidate(row, bodySize, pageWidth, columns)) continue;
+      const available = row.items.filter((atom) => !assigned.has(atom.index));
+      if (available.length === 0) continue;
+      addRegion(available, []);
+    }
+    const mergedEquations = mergeEquationRegions(equations, bodySize);
+    const resolved = applyOverrides(
+      mergedEquations,
+      atoms,
+      overrides,
+      bodySize,
+      pageWidth
+    ).map((equation, index) => {
+      const sorted = [...equation.items].sort((left, right) => left.index - right.index);
+      const number = equation.equationNumbers?.[0]?.text ?? null;
+      const padding = Math.max(1.2, bodySize * 0.18);
+      const bbox = expandBox(equation.box, padding, pageWidth, pageHeight);
+      const content = sorted.filter((atom) => !isEquationNumber(atom.text));
+      const imageBbox = content.length === 0 ? bbox : expandBox(unionBox(content.map(atomBox)), padding, pageWidth, pageHeight);
+      return {
+        items: sorted,
+        bbox,
+        imageBbox,
+        equationNumber: number === null ? null : number,
+        detectionSource: equation.detectionSource ?? "automatic",
+        sourceItemIds: [
+          ...new Set(
+            sorted.map(
+              (atom) => Number.isInteger(atom.sourceIndex) ? atom.sourceIndex : atom.index
+            )
+          )
+        ],
+        text: equationText(sorted, bodySize),
+        order: sorted.length > 0 ? sorted[0].index : index
+      };
+    });
+    const equationAtomIds = /* @__PURE__ */ new Set();
+    for (const equation of resolved) {
+      for (const atom of equation.items) equationAtomIds.add(atom.index);
+    }
+    return {
+      rows,
+      columns,
+      bodyFont,
+      bodySize,
+      equations: resolved,
+      equationAtomIds,
+      inlineMath: findInlineMath(rows, equationAtomIds, bodyFont, bodySize)
+    };
+  }
+  function equationText(items, bodySize) {
+    const ordered = [...items].sort((left, right) => left.index - right.index);
+    return rowText(ordered, bodySize);
+  }
+  function isInlineMathAtom(atom, bodyFont, bodySize) {
+    const text = atom.text.trim();
+    if (text === "" || CJK_RE.test(text[0])) return false;
+    if (PROSE_STOP_WORDS.has(text.toLowerCase())) return false;
+    if (/^\d+$/u.test(text)) {
+      return atom.fontName !== bodyFont && atom.height < bodySize * 0.9;
+    }
+    if (MATH_SYMBOL_RE.test(text)) {
+      return !looksLikeProse(text);
+    }
+    if (atom.fontName !== bodyFont) {
+      if (/^[A-Za-z\u0370-\u03ff]$/u.test(text)) return true;
+      if (/^[A-Za-z\u0370-\u03ff0-9]{1,2}$/u.test(text) && /[A-Z0-9\u0370-\u03ff]/u.test(text)) {
+        return true;
+      }
+      if (atom.height <= bodySize * 0.9 && text.length <= 4 && /^[A-Za-z0-9]*[A-Z0-9][A-Za-z0-9]*$/u.test(text)) {
+        return true;
+      }
+      if (atom.height <= bodySize * 0.9 && /^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+$/u.test(text)) {
+        return true;
+      }
+      return false;
+    }
+    if (atom.height <= bodySize * 0.9) {
+      if (/^[A-Za-z\u0370-\u03ff]$/u.test(text)) return true;
+      if (/^[A-Za-z][A-Za-z0-9]*\d[A-Za-z0-9]*$/u.test(text)) return true;
+    }
+    return false;
+  }
+  function findInlineMath(rows, equationAtomIds, bodyFont, bodySize) {
+    const inline = /* @__PURE__ */ new Set();
+    for (const row of rows) {
+      const rowAtoms = row.items.filter(
+        (atom) => atom.text.trim() !== "" && !equationAtomIds.has(atom.index)
+      );
+      if (rowAtoms.length === 0) continue;
+      const bodyChars = rowAtoms.reduce(
+        (sum, atom) => sum + (atom.fontName === bodyFont ? atom.text.trim().length : 0),
+        0
+      );
+      const totalChars = rowAtoms.reduce((sum, atom) => sum + atom.text.trim().length, 0);
+      if (totalChars === 0) continue;
+      const ratio = bodyChars / totalChars;
+      const adjacentBody = row.nearestAbove !== void 0 && row.nearestAbove.bodyRatio >= 0.5 || row.nearestBelow !== void 0 && row.nearestBelow.bodyRatio >= 0.5;
+      if (ratio < 0.5 && !adjacentBody) continue;
+      for (const atom of rowAtoms) {
+        if (isInlineMathAtom(atom, bodyFont, bodySize)) inline.add(atom.index);
+      }
+    }
+    return inline;
+  }
+  function cropMetrics(bbox, options = {}) {
+    const width = Math.max(0.5, bbox[2] - bbox[0]);
+    const height = Math.max(0.5, bbox[3] - bbox[1]);
+    const requested = Number.isFinite(options.displayWidth) ? options.displayWidth : width * 1.6;
+    const displayWidth = clamp(requested, 24, 4096);
+    const displayScale = displayWidth / width;
+    const dpr = clamp(Number.isFinite(options.devicePixelRatio) ? options.devicePixelRatio : 1, 1, 4);
+    const maxScale = Number.isFinite(options.maxScale) ? options.maxScale : 6;
+    const maxPixels = Number.isFinite(options.maxPixels) ? options.maxPixels : 4e6;
+    let renderScale = Math.max(Math.min(displayScale * dpr, maxScale), 0.6);
+    const area = width * height;
+    if (area * renderScale * renderScale > maxPixels) {
+      renderScale = Math.max(0.05, Math.sqrt(maxPixels / area));
+    }
+    let pixelWidth = Math.max(1, Math.floor(width * renderScale));
+    let pixelHeight = Math.max(1, Math.floor(height * renderScale));
+    const longest = Math.max(pixelWidth, pixelHeight);
+    if (longest > 8192) {
+      const factor = 8192 / longest;
+      pixelWidth = Math.max(1, Math.floor(pixelWidth * factor));
+      pixelHeight = Math.max(1, Math.floor(pixelHeight * factor));
+      renderScale *= factor;
+    }
+    return {
+      displayWidth,
+      displayHeight: height * displayWidth / width,
+      renderScale,
+      pixelWidth,
+      pixelHeight,
+      maxPixels
+    };
+  }
+
+  // lib/placeholders.js
+  function mathToken(index) {
+    return `\u27E6MATH_${String(index).padStart(3, "0")}\u27E7`;
+  }
+  function restorePlaceholders(text, placeholders) {
+    let value = String(text ?? "");
+    for (const entry of Array.isArray(placeholders) ? placeholders : []) {
+      if (entry === null || typeof entry !== "object") continue;
+      if (typeof entry.token !== "string" || typeof entry.text !== "string") continue;
+      value = value.split(entry.token).join(entry.text);
+    }
+    return value;
   }
 
   // src/pdf.js
@@ -344,6 +1175,43 @@ var PdfMathReaderPlugin = (() => {
     renderQueues.set(canvas, job);
     return job;
   }
+  async function renderEquationCrop(page, bbox, options = {}, signal) {
+    const metrics = cropMetrics(bbox, options);
+    const canvas = document.createElement("canvas");
+    canvas.width = metrics.pixelWidth;
+    canvas.height = metrics.pixelHeight;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (context === null) throw new Error("Canvas 2D context is unavailable");
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    const viewport = page.getViewport({
+      scale: metrics.renderScale,
+      offsetX: -bbox[0] * metrics.renderScale,
+      offsetY: -bbox[1] * metrics.renderScale
+    });
+    const task = page.render({ canvasContext: context, viewport });
+    const cancel = () => task.cancel();
+    if (signal !== void 0) {
+      if (signal.aborted) {
+        task.cancel();
+        throw new DOMException("Aborted", "AbortError");
+      }
+      signal.addEventListener("abort", cancel, { once: true });
+    }
+    try {
+      await task.promise;
+    } finally {
+      signal?.removeEventListener?.("abort", cancel);
+    }
+    return {
+      dataUrl: canvas.toDataURL("image/png"),
+      width: metrics.displayWidth,
+      height: metrics.displayHeight,
+      pixelWidth: metrics.pixelWidth,
+      pixelHeight: metrics.pixelHeight,
+      renderScale: metrics.renderScale
+    };
+  }
   function isCjk(character) {
     if (character === void 0 || character === "") return false;
     const code = character.codePointAt(0);
@@ -366,76 +1234,176 @@ var PdfMathReaderPlugin = (() => {
   function normalizeLineText(text) {
     return text.replace(/\u00ad/g, "").replace(/[ \t\u00a0]+/g, " ").replace(/\s+([,.;:!?%)\]])/g, "$1").replace(/([(\[])\s+/g, "$1").trim();
   }
-  function buildPageModel(library, textContent, viewport) {
-    const pageWidth = viewport.width;
+  function buildAtoms(library, textContent, viewport) {
+    const scale = Number.isFinite(viewport?.scale) && viewport.scale > 0 ? viewport.scale : 1;
     const items = Array.isArray(textContent?.items) ? textContent.items : [];
+    const atoms = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      if (item === null || typeof item !== "object" || typeof item.str !== "string") continue;
+      if (!Array.isArray(item.transform)) continue;
+      const matrix = library.Util.transform(viewport.transform, item.transform);
+      const x = matrix[4] / scale;
+      const baseline = matrix[5] / scale;
+      const fontHeight = Math.max(1, Math.hypot(matrix[2], matrix[3]) || (item.height || 10)) / scale;
+      if (!Number.isFinite(x) || !Number.isFinite(baseline)) continue;
+      const width = Math.max(
+        0,
+        item.width || (item.str.trim() === "" ? 0 : item.str.length * fontHeight * 0.48)
+      );
+      atoms.push({
+        index,
+        sourceIndex: index,
+        text: item.str,
+        x,
+        y: baseline,
+        endX: x + width,
+        width,
+        height: fontHeight,
+        top: baseline - fontHeight * 0.82,
+        bottom: baseline + fontHeight * 0.18,
+        fontName: typeof item.fontName === "string" ? item.fontName : ""
+      });
+    }
+    return atoms;
+  }
+  function buildPageModel(library, textContent, viewport, options = {}) {
+    const scale = Number.isFinite(viewport?.scale) && viewport.scale > 0 ? viewport.scale : 1;
+    const pageWidth = (viewport?.width ?? 612) / scale;
+    const pageHeight = (viewport?.height ?? 792) / scale;
+    const pageIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : 0;
+    const atoms = buildAtoms(library, textContent, viewport).flatMap(splitTextAtom);
+    const analysis = analyzeEquations(atoms, {
+      pageWidth,
+      pageHeight,
+      bodyFont: options.bodyFont,
+      bodySize: options.bodySize,
+      overrides: options.overrides
+    });
+    const excluded = analysis.equationAtomIds;
+    const inlineMath = analysis.inlineMath;
     const lines = [];
     let current;
-    const flush = () => {
+    let tokenCount = 0;
+    const flushMath = (line) => {
+      const run = line.mathRun;
+      if (run === null) return;
+      line.mathRun = null;
+      const mathText = run.text.replace(/\s+/g, " ").trim();
+      if (mathText === "") return;
+      const token = mathToken(tokenCount += 1);
+      if (line.text === "") line.text = mathText;
+      else if (run.separated) line.text = joinFragments(line.text, mathText);
+      else line.text += mathText;
+      if (line.translateText === "") line.translateText = token;
+      else if (run.separated) line.translateText = joinFragments(line.translateText, token);
+      else line.translateText += token;
+      line.placeholders.push({ token, text: mathText });
+    };
+    const appendMath = (atom) => {
+      const line = current;
+      if (line.mathRun === null) {
+        const separated = line.pendingSpace || line.text !== "" && atom.x - line.endX > Math.max(1.2, atom.height * 0.18);
+        line.mathRun = { text: atom.text, last: atom, separated, pendingSpace: false };
+      } else {
+        const gap = atom.x - line.mathRun.last.endX;
+        const space = line.mathRun.pendingSpace || gap > Math.max(1.2, Math.max(atom.height, line.mathRun.last.height) * 0.18);
+        line.mathRun.text += space ? ` ${atom.text}` : atom.text;
+        line.mathRun.last = atom;
+        line.mathRun.pendingSpace = false;
+      }
+      line.pendingSpace = false;
+      line.endX = atom.endX;
+      line.right = Math.max(line.right, atom.endX);
+      line.height = Math.max(line.height, atom.height);
+      line.top = Math.min(line.top, atom.top);
+      line.count += 1;
+    };
+    const appendText = (atom) => {
+      const line = current;
+      if (line.mathRun !== null) flushMath(line);
+      if (line.pendingSpace) {
+        line.text += " ";
+        line.translateText += " ";
+        line.pendingSpace = false;
+      }
+      const gap = atom.x - line.endX;
+      const join = gap > Math.max(1.2, atom.height * 0.18);
+      if (line.text === "") {
+        line.text = atom.text;
+        line.translateText = atom.text;
+      } else if (join) {
+        line.text = joinFragments(line.text, atom.text);
+        line.translateText = joinFragments(line.translateText, atom.text);
+      } else {
+        line.text += atom.text;
+        line.translateText += atom.text;
+      }
+      line.endX = atom.endX;
+      line.right = Math.max(line.right, atom.endX);
+      line.height = Math.max(line.height, atom.height);
+      line.top = Math.min(line.top, atom.top);
+      line.count += 1;
+    };
+    const flushLine = () => {
       if (current === void 0) return;
+      if (current.mathRun !== null) flushMath(current);
       const text = normalizeLineText(current.text);
+      const translateText = normalizeLineText(current.translateText);
       if (text !== "") {
         lines.push({
           text,
+          translateText,
+          placeholders: current.placeholders,
           x: current.x,
           top: current.top,
           width: Math.max(1, current.right - current.x),
           height: Math.max(1, current.height),
-          baseline: current.baseline
+          baseline: current.baseline,
+          order: current.order
         });
       }
       current = void 0;
     };
-    for (const item of items) {
-      if (item === null || typeof item !== "object" || typeof item.str !== "string") continue;
-      if (!Array.isArray(item.transform)) continue;
-      const matrix = library.Util.transform(viewport.transform, item.transform);
-      const x = matrix[4];
-      const baseline = matrix[5];
-      const fontHeight = Math.max(1, Math.hypot(matrix[2], matrix[3]) || (item.height || 10));
-      const width = Math.max(1, (item.width || item.str.length * fontHeight * 0.48) * viewport.scale);
-      if (!Number.isFinite(x) || !Number.isFinite(baseline)) continue;
-      if (item.str.trim() === "") {
+    for (const atom of atoms) {
+      if (excluded.has(atom.index)) continue;
+      if (atom.text.trim() === "") {
         if (current !== void 0) {
-          current.endX = Math.max(current.endX, x + width);
-          if (item.str.length > 0) current.pendingSpace = true;
+          current.endX = Math.max(current.endX, atom.endX);
+          if (atom.text.length > 0) {
+            current.pendingSpace = true;
+            if (current.mathRun !== null) current.mathRun.pendingSpace = true;
+          }
         }
         continue;
       }
-      const sameLine = current !== void 0 && Math.abs(baseline - current.baseline) <= Math.max(1.5, Math.min(current.height, fontHeight) * 0.4);
-      const backwards = current !== void 0 && x < current.x - Math.max(2, fontHeight * 0.8);
-      const farGap = current !== void 0 && x - current.endX > fontHeight * 5;
-      if (!sameLine || backwards || farGap) {
-        flush();
-      }
+      const fontHeight = atom.height;
+      const sameLine = current !== void 0 && Math.abs(atom.y - current.baseline) <= Math.max(1.5, Math.min(current.height, fontHeight) * 0.4);
+      const backwards = current !== void 0 && atom.x < current.x - Math.max(2, fontHeight * 0.8);
+      const farGap = current !== void 0 && atom.x - current.endX > fontHeight * 5;
+      const inlineContinuation = current !== void 0 && !backwards && inlineMath.has(atom.index) && atom.x >= current.x && atom.x - current.endX <= fontHeight * 2 && Math.abs(atom.y - current.baseline) <= fontHeight * 1.05;
+      if ((!sameLine || backwards || farGap) && !inlineContinuation) flushLine();
       if (current === void 0) {
         current = {
-          text: item.str,
-          x,
-          endX: x + width,
-          right: x + width,
-          baseline,
-          top: baseline - fontHeight * 0.82,
+          text: "",
+          translateText: "",
+          placeholders: [],
+          x: atom.x,
+          endX: atom.endX,
+          right: atom.endX,
+          baseline: atom.y,
+          top: atom.top,
           height: fontHeight,
-          count: 1,
-          pendingSpace: false
+          count: 0,
+          pendingSpace: false,
+          mathRun: null,
+          order: atom.index
         };
-      } else {
-        if (current.pendingSpace === true) {
-          current.text += " ";
-          current.pendingSpace = false;
-        }
-        const gap = x - current.endX;
-        if (gap > Math.max(1.2, fontHeight * 0.18)) current.text = joinFragments(current.text, item.str);
-        else current.text += item.str;
-        current.endX = x + width;
-        current.right = Math.max(current.right, x + width);
-        current.height = Math.max(current.height, fontHeight);
-        current.top = Math.min(current.top, baseline - fontHeight * 0.82);
-        current.count += 1;
       }
+      if (inlineMath.has(atom.index)) appendMath(atom);
+      else appendText(atom);
     }
-    flush();
+    flushLine();
     const lineGaps = [];
     const lineHeights = [];
     for (let index = 1; index < lines.length; index += 1) {
@@ -470,24 +1438,82 @@ var PdfMathReaderPlugin = (() => {
         paragraphs.push(createParagraph(line));
       } else {
         previous.text = joinLines(previous.text, line.text);
+        previous.translateText = joinLines(previous.translateText, line.translateText);
+        previous.placeholders.push(...line.placeholders);
         previous.lines.push(line);
         previous.bottom = Math.max(previous.bottom, line.top + line.height);
         previous.right = Math.max(previous.right, line.x + line.width);
         previous.height = Math.max(previous.height, line.height);
       }
     }
+    const paragraphBlocks = [];
     for (let index = 0; index < paragraphs.length; index += 1) {
       const paragraph = paragraphs[index];
       paragraph.id = `p${index}`;
+      paragraph.order = Math.min(...paragraph.lines.map((line) => line.order));
+      paragraph.bbox = unionBox(
+        paragraph.lines.map((line) => [line.x, line.top, line.x + line.width, line.top + line.height])
+      );
+      paragraph.translateText = normalizeLineText(paragraph.translateText);
+      paragraph.text = normalizeLineText(paragraph.text);
       paragraph.lines.forEach((line, lineIndex) => {
         line.id = `p${index}-l${lineIndex}`;
         line.paragraphId = paragraph.id;
       });
-      paragraph.text = normalizeLineText(paragraph.text);
+      if (paragraph.text !== "") paragraphBlocks.push(paragraph);
+    }
+    for (const paragraph of paragraphBlocks) {
+      for (const line of paragraph.lines) {
+        line.x *= scale;
+        line.top *= scale;
+        line.width *= scale;
+        line.height *= scale;
+        line.baseline *= scale;
+      }
+    }
+    const pageKey = `page${pageIndex + 1}`;
+    const blocks = paragraphBlocks.map((paragraph, index) => ({
+      id: `${pageKey}-p${index}`,
+      type: "paragraph",
+      pageIndex,
+      paragraphId: paragraph.id,
+      bbox: paragraph.bbox,
+      text: paragraph.text,
+      translateText: paragraph.translateText,
+      order: paragraph.order,
+      paragraph
+    }));
+    for (let index = 0; index < analysis.equations.length; index += 1) {
+      const equation = analysis.equations[index];
+      blocks.push({
+        id: `${pageKey}-equation${index + 1}`,
+        type: "equation",
+        pageIndex,
+        bbox: equation.bbox,
+        imageBbox: equation.imageBbox,
+        equationNumber: equation.equationNumber,
+        sourceItemIds: equation.sourceItemIds,
+        latex: null,
+        detectionSource: equation.detectionSource,
+        text: equation.text,
+        order: equation.order
+      });
+    }
+    blocks.sort(
+      (left, right) => left.order - right.order || (left.type === "equation" ? -1 : 1)
+    );
+    let equationIndex = 0;
+    for (const block of blocks) {
+      if (block.type !== "equation") continue;
+      equationIndex += 1;
+      block.id = `${pageKey}-equation${equationIndex}`;
     }
     return {
-      paragraphs: paragraphs.filter((paragraph) => paragraph.text !== ""),
-      lines,
+      blocks,
+      paragraphs: paragraphBlocks,
+      lines: paragraphBlocks.flatMap((paragraph) => paragraph.lines),
+      equations: blocks.filter((block) => block.type === "equation"),
+      atoms,
       viewport,
       pageWidth: viewport.width,
       pageHeight: viewport.height
@@ -496,6 +1522,8 @@ var PdfMathReaderPlugin = (() => {
   function createParagraph(line) {
     return {
       text: line.text,
+      translateText: line.translateText,
+      placeholders: [...line.placeholders],
       x: line.x,
       top: line.top,
       bottom: line.top + line.height,
@@ -504,14 +1532,19 @@ var PdfMathReaderPlugin = (() => {
       lines: [line]
     };
   }
-  async function extractPageModel(page, scale = 1, identity = void 0) {
+  async function extractPageModel(page, scale = 1, identity = void 0, options = {}) {
     const library = await loadPdfJs();
     const viewport = page.getViewport({ scale });
     const textContent = await page.getTextContent({ includeMarkedContent: false });
-    const model = buildPageModel(library, textContent, viewport);
+    const model = buildPageModel(library, textContent, viewport, {
+      ...options,
+      pageIndex: identity?.pageIndex ?? options.pageIndex ?? 0
+    });
     if (identity !== void 0) {
       model.documentId = identity.documentId;
       model.pageIndex = identity.pageIndex;
+    } else if (Number.isInteger(options.pageIndex)) {
+      model.pageIndex = options.pageIndex;
     }
     return model;
   }
@@ -598,6 +1631,133 @@ var PdfMathReaderPlugin = (() => {
     return batches;
   }
 
+  // src/zip.js
+  var CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let index = 0; index < 256; index += 1) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = value & 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
+      }
+      table[index] = value >>> 0;
+    }
+    return table;
+  })();
+  function crc32(bytes) {
+    let crc = 4294967295;
+    for (let index = 0; index < bytes.length; index += 1) {
+      crc = CRC_TABLE[(crc ^ bytes[index]) & 255] ^ crc >>> 8;
+    }
+    return (crc ^ 4294967295) >>> 0;
+  }
+  function toBytes(value) {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (Array.isArray(value)) return new Uint8Array(value);
+    return new TextEncoder().encode(String(value ?? ""));
+  }
+  function dataUrlToBytes(dataUrl) {
+    const value = String(dataUrl ?? "");
+    const comma = value.indexOf(",");
+    if (comma < 0) return new Uint8Array(0);
+    const header = value.slice(0, comma);
+    const payload = value.slice(comma + 1);
+    if (!/;base64/i.test(header)) return new TextEncoder().encode(decodeURIComponent(payload));
+    if (typeof atob !== "function") return new Uint8Array(0);
+    const decoded = atob(payload);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) {
+      bytes[index] = decoded.charCodeAt(index) & 255;
+    }
+    return bytes;
+  }
+  function dosDateTime(date) {
+    const year = Math.max(1980, date.getFullYear());
+    const dosTime = date.getHours() << 11 | date.getMinutes() << 5 | Math.floor(date.getSeconds() / 2);
+    const dosDate = year - 1980 << 9 | date.getMonth() + 1 << 5 | date.getDate();
+    return { time: dosTime & 65535, date: dosDate & 65535 };
+  }
+  function writeUint16(view, offset, value) {
+    view.setUint16(offset, value & 65535, true);
+  }
+  function writeUint32(view, offset, value) {
+    view.setUint32(offset, value >>> 0, true);
+  }
+  function concat(chunks) {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return output;
+  }
+  function createZip(entries, options = {}) {
+    const encoder = new TextEncoder();
+    const now = options.date instanceof Date ? options.date : /* @__PURE__ */ new Date();
+    const { time, date } = dosDateTime(now);
+    const chunks = [];
+    const central = [];
+    let offset = 0;
+    for (const entry of entries) {
+      const name = String(entry?.name ?? "").replace(/^[/\\]+/, "");
+      if (name === "") continue;
+      const nameBytes = encoder.encode(name);
+      const data = toBytes(entry.data);
+      const crc = crc32(data);
+      const local = new Uint8Array(30 + nameBytes.length);
+      const localView = new DataView(local.buffer);
+      writeUint32(localView, 0, 67324752);
+      writeUint16(localView, 4, 20);
+      writeUint16(localView, 6, 2048);
+      writeUint16(localView, 8, 0);
+      writeUint16(localView, 10, time);
+      writeUint16(localView, 12, date);
+      writeUint32(localView, 14, crc);
+      writeUint32(localView, 18, data.length);
+      writeUint32(localView, 22, data.length);
+      writeUint16(localView, 26, nameBytes.length);
+      writeUint16(localView, 28, 0);
+      local.set(nameBytes, 30);
+      chunks.push(local, data);
+      const header = new Uint8Array(46 + nameBytes.length);
+      const headerView = new DataView(header.buffer);
+      writeUint32(headerView, 0, 33639248);
+      writeUint16(headerView, 4, 20);
+      writeUint16(headerView, 6, 20);
+      writeUint16(headerView, 8, 2048);
+      writeUint16(headerView, 10, 0);
+      writeUint16(headerView, 12, time);
+      writeUint16(headerView, 14, date);
+      writeUint32(headerView, 16, crc);
+      writeUint32(headerView, 20, data.length);
+      writeUint32(headerView, 24, data.length);
+      writeUint16(headerView, 28, nameBytes.length);
+      writeUint16(headerView, 30, 0);
+      writeUint16(headerView, 32, 0);
+      writeUint16(headerView, 34, 0);
+      writeUint16(headerView, 36, 0);
+      writeUint32(headerView, 38, 0);
+      writeUint32(headerView, 42, offset);
+      header.set(nameBytes, 46);
+      central.push(header);
+      offset += local.length + data.length;
+    }
+    const centralBytes = concat(central);
+    const end = new Uint8Array(22);
+    const endView = new DataView(end.buffer);
+    writeUint32(endView, 0, 101010256);
+    writeUint16(endView, 4, 0);
+    writeUint16(endView, 6, 0);
+    writeUint16(endView, 8, central.length);
+    writeUint16(endView, 10, central.length);
+    writeUint32(endView, 12, centralBytes.length);
+    writeUint32(endView, 16, offset);
+    writeUint16(endView, 20, 0);
+    return concat([...chunks, centralBytes, end]);
+  }
+
   // src/locales.js
   var zh = {
     "panel.title": "PDF \u9605\u8BFB",
@@ -627,6 +1787,7 @@ var PdfMathReaderPlugin = (() => {
     "action.stop": "\u505C\u6B62",
     "action.export": "\u5BFC\u51FA",
     "action.exportMarkdown": "\u5BFC\u51FA\u53CC\u8BED Markdown",
+    "action.exportBundle": "\u5BFC\u51FA Markdown + \u516C\u5F0F\u56FE\u7247",
     "action.exportHtml": "\u5BFC\u51FA\u5BF9\u7167 HTML",
     "action.settings": "\u8BBE\u7F6E",
     "action.translateSelection": "\u7FFB\u8BD1\u9009\u4E2D",
@@ -650,6 +1811,28 @@ var PdfMathReaderPlugin = (() => {
     "panel.failed": "\u8FD9\u4E00\u9875\u7FFB\u8BD1\u5931\u8D25",
     "panel.retryHint": "\u53EF\u4EE5\u91CD\u8BD5\uFF1B\u5982\u679C\u53CD\u590D\u5931\u8D25\uFF0C\u8BD5\u8BD5\u51CF\u5C11\u4E00\u6B21\u7FFB\u8BD1\u7684\u6BB5\u843D\u6570\u3002",
     "panel.formulas": "\u516C\u5F0F\u3001\u5F15\u7528\u4E0E\u7F16\u53F7\u4F1A\u539F\u6837\u4FDD\u7559",
+    "panel.equationCount": "{count} \u4E2A\u516C\u5F0F",
+    "panel.placeholderFailed": "{count} \u6BB5\u7684\u516C\u5F0F\u5360\u4F4D\u7B26\u6821\u9A8C\u5931\u8D25",
+    "equation.label": "\u516C\u5F0F",
+    "equation.numbered": "\u516C\u5F0F {number}",
+    "equation.unnumbered": "\u72EC\u7ACB\u516C\u5F0F",
+    "equation.manual": "\u624B\u52A8\u6846\u9009",
+    "equation.auto": "\u81EA\u52A8\u8BC6\u522B",
+    "equation.locate": "\u5B9A\u4F4D\u539F\u6587",
+    "equation.zoom": "\u653E\u5927\u67E5\u770B",
+    "equation.remove": "\u4E0D\u662F\u516C\u5F0F",
+    "equation.copyLatex": "\u590D\u5236 LaTeX",
+    "equation.rendering": "\u6B63\u5728\u751F\u6210\u516C\u5F0F\u56FE\u2026",
+    "equation.hint": "\u70B9\u51FB\u516C\u5F0F\u5B9A\u4F4D\u539F\u6587 \xB7 \u957F\u516C\u5F0F\u53EF\u6A2A\u5411\u6EDA\u52A8",
+    "equation.select": "\u6846\u9009\u516C\u5F0F",
+    "equation.selectHint": "\u5728\u9875\u9762\u4E0A\u62D6\u62FD\u6846\u9009\u5B8C\u6574\u516C\u5F0F\u533A\u57DF\uFF1BEsc \u53D6\u6D88\u3002",
+    "equation.added": "\u5DF2\u6807\u8BB0\u4E3A\u516C\u5F0F",
+    "equation.removed": "\u5DF2\u53D6\u6D88\u516C\u5F0F\u6807\u8BB0",
+    "equation.reset": "\u5DF2\u6062\u590D\u81EA\u52A8\u8BC6\u522B",
+    "equation.restore": "\u6062\u590D\u81EA\u52A8\u8BC6\u522B",
+    "equation.emptyRegion": "\u6846\u9009\u533A\u57DF\u6CA1\u6709\u53EF\u8BC6\u522B\u7684\u6587\u672C\uFF0C\u8BF7\u91CD\u65B0\u6846\u9009\u3002",
+    "equation.tooSmall": "\u6846\u9009\u533A\u57DF\u592A\u5C0F\uFF0C\u8BF7\u62D6\u62FD\u51FA\u5B8C\u6574\u516C\u5F0F\u3002",
+    "equation.context": "\u516C\u5F0F {number}",
     "tab.translation": "\u8BD1\u6587",
     "tab.notes": "\u7B14\u8BB0",
     "tab.reading": "AI \u9605\u8BFB",
@@ -730,10 +1913,12 @@ var PdfMathReaderPlugin = (() => {
     "error.render": "\u8FD9\u4E00\u9875\u6E32\u67D3\u5931\u8D25",
     "error.extract": "\u8FD9\u4E00\u9875\u6CA1\u6709\u53EF\u63D0\u53D6\u7684\u6587\u672C\u3002",
     "error.translate": "\u7FFB\u8BD1\u5931\u8D25",
+    "error.placeholder": "\u516C\u5F0F\u5360\u4F4D\u7B26\u4E22\u5931\u6216\u88AB\u6539\u5199\uFF0C\u8BF7\u91CD\u8BD5",
     "error.noModel": "\u5F53\u524D profile \u6CA1\u6709\u53EF\u7528\u7684\u6A21\u578B\u670D\u52A1\u3002",
     "error.exportEmpty": "\u8FD8\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u5185\u5BB9\u3002",
     "error.fileType": "\u8BF7\u9009\u62E9 PDF \u6587\u4EF6\u3002",
     "toast.opened": "\u5DF2\u6253\u5F00 {name}",
+    "toast.exporting": "\u6B63\u5728\u751F\u6210\u5BFC\u51FA\u6587\u4EF6\u2026",
     "toast.copied": "\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F",
     "toast.exported": "\u5DF2\u5BFC\u51FA {name}",
     "toast.cancelled": "\u5DF2\u505C\u6B62\u7FFB\u8BD1",
@@ -774,6 +1959,7 @@ var PdfMathReaderPlugin = (() => {
     "action.stop": "Stop",
     "action.export": "Export",
     "action.exportMarkdown": "Export bilingual Markdown",
+    "action.exportBundle": "Export Markdown + equation images",
     "action.exportHtml": "Export reading HTML",
     "action.settings": "Settings",
     "action.translateSelection": "Translate selection",
@@ -797,6 +1983,28 @@ var PdfMathReaderPlugin = (() => {
     "panel.failed": "This page failed to translate",
     "panel.retryHint": "Retry, or send fewer paragraphs in one batch if it keeps failing.",
     "panel.formulas": "Formulas, citations and numbering are preserved",
+    "panel.equationCount": "{count} equations",
+    "panel.placeholderFailed": "Formula placeholder validation failed for {count} segments",
+    "equation.label": "Equation",
+    "equation.numbered": "Equation {number}",
+    "equation.unnumbered": "Display equation",
+    "equation.manual": "Manual box",
+    "equation.auto": "Auto-detected",
+    "equation.locate": "Locate in PDF",
+    "equation.zoom": "Zoom in",
+    "equation.remove": "Not an equation",
+    "equation.copyLatex": "Copy LaTeX",
+    "equation.rendering": "Rendering equation\u2026",
+    "equation.hint": "Click the equation to locate it \xB7 long equations scroll horizontally",
+    "equation.select": "Select equation",
+    "equation.selectHint": "Drag a box around the complete equation; press Esc to cancel.",
+    "equation.added": "Marked as an equation",
+    "equation.removed": "Equation mark removed",
+    "equation.reset": "Automatic detection restored",
+    "equation.restore": "Restore auto-detection",
+    "equation.emptyRegion": "No text was found inside the selected box. Try again.",
+    "equation.tooSmall": "The selected box is too small. Drag around the whole equation.",
+    "equation.context": "Equation {number}",
     "tab.translation": "Translation",
     "tab.notes": "Notes",
     "tab.reading": "AI reading",
@@ -877,10 +2085,12 @@ var PdfMathReaderPlugin = (() => {
     "error.render": "This page failed to render",
     "error.extract": "No text could be extracted from this page.",
     "error.translate": "Translation failed",
+    "error.placeholder": "A formula placeholder was lost or rewritten. Retry this paragraph.",
     "error.noModel": "No model service is available in this profile.",
     "error.exportEmpty": "There is nothing to export yet.",
     "error.fileType": "Please choose a PDF file.",
     "toast.opened": "Opened {name}",
+    "toast.exporting": "Preparing the export\u2026",
     "toast.copied": "Copied to clipboard",
     "toast.exported": "Exported {name}",
     "toast.cancelled": "Translation stopped",
@@ -947,14 +2157,11 @@ var PdfMathReaderPlugin = (() => {
 }
 .pmr-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .pmr-brand-mark {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  color: #fff;
-  background: linear-gradient(135deg, #2563eb, #0e7490);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,.18);
+  object-fit: cover;
   flex: 0 0 auto;
 }
 .pmr-brand-text { min-width: 0; }
@@ -1398,6 +2605,128 @@ var PdfMathReaderPlugin = (() => {
 .pmr-seg-err { margin-top: 5px; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
 .pmr-seg-skeleton { height: 10px; margin-top: 7px; border-radius: 4px; background: var(--dsw-alias-bg-layer-2); animation: pmr-pulse 1.25s ease-in-out infinite; }
 .pmr-seg-skeleton.short { width: 62%; }
+.pmr-seg-err { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
+.pmr-seg-err span { min-width: 0; }
+.pmr-seg-retry {
+  margin-left: auto;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 40%, var(--dsw-alias-border-l1));
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 10px;
+  cursor: pointer;
+}
+.pmr-seg-retry:hover { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent); }
+.pmr-tr-waiting { height: auto; min-height: 150px; margin-bottom: 6px; }
+
+.pmr-eq-card {
+  margin: 6px 0 9px;
+  padding: 7px 8px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-base);
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.pmr-eq-card.is-active {
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dsw-alias-brand-primary) 45%, transparent);
+}
+.pmr-eq-head { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 6px; }
+.pmr-eq-label { font-size: 11px; font-weight: 650; white-space: nowrap; }
+.pmr-eq-badge {
+  flex: 0 0 auto;
+  height: 17px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 9px;
+}
+.pmr-eq-badge.is-manual {
+  color: var(--dsw-alias-brand-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);
+}
+.pmr-eq-actions { margin-left: auto; display: inline-flex; gap: 1px; }
+.pmr-eq-actions button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+.pmr-eq-actions button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-eq-actions button:disabled { opacity: .35; cursor: default; }
+.pmr-eq-actions .pmr-eq-remove:hover { color: var(--dsw-alias-state-error-primary); }
+.pmr-eq-scroll {
+  display: flex;
+  align-items: center;
+  min-height: 46px;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+.pmr-eq-scroll:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.pmr-eq-image { display: block; flex: 0 0 auto; max-width: none; height: auto; }
+.pmr-eq-loading { display: flex; align-items: center; gap: 7px; padding: 8px 4px; color: #64748b; font-size: 10.5px; }
+.pmr-eq-fallback { padding: 4px; color: #334155; font-size: 11px; line-height: 1.45; white-space: pre-wrap; }
+.pmr-eq-foot { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-eq-count { margin-left: auto; font-variant-numeric: tabular-nums; opacity: .7; }
+.pmr-eq-count-badge { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-eq-reset { display: flex; justify-content: center; padding: 4px 0 10px; }
+.pmr-eq-reset .pmr-btn { height: 24px; padding: 0 8px; font-size: 10px; }
+.pmr-eq-hl { background: rgba(37,99,235,.16); box-shadow: inset 0 0 0 1.5px rgba(37,99,235,.5); }
+.pmr-eq-selector {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  cursor: crosshair;
+  touch-action: none;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent);
+}
+.pmr-eq-box {
+  position: absolute;
+  border: 1.5px dashed var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
+  pointer-events: none;
+}
+.pmr-eq-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, .64);
+}
+.pmr-eq-modal-body {
+  display: flex;
+  flex-direction: column;
+  max-width: 94vw;
+  max-height: 90vh;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 24px 70px rgba(0,0,0,.35);
+}
+.pmr-eq-modal-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1); font-size: 11.5px; font-weight: 600; }
+.pmr-eq-modal-head .pmr-iconbtn { width: 24px; height: 24px; margin-left: auto; }
+.pmr-eq-modal-scroll { overflow: auto; padding: 12px; background: #fff; }
+.pmr-eq-modal-scroll img { display: block; height: auto; }
 .pmr-tr-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: 100%; min-height: 160px; padding: 26px 22px; text-align: center; color: var(--dsw-alias-label-secondary); }
 .pmr-tr-empty strong { color: var(--dsw-alias-label-primary); font-size: 12.5px; font-weight: 600; }
 .pmr-tr-empty p { margin: 0; font-size: 11.5px; line-height: 1.55; max-width: 260px; }
@@ -1564,6 +2893,8 @@ var PdfMathReaderPlugin = (() => {
   .pmr-translation { flex-basis: 348px; }
   .pmr-brand-sub { display: none; }
   .pmr-toolbar .pmr-select { max-width: 108px; }
+  .pmr-eq-select-text { display: none; }
+  .pmr-eq-select-btn { width: 30px; padding: 0; }
 }
 @media (max-width: 1080px) {
   .pmr-toolbar .pmr-select { display: none; }
@@ -1642,7 +2973,10 @@ var PdfMathReaderPlugin = (() => {
   var import_jsx_runtime2 = __require("react/jsx-runtime");
   var SETTINGS_KEY = "pdf-math-reader.settings.v1";
   var NOTES_KEY = "pdf-math-reader.notes.v1";
+  var EQUATIONS_KEY = "pdf-math-reader.equations.v1";
   var PANEL_ID = "pdf-math-reader";
+  var EMPTY_OVERRIDES = { added: [], removed: [] };
+  var PANEL_ICON = "/pdf-reader/assets/icon-128.png";
   var LANGUAGES = [
     { id: "zh-CN", label: "\u7B80\u4F53\u4E2D\u6587" },
     { id: "zh-TW", label: "\u7E41\u9AD4\u4E2D\u6587" },
@@ -1656,7 +2990,7 @@ var PdfMathReaderPlugin = (() => {
     { id: "it", label: "Italiano" },
     { id: "pt", label: "Portugu\xEAs" }
   ];
-  function clamp(value, min, max) {
+  function clamp2(value, min, max) {
     return Math.min(max, Math.max(min, value));
   }
   function isAbort(error) {
@@ -1708,6 +3042,53 @@ var PdfMathReaderPlugin = (() => {
     } catch {
       return fallback;
     }
+  }
+  function normalizeBox(value) {
+    if (!Array.isArray(value) || value.length !== 4) return null;
+    const numbers = value.map((entry) => Number(entry));
+    if (!numbers.every((entry) => Number.isFinite(entry))) return null;
+    const box = [
+      Math.min(numbers[0], numbers[2]),
+      Math.min(numbers[1], numbers[3]),
+      Math.max(numbers[0], numbers[2]),
+      Math.max(numbers[1], numbers[3])
+    ];
+    if (box[2] - box[0] < 1 || box[3] - box[1] < 1) return null;
+    return box;
+  }
+  function loadEquationOverrides() {
+    try {
+      const raw = window.localStorage?.getItem(EQUATIONS_KEY);
+      if (raw === null || raw === void 0) return {};
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object") return {};
+      const output = {};
+      for (const [fingerprint, pages] of Object.entries(parsed)) {
+        if (pages === null || typeof pages !== "object") continue;
+        const pageMap = {};
+        for (const [pageIndex, entry] of Object.entries(pages)) {
+          const index = Number(pageIndex);
+          if (!Number.isInteger(index) || index < 0) continue;
+          const added = Array.isArray(entry?.added) ? entry.added.map((item) => normalizeBox(item?.bbox)).filter((box) => box !== null).map((box) => ({ bbox: box })).slice(0, 200) : [];
+          const removed = Array.isArray(entry?.removed) ? entry.removed.map(normalizeBox).filter((box) => box !== null).slice(0, 200) : [];
+          if (added.length === 0 && removed.length === 0) continue;
+          pageMap[index] = { added, removed };
+        }
+        if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap;
+      }
+      return output;
+    } catch {
+      return {};
+    }
+  }
+  function pageOverridesFor(all, fingerprint, pageIndex) {
+    if (fingerprint === "" || fingerprint === void 0) return EMPTY_OVERRIDES;
+    const entry = all?.[fingerprint]?.[pageIndex];
+    if (entry === null || entry === void 0) return EMPTY_OVERRIDES;
+    return {
+      added: Array.isArray(entry.added) ? entry.added : [],
+      removed: Array.isArray(entry.removed) ? entry.removed : []
+    };
   }
   function baseName(name) {
     return String(name).replace(/\.pdf$/i, "") || "document";
@@ -1978,7 +3359,17 @@ var PdfMathReaderPlugin = (() => {
       }
     );
   }
-  function SegmentCard({ tt, paragraph, translation, status, mode, active, onClick }) {
+  function SegmentCard({
+    tt,
+    paragraph,
+    translation,
+    status,
+    mode,
+    active,
+    error,
+    onRetry,
+    onClick
+  }) {
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
       "div",
       {
@@ -1994,10 +3385,211 @@ var PdfMathReaderPlugin = (() => {
         },
         children: [
           mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-src", children: paragraph.text }),
-          mode !== "source" && (translation?.text ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-tr", children: translation.text }) : status === "loading" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
+          mode !== "source" && (error ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-seg-err", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: error }),
+            onRetry !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+              "button",
+              {
+                type: "button",
+                className: "pmr-seg-retry",
+                onClick: (event) => {
+                  event.stopPropagation();
+                  onRetry();
+                },
+                children: tt("action.retry")
+              }
+            )
+          ] }) : translation?.text ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-tr", children: translation.text }) : status === "loading" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton" }),
             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton short" })
           ] }) : status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-err", children: tt("error.translate") }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-tr is-placeholder", children: tt("panel.waiting") }))
+        ]
+      }
+    );
+  }
+  function EquationBlock({
+    tt,
+    equation,
+    pdf,
+    fingerprint,
+    pageIndex,
+    cache,
+    cacheVersion,
+    active,
+    onLocate,
+    onRemove,
+    onCopy
+  }) {
+    const [image, setImage] = (0, import_react2.useState)({ status: "loading" });
+    const [zoomOpen, setZoomOpen] = (0, import_react2.useState)(false);
+    const cropBbox = equation.imageBbox ?? equation.bbox;
+    const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0]);
+    const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const cacheKey = [
+      fingerprint,
+      pageIndex,
+      equation.id,
+      cropBbox.map((value) => Math.round(value * 10) / 10).join(","),
+      Math.round(displayWidth),
+      dpr
+    ].join(":");
+    (0, import_react2.useEffect)(() => {
+      let cancelled = false;
+      let promise = cache.current.get(cacheKey);
+      if (promise === void 0) {
+        promise = (async () => {
+          const page = await pdf.getPage(pageIndex + 1);
+          return await renderEquationCrop(page, cropBbox, {
+            displayWidth,
+            devicePixelRatio: dpr,
+            maxPixels: 32e5,
+            maxScale: 5
+          });
+        })();
+        cache.current.set(cacheKey, promise);
+        promise.catch(() => cache.current.delete(cacheKey));
+      }
+      setImage({ status: "loading" });
+      promise.then((result) => {
+        if (!cancelled) setImage({ status: "ready", ...result });
+      }).catch((error) => {
+        if (!cancelled && !isAbort(error)) {
+          setImage({ status: "error", message: error?.message ?? String(error) });
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [
+      cache,
+      cacheKey,
+      cropBbox,
+      dpr,
+      displayWidth,
+      pageIndex,
+      pdf,
+      cacheVersion
+    ]);
+    (0, import_react2.useEffect)(() => {
+      if (!zoomOpen) return void 0;
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") setZoomOpen(false);
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    }, [zoomOpen]);
+    const label = equation.equationNumber === null || equation.equationNumber === void 0 ? tt("equation.unnumbered") : tt("equation.numbered", { number: equation.equationNumber });
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      "section",
+      {
+        className: `pmr-eq-card ${active ? "is-active" : ""}`,
+        "aria-label": label,
+        children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "pmr-eq-head", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-label", children: label }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: `pmr-eq-badge ${equation.detectionSource === "manual" ? "is-manual" : ""}`, children: equation.detectionSource === "manual" ? tt("equation.manual") : tt("equation.auto") }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-actions", children: [
+              typeof equation.latex === "string" && equation.latex !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => onCopy(`$$
+${equation.latex}
+$$`),
+                  title: tt("equation.copyLatex"),
+                  "aria-label": tt("equation.copyLatex"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "copy", size: 12 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => onLocate(equation),
+                  title: tt("equation.locate"),
+                  "aria-label": tt("equation.locate"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "search", size: 12 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => setZoomOpen(true),
+                  title: tt("equation.zoom"),
+                  "aria-label": tt("equation.zoom"),
+                  disabled: image.status !== "ready",
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "expand", size: 12 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  className: "pmr-eq-remove",
+                  onClick: () => onRemove(equation),
+                  title: tt("equation.remove"),
+                  "aria-label": tt("equation.remove"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 11 })
+                }
+              )
+            ] })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "div",
+            {
+              className: "pmr-eq-scroll",
+              role: "button",
+              tabIndex: 0,
+              onClick: () => onLocate(equation),
+              onKeyDown: (event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onLocate(equation);
+                }
+              },
+              children: image.status === "ready" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "img",
+                {
+                  className: "pmr-eq-image",
+                  src: image.dataUrl,
+                  width: image.width,
+                  height: image.height,
+                  alt: equation.text,
+                  draggable: false
+                }
+              ) : image.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-fallback", children: equation.text }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-loading", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
+                tt("equation.rendering")
+              ] })
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("footer", { className: "pmr-eq-foot", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("equation.hint") }) }),
+          zoomOpen && image.status === "ready" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal", role: "dialog", "aria-label": label, onClick: () => setZoomOpen(false), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-body", onClick: (event) => event.stopPropagation(), children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-head", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  className: "pmr-iconbtn",
+                  onClick: () => setZoomOpen(false),
+                  "aria-label": tt("action.close"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 14 })
+                }
+              )
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal-scroll", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+              "img",
+              {
+                src: image.dataUrl,
+                alt: equation.text,
+                style: { width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: "none" },
+                draggable: false
+              }
+            ) })
+          ] }) })
         ]
       }
     );
@@ -2124,6 +3716,12 @@ var PdfMathReaderPlugin = (() => {
     const [dragging, setDragging] = (0, import_react2.useState)(false);
     const [resizing, setResizing] = (0, import_react2.useState)(false);
     const [toast, setToast] = (0, import_react2.useState)(null);
+    const [equationOverrides, setEquationOverrides] = (0, import_react2.useState)(loadEquationOverrides);
+    const [modelRevision, setModelRevision] = (0, import_react2.useState)(0);
+    const [activeEquation, setActiveEquation] = (0, import_react2.useState)(null);
+    const [equationSelectMode, setEquationSelectMode] = (0, import_react2.useState)(false);
+    const [equationRect, setEquationRect] = (0, import_react2.useState)(null);
+    const [translationErrors, setTranslationErrors] = (0, import_react2.useState)({});
     const fileInputRef = (0, import_react2.useRef)(null);
     const viewerRef = (0, import_react2.useRef)(null);
     const canvasRef = (0, import_react2.useRef)(null);
@@ -2146,20 +3744,33 @@ var PdfMathReaderPlugin = (() => {
     const pendingFocusRef = (0, import_react2.useRef)(null);
     const pendingScrollRef = (0, import_react2.useRef)(null);
     const focusRequestIdRef = (0, import_react2.useRef)(0);
+    const equationOverridesRef = (0, import_react2.useRef)(equationOverrides);
+    equationOverridesRef.current = equationOverrides;
+    const equationImageCacheRef = (0, import_react2.useRef)(/* @__PURE__ */ new Map());
+    const equationDragRef = (0, import_react2.useRef)(null);
     const ttRef = (0, import_react2.useRef)(tt);
     ttRef.current = tt;
     const glossary = (0, import_react2.useMemo)(() => parseGlossary(settings.glossaryText), [settings.glossaryText]);
     const glossaryKeyValue = (0, import_react2.useMemo)(() => glossaryKey(glossary), [glossary]);
     const pageCount = doc?.numPages ?? 0;
     const paragraphs = pageModel?.paragraphs ?? [];
+    const blocks = pageModel?.blocks ?? [];
+    const equations = (0, import_react2.useMemo)(() => blocks.filter((block) => block.type === "equation"), [blocks]);
     const pageTranslation = translations[pageIndex] ?? {};
     const pageStatus = pageTranslationState[pageIndex]?.status ?? "idle";
     const pageError = pageTranslationState[pageIndex]?.error ?? "";
     const pageBusy = Boolean(busyPages[pageIndex]) || Boolean(progress?.running);
     const hasPageTranslation = paragraphs.some((paragraph) => Boolean(pageTranslation[paragraph.id]?.text));
+    const waitingForTranslation = viewMode !== "source" && paragraphs.length > 0 && !hasPageTranslation && pageStatus !== "loading" && pageStatus !== "error";
     const currentScale = pageModel?.viewport?.scale ?? 1;
     const activeLines = pageModel?.paragraphs.find((paragraph) => paragraph.id === activeParagraph)?.lines ?? [];
     const docFingerprint = doc?.fingerprint ?? "";
+    const pageOverrides = (0, import_react2.useMemo)(
+      () => pageOverridesFor(equationOverrides, docFingerprint, pageIndex),
+      [docFingerprint, equationOverrides, pageIndex]
+    );
+    const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0;
+    const activeEquationBlock = equations.find((equation) => equation.id === activeEquation);
     const docNotes = (0, import_react2.useMemo)(
       () => notes.filter((note) => note.doc === docFingerprint),
       [docFingerprint, notes]
@@ -2207,6 +3818,12 @@ var PdfMathReaderPlugin = (() => {
       } catch {
       }
     }, [notes]);
+    (0, import_react2.useEffect)(() => {
+      try {
+        window.localStorage?.setItem(EQUATIONS_KEY, JSON.stringify(equationOverrides));
+      } catch {
+      }
+    }, [equationOverrides]);
     (0, import_react2.useEffect)(() => {
       setNoteText(existingNote?.text ?? "");
     }, [existingNote]);
@@ -2257,6 +3874,9 @@ var PdfMathReaderPlugin = (() => {
       setPageSize(null);
       setRenderError("");
       setActiveParagraph(null);
+      setActiveEquation(null);
+      setEquationSelectMode(false);
+      setEquationRect(null);
       setSelection("");
       setSelectionResult(null);
       textLayerTaskRef.current?.cancel();
@@ -2281,7 +3901,7 @@ var PdfMathReaderPlugin = (() => {
           if (cancelled) return;
           const base = page.getViewport({ scale: 1 });
           const available = Math.max(260, viewerWidth - 56);
-          const scale = zoomMode === "fit" ? clamp(available / base.width, 0.4, 3) : clamp(zoom, 0.35, 4);
+          const scale = zoomMode === "fit" ? clamp2(available / base.width, 0.4, 3) : clamp2(zoom, 0.35, 4);
           const canvas = canvasRef.current;
           if (canvas === null) return;
           const viewport = await renderPdfPage(page, canvas, scale, controller.signal);
@@ -2290,7 +3910,9 @@ var PdfMathReaderPlugin = (() => {
           setRenderState("ready");
           let textContent;
           let model = {
+            blocks: [],
             paragraphs: [],
+            equations: [],
             lines: [],
             viewport,
             pageWidth: viewport.width,
@@ -2299,7 +3921,14 @@ var PdfMathReaderPlugin = (() => {
           try {
             textContent = await page.getTextContent({ includeMarkedContent: false });
             if (cancelled) return;
-            model = buildPageModel(library, textContent, viewport);
+            model = buildPageModel(library, textContent, viewport, {
+              pageIndex,
+              overrides: pageOverridesFor(
+                equationOverridesRef.current,
+                doc.fingerprint,
+                pageIndex
+              )
+            });
           } catch (error) {
             console.warn("pdf-math-reader: text extraction failed", error);
           }
@@ -2347,7 +3976,7 @@ var PdfMathReaderPlugin = (() => {
         textLayerTaskRef.current?.cancel();
         textLayerTaskRef.current = null;
       };
-    }, [doc, pageIndex, zoomMode, zoom, viewerWidth, renderNonce]);
+    }, [doc, modelRevision, pageIndex, zoomMode, zoom, viewerWidth, renderNonce]);
     (0, import_react2.useEffect)(() => {
       if (!settingsOpen && !exportOpen) return void 0;
       const onKeyDown = (event) => {
@@ -2383,10 +4012,15 @@ var PdfMathReaderPlugin = (() => {
       setPageIndex(0);
       setTranslations({});
       setPageTranslationState({});
+      setTranslationErrors({});
       setBusyPages({});
       setProgress(null);
       setSelection("");
       setSelectionResult(null);
+      setActiveEquation(null);
+      setEquationSelectMode(false);
+      setEquationRect(null);
+      equationImageCacheRef.current.clear();
       setOpenError("");
       if (meta !== null) meta.pdf.destroy?.().catch?.(() => {
       });
@@ -2413,10 +4047,15 @@ var PdfMathReaderPlugin = (() => {
         setOpenError("");
         setTranslations({});
         setPageTranslationState({});
+        setTranslationErrors({});
         setBusyPages({});
         setProgress(null);
         setSelection("");
         setSelectionResult(null);
+        setActiveEquation(null);
+        setEquationSelectMode(false);
+        setEquationRect(null);
+        equationImageCacheRef.current.clear();
         setOpening(true);
         try {
           const pdf = await openPdf(file, tt("pdf.passwordPrompt"));
@@ -2469,7 +4108,7 @@ var PdfMathReaderPlugin = (() => {
     const goToPage = (0, import_react2.useCallback)(
       (next) => {
         if (pageCount === 0) return;
-        setPageIndex(clamp(next, 0, pageCount - 1));
+        setPageIndex(clamp2(next, 0, pageCount - 1));
       },
       [pageCount]
     );
@@ -2503,7 +4142,7 @@ var PdfMathReaderPlugin = (() => {
     const zoomStep = (0, import_react2.useCallback)(
       (factor) => {
         setZoomMode("custom");
-        setZoom(clamp(currentScale * factor, 0.35, 4));
+        setZoom(clamp2(currentScale * factor, 0.35, 4));
       },
       [currentScale]
     );
@@ -2518,6 +4157,10 @@ var PdfMathReaderPlugin = (() => {
         const key = event.key.toLowerCase();
         if (event.key === "Escape") {
           setActiveParagraph(null);
+          setActiveEquation(null);
+          setEquationSelectMode(false);
+          setEquationRect(null);
+          equationDragRef.current = null;
           clearTextSelection();
           return;
         }
@@ -2584,10 +4227,235 @@ var PdfMathReaderPlugin = (() => {
           return;
         }
         setActiveParagraph(paragraphId);
+        setActiveEquation(null);
         clearTextSelection();
         scrollToParagraph(paragraphId);
       },
       [activeParagraph, clearTextSelection, scrollToParagraph]
+    );
+    const scrollToEquation = (0, import_react2.useCallback)(
+      (equation, model = pageModel) => {
+        const root = viewerRef.current;
+        if (root === null) return;
+        const pageElement = root.querySelector(".pmr-page");
+        if (pageElement === null) return;
+        const scale = model?.viewport?.scale ?? 1;
+        const rootRect = root.getBoundingClientRect();
+        const pageRect = pageElement.getBoundingClientRect();
+        const top = equation.bbox[1] * scale;
+        const height = (equation.bbox[3] - equation.bbox[1]) * scale;
+        const target = root.scrollTop + (pageRect.top - rootRect.top) + top + height / 2 - root.clientHeight / 2;
+        root.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+      },
+      [pageModel]
+    );
+    const focusEquation = (0, import_react2.useCallback)(
+      (equation) => {
+        if (activeEquation === equation.id) {
+          setActiveEquation(null);
+          return;
+        }
+        setActiveEquation(equation.id);
+        setActiveParagraph(null);
+        clearTextSelection();
+        scrollToEquation(equation);
+      },
+      [activeEquation, clearTextSelection, scrollToEquation]
+    );
+    const equationAtPoint = (0, import_react2.useCallback)(
+      (x, y) => equations.find(
+        (equation) => x >= equation.bbox[0] - 2 && x <= equation.bbox[2] + 2 && y >= equation.bbox[1] - 2 && y <= equation.bbox[3] + 2
+      ),
+      [equations]
+    );
+    const commitPageOverrides = (0, import_react2.useCallback)(
+      (mutator) => {
+        const meta = docRef.current;
+        if (meta === null) return;
+        const fingerprint = meta.fingerprint;
+        translationEpochRef.current += 1;
+        translationAbortRef.current?.abort();
+        translationAbortRef.current = null;
+        setProgress(null);
+        setBusyPages({});
+        setPageTranslationState((previous) => {
+          const next = {};
+          for (const [key, value] of Object.entries(previous)) {
+            if (value?.status !== "loading") next[key] = value;
+          }
+          return next;
+        });
+        setEquationOverrides((previous) => {
+          const pages = { ...previous[fingerprint] ?? {} };
+          const current = pages[pageIndex] ?? { added: [], removed: [] };
+          const updated = mutator({
+            added: [...current.added ?? []],
+            removed: [...current.removed ?? []]
+          });
+          const nextPages = { ...pages };
+          if (updated.added.length === 0 && updated.removed.length === 0) {
+            delete nextPages[pageIndex];
+          } else {
+            nextPages[pageIndex] = updated;
+          }
+          const next = { ...previous };
+          if (Object.keys(nextPages).length === 0) delete next[fingerprint];
+          else next[fingerprint] = nextPages;
+          return next;
+        });
+        meta.pageCache?.delete(pageIndex);
+        const prefix = `${fingerprint}:${pageIndex}:`;
+        for (const key of [...equationImageCacheRef.current.keys()]) {
+          if (key.startsWith(prefix)) equationImageCacheRef.current.delete(key);
+        }
+        setTranslations((previous) => {
+          if (!(pageIndex in previous)) return previous;
+          const next = { ...previous };
+          delete next[pageIndex];
+          return next;
+        });
+        setPageTranslationState((previous) => {
+          if (!(pageIndex in previous)) return previous;
+          const next = { ...previous };
+          delete next[pageIndex];
+          return next;
+        });
+        setTranslationErrors((previous) => {
+          if (!(pageIndex in previous)) return previous;
+          const next = { ...previous };
+          delete next[pageIndex];
+          return next;
+        });
+        setActiveEquation(null);
+        setModelRevision((value) => value + 1);
+      },
+      [pageIndex]
+    );
+    const addManualEquation = (0, import_react2.useCallback)(
+      (box) => {
+        const model = pageModel;
+        if (model === null) return;
+        const atoms = Array.isArray(model.atoms) ? model.atoms : [];
+        const hasAtom = atoms.some((atom) => {
+          if (atom.text.trim() === "") return false;
+          const centerX = (atom.x + atom.endX) / 2;
+          const centerY = (atom.y + atom.top + atom.bottom) / 3;
+          return centerX >= box[0] && centerX <= box[2] && centerY >= box[1] && centerY <= box[3];
+        });
+        if (!hasAtom) {
+          notify(tt("equation.emptyRegion"), "error");
+          return;
+        }
+        commitPageOverrides((previous) => ({
+          ...previous,
+          added: [
+            ...previous.added.filter((entry) => overlapRatio(entry.bbox, box) <= 0.3),
+            { bbox: box }
+          ]
+        }));
+        notify(tt("equation.added"));
+      },
+      [commitPageOverrides, notify, pageModel, tt]
+    );
+    const removeEquation = (0, import_react2.useCallback)(
+      (equation) => {
+        commitPageOverrides((previous) => {
+          if (equation.detectionSource === "manual") {
+            return {
+              ...previous,
+              added: previous.added.filter(
+                (entry) => overlapRatio(entry.bbox, equation.bbox) <= 0.3
+              )
+            };
+          }
+          return {
+            ...previous,
+            removed: [
+              ...previous.removed.filter(
+                (box) => overlapRatio(box, equation.bbox) <= 0.3
+              ),
+              equation.bbox
+            ]
+          };
+        });
+        notify(tt("equation.removed"));
+      },
+      [commitPageOverrides, notify, tt]
+    );
+    const resetPageEquations = (0, import_react2.useCallback)(() => {
+      commitPageOverrides(() => ({ added: [], removed: [] }));
+      notify(tt("equation.reset"));
+    }, [commitPageOverrides, notify, tt]);
+    const beginEquationSelection = (0, import_react2.useCallback)(() => {
+      if (equationSelectMode) {
+        setEquationSelectMode(false);
+        setEquationRect(null);
+        equationDragRef.current = null;
+        return;
+      }
+      setEquationSelectMode(true);
+      setActiveEquation(null);
+      setActiveParagraph(null);
+      clearTextSelection();
+      notify(tt("equation.selectHint"));
+    }, [clearTextSelection, equationSelectMode, notify, tt]);
+    const onEquationPointerDown = (0, import_react2.useCallback)(
+      (event) => {
+        if (!equationSelectMode || pageModel === null) return;
+        if (event.button !== 0) return;
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = pageModel.viewport.scale;
+        const pageWidth = pageModel.viewport.width / scale;
+        const pageHeight = pageModel.viewport.height / scale;
+        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
+        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
+        equationDragRef.current = { x0: x, y0: y };
+        setEquationRect({ x0: x, y0: y, x1: x, y1: y });
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+      },
+      [equationSelectMode, pageModel]
+    );
+    const onEquationPointerMove = (0, import_react2.useCallback)(
+      (event) => {
+        const drag = equationDragRef.current;
+        if (drag === null || pageModel === null) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = pageModel.viewport.scale;
+        const pageWidth = pageModel.viewport.width / scale;
+        const pageHeight = pageModel.viewport.height / scale;
+        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
+        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
+        setEquationRect({ x0: drag.x0, y0: drag.y0, x1: x, y1: y });
+      },
+      [pageModel]
+    );
+    const onEquationPointerUp = (0, import_react2.useCallback)(
+      (event) => {
+        const drag = equationDragRef.current;
+        if (drag === null || pageModel === null) return;
+        equationDragRef.current = null;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = pageModel.viewport.scale;
+        const pageWidth = pageModel.viewport.width / scale;
+        const pageHeight = pageModel.viewport.height / scale;
+        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
+        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
+        const box = [
+          Math.min(drag.x0, x),
+          Math.min(drag.y0, y),
+          Math.max(drag.x0, x),
+          Math.max(drag.y0, y)
+        ];
+        setEquationRect(null);
+        if (box[2] - box[0] < 6 || box[3] - box[1] < 4) {
+          notify(tt("equation.tooSmall"), "error");
+          return;
+        }
+        setEquationSelectMode(false);
+        addManualEquation(box);
+      },
+      [addManualEquation, notify, pageModel, tt]
     );
     const handleTextMouseUp = (0, import_react2.useCallback)(
       (event) => {
@@ -2612,11 +4480,21 @@ var PdfMathReaderPlugin = (() => {
       (event) => {
         if ((window.getSelection()?.toString().trim() ?? "") !== "") return;
         const rect = event.currentTarget.getBoundingClientRect();
+        const x = (event.clientX - rect.left) / currentScale;
+        const y = (event.clientY - rect.top) / currentScale;
+        const equation = equationAtPoint(x, y);
+        if (equation !== void 0) {
+          setActiveParagraph(null);
+          setActiveEquation((previous) => previous === equation.id ? null : equation.id);
+          return;
+        }
         const line = lineAtPoint(event.clientX - rect.left, event.clientY - rect.top);
         if (line === void 0) {
           setActiveParagraph(null);
+          setActiveEquation(null);
           return;
         }
+        setActiveEquation(null);
         if (activeParagraph === line.paragraphId) {
           setActiveParagraph(null);
           clearTextSelection();
@@ -2624,7 +4502,7 @@ var PdfMathReaderPlugin = (() => {
           setActiveParagraph(line.paragraphId);
         }
       },
-      [activeParagraph, clearTextSelection, lineAtPoint]
+      [activeParagraph, clearTextSelection, currentScale, equationAtPoint, lineAtPoint]
     );
     const saveNote = (0, import_react2.useCallback)(() => {
       const text = noteText.trim();
@@ -2806,6 +4684,32 @@ var PdfMathReaderPlugin = (() => {
           [id]: { text }
         }
       }));
+      setTranslationErrors((previous) => {
+        const page = previous[targetPage];
+        if (page === void 0 || page[id] === void 0) return previous;
+        const nextPage = { ...page };
+        delete nextPage[id];
+        const next = { ...previous, [targetPage]: nextPage };
+        if (Object.keys(nextPage).length === 0) delete next[targetPage];
+        return next;
+      });
+    }, []);
+    const setTranslationError = (0, import_react2.useCallback)((targetPage, id, message) => {
+      setTranslationErrors((previous) => ({
+        ...previous,
+        [targetPage]: { ...previous[targetPage] ?? {}, [id]: message }
+      }));
+    }, []);
+    const clearTranslationError = (0, import_react2.useCallback)((targetPage, id) => {
+      setTranslationErrors((previous) => {
+        const page = previous[targetPage];
+        if (page === void 0 || page[id] === void 0) return previous;
+        const nextPage = { ...page };
+        delete nextPage[id];
+        const next = { ...previous, [targetPage]: nextPage };
+        if (Object.keys(nextPage).length === 0) delete next[targetPage];
+        return next;
+      });
     }, []);
     const translatePageInternal = (0, import_react2.useCallback)(
       async (targetPage, targetParagraphs, options = {}) => {
@@ -2829,8 +4733,13 @@ var PdfMathReaderPlugin = (() => {
           [targetPage]: { status: "loading" }
         }));
         let applied = 0;
+        let failed = 0;
         try {
-          const entries = usable.map((paragraph) => ({ id: paragraph.id, text: paragraph.text }));
+          const entries = usable.map((paragraph) => ({
+            id: paragraph.id,
+            text: paragraph.translateText || paragraph.text,
+            paragraph
+          }));
           const batches = makeBatches(entries, 5, 3800);
           for (const batch of batches) {
             if (signal?.aborted || epoch !== translationEpochRef.current) {
@@ -2842,7 +4751,11 @@ var PdfMathReaderPlugin = (() => {
               if (!force) {
                 const cached = translationCacheRef.current.get(key);
                 if (cached !== void 0) {
-                  setTranslationFor(targetPage, entry.id, cached);
+                  setTranslationFor(
+                    targetPage,
+                    entry.id,
+                    restorePlaceholders(cached, entry.paragraph.placeholders)
+                  );
                   applied += 1;
                   continue;
                 }
@@ -2864,22 +4777,36 @@ var PdfMathReaderPlugin = (() => {
             const byId = new Map(
               (Array.isArray(response.translations) ? response.translations : []).map((item) => [
                 item.id,
-                item.text
+                item
               ])
             );
             for (const { entry, key } of pending) {
-              const text = byId.get(entry.id) ?? entry.text;
+              const item = byId.get(entry.id);
+              if (item === void 0 || item.error === "placeholder") {
+                failed += 1;
+                setTranslationError(
+                  targetPage,
+                  entry.id,
+                  tt("error.placeholder")
+                );
+                continue;
+              }
+              const text = typeof item.text === "string" ? item.text : entry.text;
               translationCacheRef.current.set(key, text);
-              setTranslationFor(targetPage, entry.id, text);
+              setTranslationFor(
+                targetPage,
+                entry.id,
+                restorePlaceholders(text, entry.paragraph.placeholders)
+              );
               applied += 1;
             }
           }
           if (epoch !== translationEpochRef.current) return false;
           setPageTranslationState((previous) => ({
             ...previous,
-            [targetPage]: { status: "done" }
+            [targetPage]: failed > 0 ? { status: "error", error: tt("panel.placeholderFailed", { count: failed }) } : { status: "done" }
           }));
-          return true;
+          return failed === 0;
         } catch (error) {
           if (epoch !== translationEpochRef.current) return false;
           if (signal?.aborted || isAbort(error)) {
@@ -2904,7 +4831,14 @@ var PdfMathReaderPlugin = (() => {
           }
         }
       },
-      [glossary, glossaryKeyValue, setTranslationFor, settings.targetLanguage, tt]
+      [
+        glossary,
+        glossaryKeyValue,
+        setTranslationError,
+        setTranslationFor,
+        settings.targetLanguage,
+        tt
+      ]
     );
     const translateCurrentPage = (0, import_react2.useCallback)(() => {
       if (!pageModel || paragraphs.length === 0 || pageBusy) return;
@@ -2932,17 +4866,56 @@ var PdfMathReaderPlugin = (() => {
       translatePageInternal,
       tt
     ]);
+    const retryParagraph = (0, import_react2.useCallback)(
+      (paragraph) => {
+        if (!pageModel || pageBusy) return;
+        translationAbortRef.current?.abort();
+        const controller = new AbortController();
+        translationAbortRef.current = controller;
+        clearTranslationError(pageIndex, paragraph.id);
+        translatePageInternal(pageIndex, [paragraph], {
+          force: true,
+          signal: controller.signal
+        }).catch((error) => {
+          if (!controller.signal.aborted && !isAbort(error)) {
+            notify(`${tt("error.translate")}: ${error?.message ?? ""}`, "error");
+          }
+        }).finally(() => {
+          if (translationAbortRef.current === controller) translationAbortRef.current = null;
+        });
+      },
+      [
+        clearTranslationError,
+        notify,
+        pageBusy,
+        pageIndex,
+        pageModel,
+        translatePageInternal,
+        tt
+      ]
+    );
     const getPageModel = (0, import_react2.useCallback)(async (targetPage) => {
       const meta = docRef.current;
-      if (meta === null) return { paragraphs: [] };
+      if (meta === null) return { blocks: [], paragraphs: [] };
       const cached = meta.pageCache?.get(targetPage);
       if (cached !== void 0) return cached;
       const page = await meta.pdf.getPage(targetPage + 1);
-      const model = await extractPageModel(page, 1, {
-        documentId: meta.fingerprint,
-        pageIndex: targetPage
-      });
-      if (docRef.current !== meta) return { paragraphs: [] };
+      const model = await extractPageModel(
+        page,
+        1,
+        {
+          documentId: meta.fingerprint,
+          pageIndex: targetPage
+        },
+        {
+          overrides: pageOverridesFor(
+            equationOverridesRef.current,
+            meta.fingerprint,
+            targetPage
+          )
+        }
+      );
+      if (docRef.current !== meta) return { blocks: [], paragraphs: [] };
       meta.pageCache?.set(targetPage, model);
       return model;
     }, []);
@@ -3032,6 +5005,7 @@ var PdfMathReaderPlugin = (() => {
       translationCacheRef.current.clear();
       setTranslations({});
       setPageTranslationState({});
+      setTranslationErrors({});
       notify(tt("toast.cacheCleared"));
     }, [notify, tt]);
     const collectPages = (0, import_react2.useCallback)(async () => {
@@ -3043,14 +5017,27 @@ var PdfMathReaderPlugin = (() => {
         let model = cache.get(index);
         if (model === void 0) {
           const page = await meta.pdf.getPage(index + 1);
-          model = await extractPageModel(page, 1, {
-            documentId: meta.fingerprint,
-            pageIndex: index
-          });
+          model = await extractPageModel(
+            page,
+            1,
+            {
+              documentId: meta.fingerprint,
+              pageIndex: index
+            },
+            {
+              overrides: pageOverridesFor(
+                equationOverridesRef.current,
+                meta.fingerprint,
+                index
+              )
+            }
+          );
           if (docRef.current !== meta) return [];
           cache.set(index, model);
         }
-        if (model.paragraphs.length > 0) pages.push({ index, paragraphs: model.paragraphs });
+        if ((model.blocks?.length ?? 0) > 0) {
+          pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs });
+        }
       }
       return pages;
     }, []);
@@ -3072,14 +5059,19 @@ var PdfMathReaderPlugin = (() => {
           );
           for (const index of indices) {
             const model = await getPageModel(index);
-            if (model.paragraphs.length > 0) pages.push({ index, paragraphs: model.paragraphs });
+            if ((model.blocks?.length ?? 0) > 0) {
+              pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs });
+            }
           }
           label = `\u7B2C ${pageIndex + 1} \u9875\u53CA\u76F8\u90BB\u9875`;
         }
-        const text = pages.map(
-          (page) => `[Page ${page.index + 1}]
-${page.paragraphs.map((paragraph) => paragraph.text).join("\n\n")}`
-        ).join("\n\n");
+        const text = pages.map((page) => {
+          const content = (page.blocks ?? []).map(
+            (block) => block.type === "equation" ? `[${tt("equation.context", { number: block.equationNumber ?? "" })}] ${block.text}` : block.text
+          );
+          return `[Page ${page.index + 1}]
+${content.join("\n\n")}`;
+        }).join("\n\n");
         const clipped = text.length > 22e3 ? `${text.slice(0, 16e3)}
 
 [... context truncated ...]
@@ -3089,7 +5081,7 @@ ${text.slice(-5600)}` : text;
         chatContextCacheRef.current.set(cacheKey, value);
         return value;
       },
-      [collectPages, getPageModel, pageIndex]
+      [collectPages, getPageModel, pageIndex, tt]
     );
     const sendChat = (0, import_react2.useCallback)(
       async (suggestion) => {
@@ -3213,6 +5205,36 @@ ${text.slice(-5600)}` : text;
       if (rightTab !== "reading") return;
       chatEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     }, [chatBusy, chatMessages, rightTab]);
+    const renderExportEquations = (0, import_react2.useCallback)(async (meta, pages) => {
+      const images = /* @__PURE__ */ new Map();
+      for (const page of pages) {
+        const pageEquations = (page.blocks ?? []).filter((block) => block.type === "equation");
+        if (pageEquations.length === 0) continue;
+        let pdfPage;
+        try {
+          pdfPage = await meta.pdf.getPage(page.index + 1);
+        } catch {
+          continue;
+        }
+        for (const equation of pageEquations) {
+          try {
+            const cropBox = equation.imageBbox ?? equation.bbox;
+            const result = await renderEquationCrop(pdfPage, cropBox, {
+              displayWidth: Math.min(
+                1400,
+                Math.max(320, (cropBox[2] - cropBox[0]) * 3)
+              ),
+              devicePixelRatio: 2,
+              maxPixels: 8e6,
+              maxScale: 6
+            });
+            images.set(`${page.index}:${equation.id}`, result);
+          } catch {
+          }
+        }
+      }
+      return images;
+    }, []);
     const exportMarkdown = (0, import_react2.useCallback)(async () => {
       const meta = docRef.current;
       if (meta === null) return;
@@ -3230,7 +5252,16 @@ ${text.slice(-5600)}` : text;
       ];
       for (const page of pages) {
         lines.push(`## ${tt("page.short", { page: page.index + 1 })}`, "");
-        for (const paragraph of page.paragraphs) {
+        for (const block of page.blocks ?? []) {
+          if (block.type === "equation") {
+            if (block.equationNumber) {
+              lines.push(`**${tt("equation.label")} ${block.equationNumber}**`, "");
+            }
+            lines.push("```", block.text, "```", "");
+            continue;
+          }
+          const paragraph = block.paragraph;
+          if (paragraph === void 0) continue;
           const translated = translations[page.index]?.[paragraph.id]?.text;
           lines.push(`> ${paragraph.text.replace(/\s+/g, " ")}`, "");
           if (translated) lines.push(translated, "");
@@ -3240,21 +5271,78 @@ ${text.slice(-5600)}` : text;
       downloadBlob(lines.join("\n"), filename, "text/markdown;charset=utf-8");
       notify(tt("toast.exported", { name: filename }));
     }, [collectPages, notify, settings.targetLanguage, translations, tt]);
-    const exportHtml = (0, import_react2.useCallback)(async () => {
+    const exportBundle = (0, import_react2.useCallback)(async () => {
       const meta = docRef.current;
       if (meta === null) return;
       setExportOpen(false);
+      notify(tt("toast.exporting"));
       const pages = await collectPages();
       if (pages.length === 0) {
         notify(tt("error.exportEmpty"), "error");
         return;
       }
+      const images = await renderExportEquations(meta, pages);
+      const lines = [
+        `# ${meta.name}`,
+        "",
+        `> ${tt("export.generated")} \xB7 ${(/* @__PURE__ */ new Date()).toLocaleString()} \xB7 ${settings.targetLanguage}`,
+        ""
+      ];
+      const files = [];
+      for (const page of pages) {
+        lines.push(`## ${tt("page.short", { page: page.index + 1 })}`, "");
+        for (const block of page.blocks ?? []) {
+          if (block.type === "equation") {
+            const image = images.get(`${page.index}:${block.id}`);
+            const label = block.equationNumber ? `${tt("equation.label")} ${block.equationNumber}` : tt("equation.unnumbered");
+            if (image !== void 0) {
+              const name = `equations/${block.id}.png`;
+              files.push({ name, data: dataUrlToBytes(image.dataUrl) });
+              lines.push(`![${label}](${name})`, "");
+            } else {
+              lines.push(`**${label}**`, "", "```", block.text, "```", "");
+            }
+            continue;
+          }
+          const paragraph = block.paragraph;
+          if (paragraph === void 0) continue;
+          const translated = translations[page.index]?.[paragraph.id]?.text;
+          lines.push(`> ${paragraph.text.replace(/\s+/g, " ")}`, "");
+          if (translated) lines.push(translated, "");
+        }
+      }
+      const markdown = lines.join("\n");
+      files.unshift({ name: `${baseName(meta.name)}-bilingual.md`, data: markdown });
+      const zip = createZip(files);
+      const filename = `${baseName(meta.name)}-bilingual.zip`;
+      downloadBlob(new Blob([zip], { type: "application/zip" }), filename, "application/zip");
+      notify(tt("toast.exported", { name: filename }));
+    }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt]);
+    const exportHtml = (0, import_react2.useCallback)(async () => {
+      const meta = docRef.current;
+      if (meta === null) return;
+      setExportOpen(false);
+      notify(tt("toast.exporting"));
+      const pages = await collectPages();
+      if (pages.length === 0) {
+        notify(tt("error.exportEmpty"), "error");
+        return;
+      }
+      const images = await renderExportEquations(meta, pages);
       const body = pages.map((page) => {
-        const cards = page.paragraphs.map((paragraph) => {
+        const content = (page.blocks ?? []).map((block) => {
+          if (block.type === "equation") {
+            const image = images.get(`${page.index}:${block.id}`);
+            const label = block.equationNumber ? `${tt("equation.label")} ${block.equationNumber}` : tt("equation.unnumbered");
+            const figure = image !== void 0 ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">` : `<pre>${escapeHtml(block.text)}</pre>`;
+            return `<figure class="equation">${figure}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
+          }
+          const paragraph = block.paragraph;
+          if (paragraph === void 0) return "";
           const translated = translations[page.index]?.[paragraph.id]?.text;
           return `<div class="card"><div class="src">${escapeHtml(paragraph.text)}</div>${translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ""}</div>`;
         }).join("\n");
-        return `<section><h2>${escapeHtml(tt("page.short", { page: page.index + 1 }))}</h2>${cards}</section>`;
+        return `<section><h2>${escapeHtml(tt("page.short", { page: page.index + 1 }))}</h2>${content}</section>`;
       }).join("\n");
       const html = `<!doctype html>
 <html lang="${escapeHtml(settings.targetLanguage)}">
@@ -3272,8 +5360,12 @@ h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #
 .card { padding: 14px 0 16px; border-bottom: 1px dashed #e5e7eb; }
 .src { color: #4b5563; font-size: 13.5px; }
 .tr { margin-top: 7px; font-size: 15px; }
-@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card { break-inside: avoid; } }
-@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card { border-color: #374151; } .meta { color: #9ca3af; } }
+figure.equation { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: center; background: #fff; }
+figure.equation img { max-width: 100%; height: auto; }
+figure.equation pre { margin: 0; white-space: pre-wrap; text-align: left; font-size: 12px; }
+figure.equation figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
+@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation { break-inside: avoid; } }
+@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation { border-color: #374151; } figure.equation { background: #fff; } .meta { color: #9ca3af; } }
 </style>
 </head>
 <body>
@@ -3285,7 +5377,7 @@ ${body}
       const filename = `${baseName(meta.name)}-reading.html`;
       downloadBlob(html, filename, "text/html;charset=utf-8");
       notify(tt("toast.exported", { name: filename }));
-    }, [collectPages, notify, settings.targetLanguage, translations, tt]);
+    }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt]);
     const onDragEnter = (0, import_react2.useCallback)((event) => {
       event.preventDefault();
       dragDepthRef.current += 1;
@@ -3321,6 +5413,7 @@ ${body}
           setProgress(null);
           setTranslations({});
           setPageTranslationState({});
+          setTranslationErrors({});
           setSelectionResult(null);
           setSelection("");
         }
@@ -3340,9 +5433,9 @@ ${body}
         const move = (moveEvent) => {
           const delta = moveEvent.clientX - startX;
           if (side === "rail") {
-            updateSettings({ railWidth: clamp(startWidth + delta, 160, 380) });
+            updateSettings({ railWidth: clamp2(startWidth + delta, 160, 380) });
           } else {
-            updateSettings({ translationWidth: clamp(startWidth - delta, 300, 640) });
+            updateSettings({ translationWidth: clamp2(startWidth - delta, 300, 640) });
           }
         };
         const stop = () => {
@@ -3387,7 +5480,16 @@ ${body}
           ),
           /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "pmr-topbar", children: [
             /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-brand", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-brand-mark", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "book", size: 18 }) }),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "img",
+                {
+                  className: "pmr-brand-mark",
+                  src: PANEL_ICON,
+                  alt: "",
+                  "aria-hidden": "true",
+                  draggable: false
+                }
+              ),
               /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-brand-text", children: [
                 /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-brand-title", children: tt("page.title") }),
                 /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-brand-sub", children: tt("page.subtitle") })
@@ -3533,6 +5635,20 @@ ${body}
                     ]
                   }
                 ),
+                /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                  "button",
+                  {
+                    type: "button",
+                    className: `pmr-btn pmr-eq-select-btn ${equationSelectMode ? "pmr-btn-primary" : "pmr-btn-ghost"}`,
+                    onClick: beginEquationSelection,
+                    title: tt("equation.select"),
+                    disabled: pageModel === null,
+                    children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "crop", size: 14 }),
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-select-text", children: tt("equation.select") })
+                    ]
+                  }
+                ),
                 /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { style: { position: "relative" }, children: [
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                     "button",
@@ -3552,6 +5668,10 @@ ${body}
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", onClick: exportMarkdown, children: [
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "download", size: 13 }),
                       tt("action.exportMarkdown")
+                    ] }),
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", onClick: exportBundle, children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "file", size: 13 }),
+                      tt("action.exportBundle")
                     ] }),
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", onClick: exportHtml, children: [
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "file", size: 13 }),
@@ -3652,7 +5772,7 @@ ${body}
                         label: tt("rail.page", { page: index + 1 }),
                         active: index === pageIndex,
                         width: Math.round(
-                          clamp((settings.railWidth - 34) / 2, 78, 168) * Math.min(window.devicePixelRatio || 1, 2)
+                          clamp2((settings.railWidth - 34) / 2, 78, 168) * Math.min(window.devicePixelRatio || 1, 2)
                         ),
                         cacheKey: `${doc.fingerprint}:${index + 1}`,
                         onClick: () => goToPage(index)
@@ -3707,7 +5827,19 @@ ${body}
                           }
                         },
                         line.id
-                      ))
+                      )),
+                      activeEquationBlock !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                        "div",
+                        {
+                          className: "pmr-hl pmr-eq-hl",
+                          style: {
+                            left: activeEquationBlock.bbox[0] * currentScale,
+                            top: activeEquationBlock.bbox[1] * currentScale,
+                            width: (activeEquationBlock.bbox[2] - activeEquationBlock.bbox[0]) * currentScale,
+                            height: (activeEquationBlock.bbox[3] - activeEquationBlock.bbox[1]) * currentScale
+                          }
+                        }
+                      )
                     ] }),
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                       "div",
@@ -3718,6 +5850,31 @@ ${body}
                         onClick: handleTextClick
                       },
                       textLayerKey
+                    ),
+                    equationSelectMode && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                      "div",
+                      {
+                        className: "pmr-eq-selector",
+                        onPointerDown: onEquationPointerDown,
+                        onPointerMove: onEquationPointerMove,
+                        onPointerUp: onEquationPointerUp,
+                        onPointerCancel: () => {
+                          equationDragRef.current = null;
+                          setEquationRect(null);
+                        },
+                        children: equationRect !== null && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                          "div",
+                          {
+                            className: "pmr-eq-box",
+                            style: {
+                              left: Math.min(equationRect.x0, equationRect.x1) * currentScale,
+                              top: Math.min(equationRect.y0, equationRect.y1) * currentScale,
+                              width: Math.abs(equationRect.x1 - equationRect.x0) * currentScale,
+                              height: Math.abs(equationRect.y1 - equationRect.y0) * currentScale
+                            }
+                          }
+                        )
+                      }
                     ),
                     renderState === "loading" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-page-loading", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { style: { display: "inline-flex", alignItems: "center", gap: 7 }, children: [
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
@@ -3855,7 +6012,8 @@ ${body}
                         ] }),
                         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-hint", children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "sparkle", size: 11 }),
-                          tt("panel.formulas")
+                          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("panel.formulas") }),
+                          equations.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-count-badge", children: tt("panel.equationCount", { count: equations.length }) })
                         ] })
                       ] }),
                       rightTab === "notes" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-hint", children: [
@@ -3872,27 +6030,28 @@ ${body}
                             total: progress.total
                           })
                         ] }),
-                        paragraphs.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty", children: [
+                        blocks.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty", children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "file", size: 22 }),
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: tt("panel.empty") })
-                        ] }) : viewMode !== "source" && !hasPageTranslation && pageStatus !== "loading" && pageStatus !== "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty", children: [
-                          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "languages", size: 22 }),
-                          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: tt("panel.waiting") }),
-                          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: tt("panel.waitingAll") }),
-                          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
-                            "button",
-                            {
-                              type: "button",
-                              className: "pmr-btn pmr-btn-primary",
-                              onClick: translateCurrentPage,
-                              disabled: pageBusy || progress?.running,
-                              children: [
-                                /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "languages", size: 14 }),
-                                tt("action.translatePage")
-                              ]
-                            }
-                          )
                         ] }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
+                          waitingForTranslation && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty pmr-tr-waiting", children: [
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "languages", size: 22 }),
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: tt("panel.waiting") }),
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: tt("panel.waitingAll") }),
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                              "button",
+                              {
+                                type: "button",
+                                className: "pmr-btn pmr-btn-primary",
+                                onClick: translateCurrentPage,
+                                disabled: pageBusy || progress?.running,
+                                children: [
+                                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "languages", size: 14 }),
+                                  tt("action.translatePage")
+                                ]
+                              }
+                            )
+                          ] }),
                           pageStatus === "error" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-inline-error", role: "alert", children: [
                             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "alert", size: 14 }),
                             /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { children: [
@@ -3901,19 +6060,43 @@ ${body}
                             ] }),
                             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: translateCurrentPage, children: tt("action.retry") })
                           ] }),
-                          paragraphs.map((paragraph) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-                            SegmentCard,
-                            {
-                              tt,
-                              paragraph,
-                              translation: pageTranslation[paragraph.id],
-                              status: pageStatus,
-                              mode: viewMode,
-                              active: activeParagraph === paragraph.id,
-                              onClick: () => focusParagraph(paragraph.id)
-                            },
-                            paragraph.id
-                          ))
+                          (waitingForTranslation ? blocks.filter((block) => block.type === "equation") : blocks).map(
+                            (block) => block.type === "equation" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                              EquationBlock,
+                              {
+                                tt,
+                                equation: block,
+                                pdf: doc.pdf,
+                                fingerprint: docFingerprint,
+                                pageIndex,
+                                cache: equationImageCacheRef,
+                                cacheVersion: modelRevision,
+                                active: activeEquation === block.id,
+                                onLocate: focusEquation,
+                                onRemove: removeEquation,
+                                onCopy: copyText
+                              },
+                              block.id
+                            ) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                              SegmentCard,
+                              {
+                                tt,
+                                paragraph: block.paragraph,
+                                translation: pageTranslation[block.paragraphId],
+                                status: pageStatus,
+                                mode: viewMode,
+                                active: activeParagraph === block.paragraphId,
+                                error: translationErrors[pageIndex]?.[block.paragraphId],
+                                onRetry: () => retryParagraph(block.paragraph),
+                                onClick: () => focusParagraph(block.paragraphId)
+                              },
+                              block.id
+                            )
+                          ),
+                          hasPageOverrides && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-reset", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: resetPageEquations, children: [
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "refresh", size: 12 }),
+                            tt("equation.restore")
+                          ] }) })
                         ] })
                       ] }),
                       selection !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
@@ -4289,14 +6472,32 @@ ${body}
     );
   }
   function PdfReaderIcon({ size = 20, active }) {
+    const px = Math.max(14, size);
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
       "span",
       {
         style: {
           display: "inline-flex",
-          color: active ? "var(--dsw-alias-brand-primary)" : "currentColor"
+          width: px,
+          height: px,
+          flex: "none",
+          overflow: "hidden",
+          borderRadius: Math.round(px * 0.26),
+          userSelect: "none",
+          boxShadow: active ? "0 0 0 1.5px var(--dsw-alias-brand-primary)" : "none"
         },
-        children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "book", size, strokeWidth: 1.6 })
+        children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "img",
+          {
+            src: PANEL_ICON,
+            alt: "",
+            "aria-hidden": "true",
+            draggable: false,
+            width: px,
+            height: px,
+            style: { display: "block", width: "100%", height: "100%", objectFit: "cover" }
+          }
+        )
       }
     );
   }

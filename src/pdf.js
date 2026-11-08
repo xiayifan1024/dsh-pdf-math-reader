@@ -5,6 +5,14 @@
  * never installs a global that could collide with the document-preview plugin.
  */
 
+import {
+  analyzeEquations,
+  cropMetrics,
+  splitTextAtom,
+  unionBox,
+} from './equations.js'
+import { mathToken } from '../lib/placeholders.js'
+
 const ASSET_BASE = '/pdf-reader/assets'
 let libraryPromise
 
@@ -166,6 +174,53 @@ export function renderPdfPage(page, canvas, scale, signal) {
   return job
 }
 
+/**
+ * Render an equation region from an independently rendered page canvas.
+ *
+ * The crop never depends on the reader's visible canvas or current zoom. It is
+ * sized from the requested display width and device pixel ratio, then clamped
+ * by a pixel budget so a very large region cannot exhaust browser memory.
+ */
+export async function renderEquationCrop(page, bbox, options = {}, signal) {
+  const metrics = cropMetrics(bbox, options)
+  const canvas = document.createElement('canvas')
+  canvas.width = metrics.pixelWidth
+  canvas.height = metrics.pixelHeight
+  const context = canvas.getContext('2d', { alpha: false })
+  if (context === null) throw new Error('Canvas 2D context is unavailable')
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+  // Shift the viewport by the crop origin. The offset is in device pixels and
+  // therefore also correct for rotated pages.
+  const viewport = page.getViewport({
+    scale: metrics.renderScale,
+    offsetX: -bbox[0] * metrics.renderScale,
+    offsetY: -bbox[1] * metrics.renderScale,
+  })
+  const task = page.render({ canvasContext: context, viewport })
+  const cancel = () => task.cancel()
+  if (signal !== undefined) {
+    if (signal.aborted) {
+      task.cancel()
+      throw new DOMException('Aborted', 'AbortError')
+    }
+    signal.addEventListener('abort', cancel, { once: true })
+  }
+  try {
+    await task.promise
+  } finally {
+    signal?.removeEventListener?.('abort', cancel)
+  }
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    width: metrics.displayWidth,
+    height: metrics.displayHeight,
+    pixelWidth: metrics.pixelWidth,
+    pixelHeight: metrics.pixelHeight,
+    renderScale: metrics.renderScale,
+  }
+}
+
 function isCjk(character) {
   if (character === undefined || character === '') return false
   const code = character.codePointAt(0)
@@ -204,89 +259,216 @@ function normalizeLineText(text) {
 }
 
 /**
+ * Convert PDF.js text items into page-point atoms (scale-1 viewport space).
+ * Empty items are kept so whitespace still influences word spacing.
+ */
+export function buildAtoms(library, textContent, viewport) {
+  const scale = Number.isFinite(viewport?.scale) && viewport.scale > 0 ? viewport.scale : 1
+  const items = Array.isArray(textContent?.items) ? textContent.items : []
+  const atoms = []
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+    if (item === null || typeof item !== 'object' || typeof item.str !== 'string') continue
+    if (!Array.isArray(item.transform)) continue
+    const matrix = library.Util.transform(viewport.transform, item.transform)
+    const x = matrix[4] / scale
+    const baseline = matrix[5] / scale
+    const fontHeight =
+      Math.max(1, Math.hypot(matrix[2], matrix[3]) || (item.height || 10)) / scale
+    if (!Number.isFinite(x) || !Number.isFinite(baseline)) continue
+    const width = Math.max(
+      0,
+      item.width || (item.str.trim() === '' ? 0 : item.str.length * fontHeight * 0.48),
+    )
+    atoms.push({
+      index,
+      sourceIndex: index,
+      text: item.str,
+      x,
+      y: baseline,
+      endX: x + width,
+      width,
+      height: fontHeight,
+      top: baseline - fontHeight * 0.82,
+      bottom: baseline + fontHeight * 0.18,
+      fontName: typeof item.fontName === 'string' ? item.fontName : '',
+    })
+  }
+  return atoms
+}
+
+/**
  * Reconstruct lines and paragraph-sized segments from PDF.js text items.
  *
- * The content stream generally follows reading order (including columns), so
- * this preserves item order instead of globally sorting by y, which would
- * interleave two-column papers. Lines still split on large horizontal moves and
- * paragraphs split on vertical gaps, indentation, and font-size changes.
+ * Display-equation regions are detected first and removed from the text flow,
+ * so their fragments never become paragraphs. Remaining lines are rebuilt in
+ * content-stream order (which follows columns), split on large horizontal moves
+ * and vertical gaps, and grouped into paragraphs.
+ *
+ * Inline math inside body lines is replaced by a unique placeholder in
+ * `translateText` while `text` keeps the readable source. Placeholders are
+ * restored after translation.
  */
-export function buildPageModel(library, textContent, viewport) {
-  const pageWidth = viewport.width
-  const items = Array.isArray(textContent?.items) ? textContent.items : []
+export function buildPageModel(library, textContent, viewport, options = {}) {
+  const scale = Number.isFinite(viewport?.scale) && viewport.scale > 0 ? viewport.scale : 1
+  const pageWidth = (viewport?.width ?? 612) / scale
+  const pageHeight = (viewport?.height ?? 792) / scale
+  const pageIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : 0
+  const atoms = buildAtoms(library, textContent, viewport).flatMap(splitTextAtom)
+  const analysis = analyzeEquations(atoms, {
+    pageWidth,
+    pageHeight,
+    bodyFont: options.bodyFont,
+    bodySize: options.bodySize,
+    overrides: options.overrides,
+  })
+  const excluded = analysis.equationAtomIds
+  const inlineMath = analysis.inlineMath
   const lines = []
   let current
+  let tokenCount = 0
 
-  const flush = () => {
+  const flushMath = (line) => {
+    const run = line.mathRun
+    if (run === null) return
+    line.mathRun = null
+    const mathText = run.text.replace(/\s+/g, ' ').trim()
+    if (mathText === '') return
+    const token = mathToken((tokenCount += 1))
+    if (line.text === '') line.text = mathText
+    else if (run.separated) line.text = joinFragments(line.text, mathText)
+    else line.text += mathText
+    if (line.translateText === '') line.translateText = token
+    else if (run.separated) line.translateText = joinFragments(line.translateText, token)
+    else line.translateText += token
+    line.placeholders.push({ token, text: mathText })
+  }
+
+  const appendMath = (atom) => {
+    const line = current
+    if (line.mathRun === null) {
+      const separated =
+        line.pendingSpace ||
+        (line.text !== '' && atom.x - line.endX > Math.max(1.2, atom.height * 0.18))
+      line.mathRun = { text: atom.text, last: atom, separated, pendingSpace: false }
+    } else {
+      const gap = atom.x - line.mathRun.last.endX
+      const space =
+        line.mathRun.pendingSpace ||
+        gap > Math.max(1.2, Math.max(atom.height, line.mathRun.last.height) * 0.18)
+      line.mathRun.text += space ? ` ${atom.text}` : atom.text
+      line.mathRun.last = atom
+      line.mathRun.pendingSpace = false
+    }
+    line.pendingSpace = false
+    line.endX = atom.endX
+    line.right = Math.max(line.right, atom.endX)
+    line.height = Math.max(line.height, atom.height)
+    line.top = Math.min(line.top, atom.top)
+    line.count += 1
+  }
+
+  const appendText = (atom) => {
+    const line = current
+    if (line.mathRun !== null) flushMath(line)
+    if (line.pendingSpace) {
+      line.text += ' '
+      line.translateText += ' '
+      line.pendingSpace = false
+    }
+    const gap = atom.x - line.endX
+    const join = gap > Math.max(1.2, atom.height * 0.18)
+    if (line.text === '') {
+      line.text = atom.text
+      line.translateText = atom.text
+    } else if (join) {
+      line.text = joinFragments(line.text, atom.text)
+      line.translateText = joinFragments(line.translateText, atom.text)
+    } else {
+      line.text += atom.text
+      line.translateText += atom.text
+    }
+    line.endX = atom.endX
+    line.right = Math.max(line.right, atom.endX)
+    line.height = Math.max(line.height, atom.height)
+    line.top = Math.min(line.top, atom.top)
+    line.count += 1
+  }
+
+  const flushLine = () => {
     if (current === undefined) return
+    if (current.mathRun !== null) flushMath(current)
     const text = normalizeLineText(current.text)
+    const translateText = normalizeLineText(current.translateText)
     if (text !== '') {
       lines.push({
         text,
+        translateText,
+        placeholders: current.placeholders,
         x: current.x,
         top: current.top,
         width: Math.max(1, current.right - current.x),
         height: Math.max(1, current.height),
         baseline: current.baseline,
+        order: current.order,
       })
     }
     current = undefined
   }
 
-  for (const item of items) {
-    if (item === null || typeof item !== 'object' || typeof item.str !== 'string') continue
-    if (!Array.isArray(item.transform)) continue
-    const matrix = library.Util.transform(viewport.transform, item.transform)
-    const x = matrix[4]
-    const baseline = matrix[5]
-    const fontHeight = Math.max(1, Math.hypot(matrix[2], matrix[3]) || (item.height || 10))
-    const width = Math.max(1, (item.width || item.str.length * fontHeight * 0.48) * viewport.scale)
-    if (!Number.isFinite(x) || !Number.isFinite(baseline)) continue
-    if (item.str.trim() === '') {
+  for (const atom of atoms) {
+    if (excluded.has(atom.index)) continue
+    if (atom.text.trim() === '') {
       if (current !== undefined) {
-        current.endX = Math.max(current.endX, x + width)
-        if (item.str.length > 0) current.pendingSpace = true
+        current.endX = Math.max(current.endX, atom.endX)
+        if (atom.text.length > 0) {
+          current.pendingSpace = true
+          if (current.mathRun !== null) current.mathRun.pendingSpace = true
+        }
       }
       continue
     }
 
+    const fontHeight = atom.height
     const sameLine =
       current !== undefined &&
-      Math.abs(baseline - current.baseline) <= Math.max(1.5, Math.min(current.height, fontHeight) * 0.4)
-    const backwards = current !== undefined && x < current.x - Math.max(2, fontHeight * 0.8)
-    const farGap = current !== undefined && x - current.endX > fontHeight * 5
-    if (!sameLine || backwards || farGap) {
-      flush()
-    }
+      Math.abs(atom.y - current.baseline) <=
+        Math.max(1.5, Math.min(current.height, fontHeight) * 0.4)
+    const backwards = current !== undefined && atom.x < current.x - Math.max(2, fontHeight * 0.8)
+    const farGap = current !== undefined && atom.x - current.endX > fontHeight * 5
+    // Inline radicals and superscripts sit above the baseline. Keep them on
+    // the surrounding text line when they are horizontally attached, so an
+    // inline formula cannot become its own paragraph.
+    const inlineContinuation =
+      current !== undefined &&
+      !backwards &&
+      inlineMath.has(atom.index) &&
+      atom.x >= current.x &&
+      atom.x - current.endX <= fontHeight * 2 &&
+      Math.abs(atom.y - current.baseline) <= fontHeight * 1.05
+    if ((!sameLine || backwards || farGap) && !inlineContinuation) flushLine()
 
     if (current === undefined) {
       current = {
-        text: item.str,
-        x,
-        endX: x + width,
-        right: x + width,
-        baseline,
-        top: baseline - fontHeight * 0.82,
+        text: '',
+        translateText: '',
+        placeholders: [],
+        x: atom.x,
+        endX: atom.endX,
+        right: atom.endX,
+        baseline: atom.y,
+        top: atom.top,
         height: fontHeight,
-        count: 1,
+        count: 0,
         pendingSpace: false,
+        mathRun: null,
+        order: atom.index,
       }
-    } else {
-      if (current.pendingSpace === true) {
-        current.text += ' '
-        current.pendingSpace = false
-      }
-      const gap = x - current.endX
-      if (gap > Math.max(1.2, fontHeight * 0.18)) current.text = joinFragments(current.text, item.str)
-      else current.text += item.str
-      current.endX = x + width
-      current.right = Math.max(current.right, x + width)
-      current.height = Math.max(current.height, fontHeight)
-      current.top = Math.min(current.top, baseline - fontHeight * 0.82)
-      current.count += 1
     }
+    if (inlineMath.has(atom.index)) appendMath(atom)
+    else appendText(atom)
   }
-  flush()
+  flushLine()
 
   const lineGaps = []
   const lineHeights = []
@@ -338,6 +520,8 @@ export function buildPageModel(library, textContent, viewport) {
       paragraphs.push(createParagraph(line))
     } else {
       previous.text = joinLines(previous.text, line.text)
+      previous.translateText = joinLines(previous.translateText, line.translateText)
+      previous.placeholders.push(...line.placeholders)
       previous.lines.push(line)
       previous.bottom = Math.max(previous.bottom, line.top + line.height)
       previous.right = Math.max(previous.right, line.x + line.width)
@@ -345,19 +529,78 @@ export function buildPageModel(library, textContent, viewport) {
     }
   }
 
+  const paragraphBlocks = []
   for (let index = 0; index < paragraphs.length; index += 1) {
     const paragraph = paragraphs[index]
     paragraph.id = `p${index}`
+    paragraph.order = Math.min(...paragraph.lines.map((line) => line.order))
+    paragraph.bbox = unionBox(
+      paragraph.lines.map((line) => [line.x, line.top, line.x + line.width, line.top + line.height]),
+    )
+    paragraph.translateText = normalizeLineText(paragraph.translateText)
+    paragraph.text = normalizeLineText(paragraph.text)
     paragraph.lines.forEach((line, lineIndex) => {
       line.id = `p${index}-l${lineIndex}`
       line.paragraphId = paragraph.id
     })
-    paragraph.text = normalizeLineText(paragraph.text)
+    if (paragraph.text !== '') paragraphBlocks.push(paragraph)
+  }
+
+  for (const paragraph of paragraphBlocks) {
+    for (const line of paragraph.lines) {
+      line.x *= scale
+      line.top *= scale
+      line.width *= scale
+      line.height *= scale
+      line.baseline *= scale
+    }
+  }
+
+  const pageKey = `page${pageIndex + 1}`
+  const blocks = paragraphBlocks.map((paragraph, index) => ({
+    id: `${pageKey}-p${index}`,
+    type: 'paragraph',
+    pageIndex,
+    paragraphId: paragraph.id,
+    bbox: paragraph.bbox,
+    text: paragraph.text,
+    translateText: paragraph.translateText,
+    order: paragraph.order,
+    paragraph,
+  }))
+  for (let index = 0; index < analysis.equations.length; index += 1) {
+    const equation = analysis.equations[index]
+    blocks.push({
+      id: `${pageKey}-equation${index + 1}`,
+      type: 'equation',
+      pageIndex,
+      bbox: equation.bbox,
+      imageBbox: equation.imageBbox,
+      equationNumber: equation.equationNumber,
+      sourceItemIds: equation.sourceItemIds,
+      latex: null,
+      detectionSource: equation.detectionSource,
+      text: equation.text,
+      order: equation.order,
+    })
+  }
+  blocks.sort(
+    (left, right) =>
+      left.order - right.order || (left.type === 'equation' ? -1 : 1),
+  )
+  let equationIndex = 0
+  for (const block of blocks) {
+    if (block.type !== 'equation') continue
+    equationIndex += 1
+    block.id = `${pageKey}-equation${equationIndex}`
   }
 
   return {
-    paragraphs: paragraphs.filter((paragraph) => paragraph.text !== ''),
-    lines,
+    blocks,
+    paragraphs: paragraphBlocks,
+    lines: paragraphBlocks.flatMap((paragraph) => paragraph.lines),
+    equations: blocks.filter((block) => block.type === 'equation'),
+    atoms,
     viewport,
     pageWidth: viewport.width,
     pageHeight: viewport.height,
@@ -367,6 +610,8 @@ export function buildPageModel(library, textContent, viewport) {
 function createParagraph(line) {
   return {
     text: line.text,
+    translateText: line.translateText,
+    placeholders: [...line.placeholders],
     x: line.x,
     top: line.top,
     bottom: line.top + line.height,
@@ -376,14 +621,19 @@ function createParagraph(line) {
   }
 }
 
-export async function extractPageModel(page, scale = 1, identity = undefined) {
+export async function extractPageModel(page, scale = 1, identity = undefined, options = {}) {
   const library = await loadPdfJs()
   const viewport = page.getViewport({ scale })
   const textContent = await page.getTextContent({ includeMarkedContent: false })
-  const model = buildPageModel(library, textContent, viewport)
+  const model = buildPageModel(library, textContent, viewport, {
+    ...options,
+    pageIndex: identity?.pageIndex ?? options.pageIndex ?? 0,
+  })
   if (identity !== undefined) {
     model.documentId = identity.documentId
     model.pageIndex = identity.pageIndex
+  } else if (Number.isInteger(options.pageIndex)) {
+    model.pageIndex = options.pageIndex
   }
   return model
 }

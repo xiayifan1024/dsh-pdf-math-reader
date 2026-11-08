@@ -339,7 +339,8 @@ async function handleTranslate(ctx, config, body, cache, signal) {
             segments: batch,
             signal,
           })
-    if (!request.refresh) remember(cache, key, result, config.cacheEntries)
+    const hasPlaceholderError = result.some((item) => item.error === 'placeholder')
+    if (!request.refresh && !hasPlaceholderError) remember(cache, key, result, config.cacheEntries)
     translations.push(...result)
     // Be gentle with the account route when one logical page needs several
     // batches. A paint delay keeps progress visible and avoids bursty retries.

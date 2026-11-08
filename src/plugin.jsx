@@ -19,16 +19,24 @@ import {
   makeBatches,
   openPdf,
   parseGlossary,
+  renderEquationCrop,
   renderPdfPage,
   renderThumbnail,
   resolveOutline,
 } from './pdf'
+import { overlapRatio } from './equations'
+import { restorePlaceholders } from '../lib/placeholders.js'
+import { createZip, dataUrlToBytes } from './zip'
 import { en, translate, zh } from './locales'
 import { CSS } from './styles'
 
 const SETTINGS_KEY = 'pdf-math-reader.settings.v1'
 const NOTES_KEY = 'pdf-math-reader.notes.v1'
+const EQUATIONS_KEY = 'pdf-math-reader.equations.v1'
 const PANEL_ID = 'pdf-math-reader'
+const EMPTY_OVERRIDES = { added: [], removed: [] }
+// Sidebar tile: a small raster served by the Host under /pdf-reader/assets/.
+const PANEL_ICON = '/pdf-reader/assets/icon-128.png'
 
 const LANGUAGES = [
   { id: 'zh-CN', label: '简体中文' },
@@ -117,6 +125,65 @@ function loadSettings() {
     }
   } catch {
     return fallback
+  }
+}
+
+function normalizeBox(value) {
+  if (!Array.isArray(value) || value.length !== 4) return null
+  const numbers = value.map((entry) => Number(entry))
+  if (!numbers.every((entry) => Number.isFinite(entry))) return null
+  const box = [
+    Math.min(numbers[0], numbers[2]),
+    Math.min(numbers[1], numbers[3]),
+    Math.max(numbers[0], numbers[2]),
+    Math.max(numbers[1], numbers[3]),
+  ]
+  if (box[2] - box[0] < 1 || box[3] - box[1] < 1) return null
+  return box
+}
+
+/** Equation corrections persist per document fingerprint and page number. */
+function loadEquationOverrides() {
+  try {
+    const raw = window.localStorage?.getItem(EQUATIONS_KEY)
+    if (raw === null || raw === undefined) return {}
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object') return {}
+    const output = {}
+    for (const [fingerprint, pages] of Object.entries(parsed)) {
+      if (pages === null || typeof pages !== 'object') continue
+      const pageMap = {}
+      for (const [pageIndex, entry] of Object.entries(pages)) {
+        const index = Number(pageIndex)
+        if (!Number.isInteger(index) || index < 0) continue
+        const added = Array.isArray(entry?.added)
+          ? entry.added
+              .map((item) => normalizeBox(item?.bbox))
+              .filter((box) => box !== null)
+              .map((box) => ({ bbox: box }))
+              .slice(0, 200)
+          : []
+        const removed = Array.isArray(entry?.removed)
+          ? entry.removed.map(normalizeBox).filter((box) => box !== null).slice(0, 200)
+          : []
+        if (added.length === 0 && removed.length === 0) continue
+        pageMap[index] = { added, removed }
+      }
+      if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap
+    }
+    return output
+  } catch {
+    return {}
+  }
+}
+
+function pageOverridesFor(all, fingerprint, pageIndex) {
+  if (fingerprint === '' || fingerprint === undefined) return EMPTY_OVERRIDES
+  const entry = all?.[fingerprint]?.[pageIndex]
+  if (entry === null || entry === undefined) return EMPTY_OVERRIDES
+  return {
+    added: Array.isArray(entry.added) ? entry.added : [],
+    removed: Array.isArray(entry.removed) ? entry.removed : [],
   }
 }
 
@@ -449,7 +516,17 @@ function PageThumbnail({ pdf, pageNumber, label, active, width, cacheKey, onClic
   )
 }
 
-function SegmentCard({ tt, paragraph, translation, status, mode, active, onClick }) {
+function SegmentCard({
+  tt,
+  paragraph,
+  translation,
+  status,
+  mode,
+  active,
+  error,
+  onRetry,
+  onClick,
+}) {
   return (
     <div
       className={`pmr-seg-card ${active ? 'is-active' : ''}`}
@@ -465,7 +542,23 @@ function SegmentCard({ tt, paragraph, translation, status, mode, active, onClick
     >
       {mode !== 'translation' && <div className="pmr-seg-src">{paragraph.text}</div>}
       {mode !== 'source' &&
-        (translation?.text ? (
+        (error ? (
+          <div className="pmr-seg-err">
+            <span>{error}</span>
+            {onRetry !== undefined && (
+              <button
+                type="button"
+                className="pmr-seg-retry"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onRetry()
+                }}
+              >
+                {tt('action.retry')}
+              </button>
+            )}
+          </div>
+        ) : translation?.text ? (
           <div className="pmr-seg-tr">{translation.text}</div>
         ) : status === 'loading' ? (
           <>
@@ -478,6 +571,202 @@ function SegmentCard({ tt, paragraph, translation, status, mode, active, onClick
           <div className="pmr-seg-tr is-placeholder">{tt('panel.waiting')}</div>
         ))}
     </div>
+  )
+}
+
+function EquationBlock({
+  tt,
+  equation,
+  pdf,
+  fingerprint,
+  pageIndex,
+  cache,
+  cacheVersion,
+  active,
+  onLocate,
+  onRemove,
+  onCopy,
+}) {
+  const [image, setImage] = useState({ status: 'loading' })
+  const [zoomOpen, setZoomOpen] = useState(false)
+  const cropBbox = equation.imageBbox ?? equation.bbox
+  const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
+  const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7))
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
+  const cacheKey = [
+    fingerprint,
+    pageIndex,
+    equation.id,
+    cropBbox.map((value) => Math.round(value * 10) / 10).join(','),
+    Math.round(displayWidth),
+    dpr,
+  ].join(':')
+
+  useEffect(() => {
+    let cancelled = false
+    let promise = cache.current.get(cacheKey)
+    if (promise === undefined) {
+      promise = (async () => {
+        const page = await pdf.getPage(pageIndex + 1)
+        return await renderEquationCrop(page, cropBbox, {
+          displayWidth,
+          devicePixelRatio: dpr,
+          maxPixels: 3200000,
+          maxScale: 5,
+        })
+      })()
+      cache.current.set(cacheKey, promise)
+      promise.catch(() => cache.current.delete(cacheKey))
+    }
+    setImage({ status: 'loading' })
+    promise
+      .then((result) => {
+        if (!cancelled) setImage({ status: 'ready', ...result })
+      })
+      .catch((error) => {
+        if (!cancelled && !isAbort(error)) {
+          setImage({ status: 'error', message: error?.message ?? String(error) })
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    cache,
+    cacheKey,
+    cropBbox,
+    dpr,
+    displayWidth,
+    pageIndex,
+    pdf,
+    cacheVersion,
+  ])
+
+  useEffect(() => {
+    if (!zoomOpen) return undefined
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setZoomOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [zoomOpen])
+
+  const label =
+    equation.equationNumber === null || equation.equationNumber === undefined
+      ? tt('equation.unnumbered')
+      : tt('equation.numbered', { number: equation.equationNumber })
+
+  return (
+    <section
+      className={`pmr-eq-card ${active ? 'is-active' : ''}`}
+      aria-label={label}
+    >
+      <header className="pmr-eq-head">
+        <span className="pmr-eq-label">{label}</span>
+        <span className={`pmr-eq-badge ${equation.detectionSource === 'manual' ? 'is-manual' : ''}`}>
+          {equation.detectionSource === 'manual' ? tt('equation.manual') : tt('equation.auto')}
+        </span>
+        <div className="pmr-eq-actions">
+          {typeof equation.latex === 'string' && equation.latex !== '' && (
+            <button
+              type="button"
+              onClick={() => onCopy(`$$\n${equation.latex}\n$$`)}
+              title={tt('equation.copyLatex')}
+              aria-label={tt('equation.copyLatex')}
+            >
+              <Icon name="copy" size={12} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onLocate(equation)}
+            title={tt('equation.locate')}
+            aria-label={tt('equation.locate')}
+          >
+            <Icon name="search" size={12} />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoomOpen(true)}
+            title={tt('equation.zoom')}
+            aria-label={tt('equation.zoom')}
+            disabled={image.status !== 'ready'}
+          >
+            <Icon name="expand" size={12} />
+          </button>
+          <button
+            type="button"
+            className="pmr-eq-remove"
+            onClick={() => onRemove(equation)}
+            title={tt('equation.remove')}
+            aria-label={tt('equation.remove')}
+          >
+            <Icon name="close" size={11} />
+          </button>
+        </div>
+      </header>
+
+      <div
+        className="pmr-eq-scroll"
+        role="button"
+        tabIndex={0}
+        onClick={() => onLocate(equation)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onLocate(equation)
+          }
+        }}
+      >
+        {image.status === 'ready' ? (
+          <img
+            className="pmr-eq-image"
+            src={image.dataUrl}
+            width={image.width}
+            height={image.height}
+            alt={equation.text}
+            draggable={false}
+          />
+        ) : image.status === 'error' ? (
+          <div className="pmr-eq-fallback">{equation.text}</div>
+        ) : (
+          <div className="pmr-eq-loading">
+            <span className="pmr-spinner" />
+            {tt('equation.rendering')}
+          </div>
+        )}
+      </div>
+
+      <footer className="pmr-eq-foot">
+        <span>{tt('equation.hint')}</span>
+      </footer>
+
+      {zoomOpen && image.status === 'ready' && (
+        <div className="pmr-eq-modal" role="dialog" aria-label={label} onClick={() => setZoomOpen(false)}>
+          <div className="pmr-eq-modal-body" onClick={(event) => event.stopPropagation()}>
+            <div className="pmr-eq-modal-head">
+              <span>{label}</span>
+              <button
+                type="button"
+                className="pmr-iconbtn"
+                onClick={() => setZoomOpen(false)}
+                aria-label={tt('action.close')}
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div className="pmr-eq-modal-scroll">
+              <img
+                src={image.dataUrl}
+                alt={equation.text}
+                style={{ width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: 'none' }}
+                draggable={false}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
   )
 }
 
@@ -610,6 +899,12 @@ export function PdfReaderPage({ t }) {
   const [dragging, setDragging] = useState(false)
   const [resizing, setResizing] = useState(false)
   const [toast, setToast] = useState(null)
+  const [equationOverrides, setEquationOverrides] = useState(loadEquationOverrides)
+  const [modelRevision, setModelRevision] = useState(0)
+  const [activeEquation, setActiveEquation] = useState(null)
+  const [equationSelectMode, setEquationSelectMode] = useState(false)
+  const [equationRect, setEquationRect] = useState(null)
+  const [translationErrors, setTranslationErrors] = useState({})
 
   const fileInputRef = useRef(null)
   const viewerRef = useRef(null)
@@ -633,6 +928,10 @@ export function PdfReaderPage({ t }) {
   const pendingFocusRef = useRef(null)
   const pendingScrollRef = useRef(null)
   const focusRequestIdRef = useRef(0)
+  const equationOverridesRef = useRef(equationOverrides)
+  equationOverridesRef.current = equationOverrides
+  const equationImageCacheRef = useRef(new Map())
+  const equationDragRef = useRef(null)
   const ttRef = useRef(tt)
   ttRef.current = tt
 
@@ -640,14 +939,28 @@ export function PdfReaderPage({ t }) {
   const glossaryKeyValue = useMemo(() => glossaryKey(glossary), [glossary])
   const pageCount = doc?.numPages ?? 0
   const paragraphs = pageModel?.paragraphs ?? []
+  const blocks = pageModel?.blocks ?? []
+  const equations = useMemo(() => blocks.filter((block) => block.type === 'equation'), [blocks])
   const pageTranslation = translations[pageIndex] ?? {}
   const pageStatus = pageTranslationState[pageIndex]?.status ?? 'idle'
   const pageError = pageTranslationState[pageIndex]?.error ?? ''
   const pageBusy = Boolean(busyPages[pageIndex]) || Boolean(progress?.running)
   const hasPageTranslation = paragraphs.some((paragraph) => Boolean(pageTranslation[paragraph.id]?.text))
+  const waitingForTranslation =
+    viewMode !== 'source' &&
+    paragraphs.length > 0 &&
+    !hasPageTranslation &&
+    pageStatus !== 'loading' &&
+    pageStatus !== 'error'
   const currentScale = pageModel?.viewport?.scale ?? 1
   const activeLines = pageModel?.paragraphs.find((paragraph) => paragraph.id === activeParagraph)?.lines ?? []
   const docFingerprint = doc?.fingerprint ?? ''
+  const pageOverrides = useMemo(
+    () => pageOverridesFor(equationOverrides, docFingerprint, pageIndex),
+    [docFingerprint, equationOverrides, pageIndex],
+  )
+  const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0
+  const activeEquationBlock = equations.find((equation) => equation.id === activeEquation)
   const docNotes = useMemo(
     () => notes.filter((note) => note.doc === docFingerprint),
     [docFingerprint, notes],
@@ -714,6 +1027,14 @@ export function PdfReaderPage({ t }) {
   }, [notes])
 
   useEffect(() => {
+    try {
+      window.localStorage?.setItem(EQUATIONS_KEY, JSON.stringify(equationOverrides))
+    } catch {
+      // Equation corrections remain available for this session.
+    }
+  }, [equationOverrides])
+
+  useEffect(() => {
     setNoteText(existingNote?.text ?? '')
   }, [existingNote])
 
@@ -772,6 +1093,9 @@ export function PdfReaderPage({ t }) {
     setPageSize(null)
     setRenderError('')
     setActiveParagraph(null)
+    setActiveEquation(null)
+    setEquationSelectMode(false)
+    setEquationRect(null)
     setSelection('')
     setSelectionResult(null)
     textLayerTaskRef.current?.cancel()
@@ -812,7 +1136,9 @@ export function PdfReaderPage({ t }) {
 
         let textContent
         let model = {
+          blocks: [],
           paragraphs: [],
+          equations: [],
           lines: [],
           viewport,
           pageWidth: viewport.width,
@@ -821,7 +1147,14 @@ export function PdfReaderPage({ t }) {
         try {
           textContent = await page.getTextContent({ includeMarkedContent: false })
           if (cancelled) return
-          model = buildPageModel(library, textContent, viewport)
+          model = buildPageModel(library, textContent, viewport, {
+            pageIndex,
+            overrides: pageOverridesFor(
+              equationOverridesRef.current,
+              doc.fingerprint,
+              pageIndex,
+            ),
+          })
         } catch (error) {
           console.warn('pdf-math-reader: text extraction failed', error)
         }
@@ -875,7 +1208,7 @@ export function PdfReaderPage({ t }) {
       textLayerTaskRef.current?.cancel()
       textLayerTaskRef.current = null
     }
-  }, [doc, pageIndex, zoomMode, zoom, viewerWidth, renderNonce])
+  }, [doc, modelRevision, pageIndex, zoomMode, zoom, viewerWidth, renderNonce])
 
   useEffect(() => {
     if (!settingsOpen && !exportOpen) return undefined
@@ -913,10 +1246,15 @@ export function PdfReaderPage({ t }) {
     setPageIndex(0)
     setTranslations({})
     setPageTranslationState({})
+    setTranslationErrors({})
     setBusyPages({})
     setProgress(null)
     setSelection('')
     setSelectionResult(null)
+    setActiveEquation(null)
+    setEquationSelectMode(false)
+    setEquationRect(null)
+    equationImageCacheRef.current.clear()
     setOpenError('')
     if (meta !== null) meta.pdf.destroy?.().catch?.(() => {})
   }, [])
@@ -942,10 +1280,15 @@ export function PdfReaderPage({ t }) {
       setOpenError('')
       setTranslations({})
       setPageTranslationState({})
+      setTranslationErrors({})
       setBusyPages({})
       setProgress(null)
       setSelection('')
       setSelectionResult(null)
+      setActiveEquation(null)
+      setEquationSelectMode(false)
+      setEquationRect(null)
+      equationImageCacheRef.current.clear()
       setOpening(true)
       try {
         const pdf = await openPdf(file, tt('pdf.passwordPrompt'))
@@ -1059,6 +1402,10 @@ export function PdfReaderPage({ t }) {
       const key = event.key.toLowerCase()
       if (event.key === 'Escape') {
         setActiveParagraph(null)
+        setActiveEquation(null)
+        setEquationSelectMode(false)
+        setEquationRect(null)
+        equationDragRef.current = null
         clearTextSelection()
         return
       }
@@ -1138,10 +1485,259 @@ export function PdfReaderPage({ t }) {
         return
       }
       setActiveParagraph(paragraphId)
+      setActiveEquation(null)
       clearTextSelection()
       scrollToParagraph(paragraphId)
     },
     [activeParagraph, clearTextSelection, scrollToParagraph],
+  )
+
+  const scrollToEquation = useCallback(
+    (equation, model = pageModel) => {
+      const root = viewerRef.current
+      if (root === null) return
+      const pageElement = root.querySelector('.pmr-page')
+      if (pageElement === null) return
+      const scale = model?.viewport?.scale ?? 1
+      const rootRect = root.getBoundingClientRect()
+      const pageRect = pageElement.getBoundingClientRect()
+      const top = equation.bbox[1] * scale
+      const height = (equation.bbox[3] - equation.bbox[1]) * scale
+      const target =
+        root.scrollTop +
+        (pageRect.top - rootRect.top) +
+        top +
+        height / 2 -
+        root.clientHeight / 2
+      root.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
+    },
+    [pageModel],
+  )
+
+  const focusEquation = useCallback(
+    (equation) => {
+      if (activeEquation === equation.id) {
+        setActiveEquation(null)
+        return
+      }
+      setActiveEquation(equation.id)
+      setActiveParagraph(null)
+      clearTextSelection()
+      scrollToEquation(equation)
+    },
+    [activeEquation, clearTextSelection, scrollToEquation],
+  )
+
+  const equationAtPoint = useCallback(
+    (x, y) =>
+      equations.find(
+        (equation) =>
+          x >= equation.bbox[0] - 2 &&
+          x <= equation.bbox[2] + 2 &&
+          y >= equation.bbox[1] - 2 &&
+          y <= equation.bbox[3] + 2,
+      ),
+    [equations],
+  )
+
+  const commitPageOverrides = useCallback(
+    (mutator) => {
+      const meta = docRef.current
+      if (meta === null) return
+      const fingerprint = meta.fingerprint
+      // The page model (and therefore paragraph ids) is about to change.
+      // Cancel any in-flight translation and invalidate its epoch so late
+      // responses cannot write results under the old p0/p1 ids.
+      translationEpochRef.current += 1
+      translationAbortRef.current?.abort()
+      translationAbortRef.current = null
+      setProgress(null)
+      setBusyPages({})
+      setPageTranslationState((previous) => {
+        const next = {}
+        for (const [key, value] of Object.entries(previous)) {
+          if (value?.status !== 'loading') next[key] = value
+        }
+        return next
+      })
+      setEquationOverrides((previous) => {
+        const pages = { ...(previous[fingerprint] ?? {}) }
+        const current = pages[pageIndex] ?? { added: [], removed: [] }
+        const updated = mutator({
+          added: [...(current.added ?? [])],
+          removed: [...(current.removed ?? [])],
+        })
+        const nextPages = { ...pages }
+        if (updated.added.length === 0 && updated.removed.length === 0) {
+          delete nextPages[pageIndex]
+        } else {
+          nextPages[pageIndex] = updated
+        }
+        const next = { ...previous }
+        if (Object.keys(nextPages).length === 0) delete next[fingerprint]
+        else next[fingerprint] = nextPages
+        return next
+      })
+      meta.pageCache?.delete(pageIndex)
+      const prefix = `${fingerprint}:${pageIndex}:`
+      for (const key of [...equationImageCacheRef.current.keys()]) {
+        if (key.startsWith(prefix)) equationImageCacheRef.current.delete(key)
+      }
+      setTranslations((previous) => {
+        if (!(pageIndex in previous)) return previous
+        const next = { ...previous }
+        delete next[pageIndex]
+        return next
+      })
+      setPageTranslationState((previous) => {
+        if (!(pageIndex in previous)) return previous
+        const next = { ...previous }
+        delete next[pageIndex]
+        return next
+      })
+      setTranslationErrors((previous) => {
+        if (!(pageIndex in previous)) return previous
+        const next = { ...previous }
+        delete next[pageIndex]
+        return next
+      })
+      setActiveEquation(null)
+      setModelRevision((value) => value + 1)
+    },
+    [pageIndex],
+  )
+
+  const addManualEquation = useCallback(
+    (box) => {
+      const model = pageModel
+      if (model === null) return
+      const atoms = Array.isArray(model.atoms) ? model.atoms : []
+      const hasAtom = atoms.some((atom) => {
+        if (atom.text.trim() === '') return false
+        const centerX = (atom.x + atom.endX) / 2
+        const centerY = (atom.y + atom.top + atom.bottom) / 3
+        return centerX >= box[0] && centerX <= box[2] && centerY >= box[1] && centerY <= box[3]
+      })
+      if (!hasAtom) {
+        notify(tt('equation.emptyRegion'), 'error')
+        return
+      }
+      commitPageOverrides((previous) => ({
+        ...previous,
+        added: [
+          ...previous.added.filter((entry) => overlapRatio(entry.bbox, box) <= 0.3),
+          { bbox: box },
+        ],
+      }))
+      notify(tt('equation.added'))
+    },
+    [commitPageOverrides, notify, pageModel, tt],
+  )
+
+  const removeEquation = useCallback(
+    (equation) => {
+      commitPageOverrides((previous) => {
+        if (equation.detectionSource === 'manual') {
+          return {
+            ...previous,
+            added: previous.added.filter(
+              (entry) => overlapRatio(entry.bbox, equation.bbox) <= 0.3,
+            ),
+          }
+        }
+        return {
+          ...previous,
+          removed: [
+            ...previous.removed.filter(
+              (box) => overlapRatio(box, equation.bbox) <= 0.3,
+            ),
+            equation.bbox,
+          ],
+        }
+      })
+      notify(tt('equation.removed'))
+    },
+    [commitPageOverrides, notify, tt],
+  )
+
+  const resetPageEquations = useCallback(() => {
+    commitPageOverrides(() => ({ added: [], removed: [] }))
+    notify(tt('equation.reset'))
+  }, [commitPageOverrides, notify, tt])
+
+  const beginEquationSelection = useCallback(() => {
+    if (equationSelectMode) {
+      setEquationSelectMode(false)
+      setEquationRect(null)
+      equationDragRef.current = null
+      return
+    }
+    setEquationSelectMode(true)
+    setActiveEquation(null)
+    setActiveParagraph(null)
+    clearTextSelection()
+    notify(tt('equation.selectHint'))
+  }, [clearTextSelection, equationSelectMode, notify, tt])
+
+  const onEquationPointerDown = useCallback(
+    (event) => {
+      if (!equationSelectMode || pageModel === null) return
+      if (event.button !== 0) return
+      event.preventDefault()
+      const rect = event.currentTarget.getBoundingClientRect()
+      const scale = pageModel.viewport.scale
+      const pageWidth = pageModel.viewport.width / scale
+      const pageHeight = pageModel.viewport.height / scale
+      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
+      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
+      equationDragRef.current = { x0: x, y0: y }
+      setEquationRect({ x0: x, y0: y, x1: x, y1: y })
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+    },
+    [equationSelectMode, pageModel],
+  )
+
+  const onEquationPointerMove = useCallback(
+    (event) => {
+      const drag = equationDragRef.current
+      if (drag === null || pageModel === null) return
+      const rect = event.currentTarget.getBoundingClientRect()
+      const scale = pageModel.viewport.scale
+      const pageWidth = pageModel.viewport.width / scale
+      const pageHeight = pageModel.viewport.height / scale
+      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
+      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
+      setEquationRect({ x0: drag.x0, y0: drag.y0, x1: x, y1: y })
+    },
+    [pageModel],
+  )
+
+  const onEquationPointerUp = useCallback(
+    (event) => {
+      const drag = equationDragRef.current
+      if (drag === null || pageModel === null) return
+      equationDragRef.current = null
+      const rect = event.currentTarget.getBoundingClientRect()
+      const scale = pageModel.viewport.scale
+      const pageWidth = pageModel.viewport.width / scale
+      const pageHeight = pageModel.viewport.height / scale
+      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
+      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
+      const box = [
+        Math.min(drag.x0, x),
+        Math.min(drag.y0, y),
+        Math.max(drag.x0, x),
+        Math.max(drag.y0, y),
+      ]
+      setEquationRect(null)
+      if (box[2] - box[0] < 6 || box[3] - box[1] < 4) {
+        notify(tt('equation.tooSmall'), 'error')
+        return
+      }
+      setEquationSelectMode(false)
+      addManualEquation(box)
+    },
+    [addManualEquation, notify, pageModel, tt],
   )
 
   const handleTextMouseUp = useCallback(
@@ -1168,11 +1764,21 @@ export function PdfReaderPage({ t }) {
     (event) => {
       if ((window.getSelection()?.toString().trim() ?? '') !== '') return
       const rect = event.currentTarget.getBoundingClientRect()
+      const x = (event.clientX - rect.left) / currentScale
+      const y = (event.clientY - rect.top) / currentScale
+      const equation = equationAtPoint(x, y)
+      if (equation !== undefined) {
+        setActiveParagraph(null)
+        setActiveEquation((previous) => (previous === equation.id ? null : equation.id))
+        return
+      }
       const line = lineAtPoint(event.clientX - rect.left, event.clientY - rect.top)
       if (line === undefined) {
         setActiveParagraph(null)
+        setActiveEquation(null)
         return
       }
+      setActiveEquation(null)
       if (activeParagraph === line.paragraphId) {
         setActiveParagraph(null)
         clearTextSelection()
@@ -1180,7 +1786,7 @@ export function PdfReaderPage({ t }) {
         setActiveParagraph(line.paragraphId)
       }
     },
-    [activeParagraph, clearTextSelection, lineAtPoint],
+    [activeParagraph, clearTextSelection, currentScale, equationAtPoint, lineAtPoint],
   )
 
   const saveNote = useCallback(() => {
@@ -1383,6 +1989,34 @@ export function PdfReaderPage({ t }) {
         [id]: { text },
       },
     }))
+    setTranslationErrors((previous) => {
+      const page = previous[targetPage]
+      if (page === undefined || page[id] === undefined) return previous
+      const nextPage = { ...page }
+      delete nextPage[id]
+      const next = { ...previous, [targetPage]: nextPage }
+      if (Object.keys(nextPage).length === 0) delete next[targetPage]
+      return next
+    })
+  }, [])
+
+  const setTranslationError = useCallback((targetPage, id, message) => {
+    setTranslationErrors((previous) => ({
+      ...previous,
+      [targetPage]: { ...(previous[targetPage] ?? {}), [id]: message },
+    }))
+  }, [])
+
+  const clearTranslationError = useCallback((targetPage, id) => {
+    setTranslationErrors((previous) => {
+      const page = previous[targetPage]
+      if (page === undefined || page[id] === undefined) return previous
+      const nextPage = { ...page }
+      delete nextPage[id]
+      const next = { ...previous, [targetPage]: nextPage }
+      if (Object.keys(nextPage).length === 0) delete next[targetPage]
+      return next
+    })
   }, [])
 
   const translatePageInternal = useCallback(
@@ -1407,8 +2041,13 @@ export function PdfReaderPage({ t }) {
         [targetPage]: { status: 'loading' },
       }))
       let applied = 0
+      let failed = 0
       try {
-        const entries = usable.map((paragraph) => ({ id: paragraph.id, text: paragraph.text }))
+        const entries = usable.map((paragraph) => ({
+          id: paragraph.id,
+          text: paragraph.translateText || paragraph.text,
+          paragraph,
+        }))
         const batches = makeBatches(entries, 5, 3800)
         for (const batch of batches) {
           if (signal?.aborted || epoch !== translationEpochRef.current) {
@@ -1420,7 +2059,11 @@ export function PdfReaderPage({ t }) {
             if (!force) {
               const cached = translationCacheRef.current.get(key)
               if (cached !== undefined) {
-                setTranslationFor(targetPage, entry.id, cached)
+                setTranslationFor(
+                  targetPage,
+                  entry.id,
+                  restorePlaceholders(cached, entry.paragraph.placeholders),
+                )
                 applied += 1
                 continue
               }
@@ -1442,22 +2085,39 @@ export function PdfReaderPage({ t }) {
           const byId = new Map(
             (Array.isArray(response.translations) ? response.translations : []).map((item) => [
               item.id,
-              item.text,
+              item,
             ]),
           )
           for (const { entry, key } of pending) {
-            const text = byId.get(entry.id) ?? entry.text
+            const item = byId.get(entry.id)
+            if (item === undefined || item.error === 'placeholder') {
+              failed += 1
+              setTranslationError(
+                targetPage,
+                entry.id,
+                tt('error.placeholder'),
+              )
+              continue
+            }
+            const text = typeof item.text === 'string' ? item.text : entry.text
             translationCacheRef.current.set(key, text)
-            setTranslationFor(targetPage, entry.id, text)
+            setTranslationFor(
+              targetPage,
+              entry.id,
+              restorePlaceholders(text, entry.paragraph.placeholders),
+            )
             applied += 1
           }
         }
         if (epoch !== translationEpochRef.current) return false
         setPageTranslationState((previous) => ({
           ...previous,
-          [targetPage]: { status: 'done' },
+          [targetPage]:
+            failed > 0
+              ? { status: 'error', error: tt('panel.placeholderFailed', { count: failed }) }
+              : { status: 'done' },
         }))
-        return true
+        return failed === 0
       } catch (error) {
         if (epoch !== translationEpochRef.current) return false
         if (signal?.aborted || isAbort(error)) {
@@ -1482,7 +2142,14 @@ export function PdfReaderPage({ t }) {
         }
       }
     },
-    [glossary, glossaryKeyValue, setTranslationFor, settings.targetLanguage, tt],
+    [
+      glossary,
+      glossaryKeyValue,
+      setTranslationError,
+      setTranslationFor,
+      settings.targetLanguage,
+      tt,
+    ],
   )
 
   const translateCurrentPage = useCallback(() => {
@@ -1514,17 +2181,59 @@ export function PdfReaderPage({ t }) {
     tt,
   ])
 
+  const retryParagraph = useCallback(
+    (paragraph) => {
+      if (!pageModel || pageBusy) return
+      translationAbortRef.current?.abort()
+      const controller = new AbortController()
+      translationAbortRef.current = controller
+      clearTranslationError(pageIndex, paragraph.id)
+      translatePageInternal(pageIndex, [paragraph], {
+        force: true,
+        signal: controller.signal,
+      })
+        .catch((error) => {
+          if (!controller.signal.aborted && !isAbort(error)) {
+            notify(`${tt('error.translate')}: ${error?.message ?? ''}`, 'error')
+          }
+        })
+        .finally(() => {
+          if (translationAbortRef.current === controller) translationAbortRef.current = null
+        })
+    },
+    [
+      clearTranslationError,
+      notify,
+      pageBusy,
+      pageIndex,
+      pageModel,
+      translatePageInternal,
+      tt,
+    ],
+  )
+
   const getPageModel = useCallback(async (targetPage) => {
     const meta = docRef.current
-    if (meta === null) return { paragraphs: [] }
+    if (meta === null) return { blocks: [], paragraphs: [] }
     const cached = meta.pageCache?.get(targetPage)
     if (cached !== undefined) return cached
     const page = await meta.pdf.getPage(targetPage + 1)
-    const model = await extractPageModel(page, 1, {
-      documentId: meta.fingerprint,
-      pageIndex: targetPage,
-    })
-    if (docRef.current !== meta) return { paragraphs: [] }
+    const model = await extractPageModel(
+      page,
+      1,
+      {
+        documentId: meta.fingerprint,
+        pageIndex: targetPage,
+      },
+      {
+        overrides: pageOverridesFor(
+          equationOverridesRef.current,
+          meta.fingerprint,
+          targetPage,
+        ),
+      },
+    )
+    if (docRef.current !== meta) return { blocks: [], paragraphs: [] }
     meta.pageCache?.set(targetPage, model)
     return model
   }, [])
@@ -1623,6 +2332,7 @@ export function PdfReaderPage({ t }) {
     translationCacheRef.current.clear()
     setTranslations({})
     setPageTranslationState({})
+    setTranslationErrors({})
     notify(tt('toast.cacheCleared'))
   }, [notify, tt])
 
@@ -1635,14 +2345,27 @@ export function PdfReaderPage({ t }) {
       let model = cache.get(index)
       if (model === undefined) {
         const page = await meta.pdf.getPage(index + 1)
-        model = await extractPageModel(page, 1, {
-          documentId: meta.fingerprint,
-          pageIndex: index,
-        })
+        model = await extractPageModel(
+          page,
+          1,
+          {
+            documentId: meta.fingerprint,
+            pageIndex: index,
+          },
+          {
+            overrides: pageOverridesFor(
+              equationOverridesRef.current,
+              meta.fingerprint,
+              index,
+            ),
+          },
+        )
         if (docRef.current !== meta) return []
         cache.set(index, model)
       }
-      if (model.paragraphs.length > 0) pages.push({ index, paragraphs: model.paragraphs })
+      if ((model.blocks?.length ?? 0) > 0) {
+        pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs })
+      }
     }
     return pages
   }, [])
@@ -1666,18 +2389,22 @@ export function PdfReaderPage({ t }) {
         )
         for (const index of indices) {
           const model = await getPageModel(index)
-          if (model.paragraphs.length > 0) pages.push({ index, paragraphs: model.paragraphs })
+          if ((model.blocks?.length ?? 0) > 0) {
+            pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs })
+          }
         }
         label = `第 ${pageIndex + 1} 页及相邻页`
       }
 
       const text = pages
-        .map(
-          (page) =>
-            `[Page ${page.index + 1}]\n${page.paragraphs
-              .map((paragraph) => paragraph.text)
-              .join('\n\n')}`,
-        )
+        .map((page) => {
+          const content = (page.blocks ?? []).map((block) =>
+            block.type === 'equation'
+              ? `[${tt('equation.context', { number: block.equationNumber ?? '' })}] ${block.text}`
+              : block.text,
+          )
+          return `[Page ${page.index + 1}]\n${content.join('\n\n')}`
+        })
         .join('\n\n')
       const clipped =
         text.length > 22000
@@ -1687,7 +2414,7 @@ export function PdfReaderPage({ t }) {
       chatContextCacheRef.current.set(cacheKey, value)
       return value
     },
-    [collectPages, getPageModel, pageIndex],
+    [collectPages, getPageModel, pageIndex, tt],
   )
 
   const sendChat = useCallback(
@@ -1823,6 +2550,38 @@ export function PdfReaderPage({ t }) {
     chatEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
   }, [chatBusy, chatMessages, rightTab])
 
+  const renderExportEquations = useCallback(async (meta, pages) => {
+    const images = new Map()
+    for (const page of pages) {
+      const pageEquations = (page.blocks ?? []).filter((block) => block.type === 'equation')
+      if (pageEquations.length === 0) continue
+      let pdfPage
+      try {
+        pdfPage = await meta.pdf.getPage(page.index + 1)
+      } catch {
+        continue
+      }
+      for (const equation of pageEquations) {
+        try {
+          const cropBox = equation.imageBbox ?? equation.bbox
+          const result = await renderEquationCrop(pdfPage, cropBox, {
+            displayWidth: Math.min(
+              1400,
+              Math.max(320, (cropBox[2] - cropBox[0]) * 3),
+            ),
+            devicePixelRatio: 2,
+            maxPixels: 8000000,
+            maxScale: 6,
+          })
+          images.set(`${page.index}:${equation.id}`, result)
+        } catch {
+          // The text fallback keeps the export complete when a crop fails.
+        }
+      }
+    }
+    return images
+  }, [])
+
   const exportMarkdown = useCallback(async () => {
     const meta = docRef.current
     if (meta === null) return
@@ -1840,7 +2599,16 @@ export function PdfReaderPage({ t }) {
     ]
     for (const page of pages) {
       lines.push(`## ${tt('page.short', { page: page.index + 1 })}`, '')
-      for (const paragraph of page.paragraphs) {
+      for (const block of page.blocks ?? []) {
+        if (block.type === 'equation') {
+          if (block.equationNumber) {
+            lines.push(`**${tt('equation.label')} ${block.equationNumber}**`, '')
+          }
+          lines.push('```', block.text, '```', '')
+          continue
+        }
+        const paragraph = block.paragraph
+        if (paragraph === undefined) continue
         const translated = translations[page.index]?.[paragraph.id]?.text
         lines.push(`> ${paragraph.text.replace(/\s+/g, ' ')}`, '')
         if (translated) lines.push(translated, '')
@@ -1851,26 +2619,91 @@ export function PdfReaderPage({ t }) {
     notify(tt('toast.exported', { name: filename }))
   }, [collectPages, notify, settings.targetLanguage, translations, tt])
 
-  const exportHtml = useCallback(async () => {
+  const exportBundle = useCallback(async () => {
     const meta = docRef.current
     if (meta === null) return
     setExportOpen(false)
+    notify(tt('toast.exporting'))
     const pages = await collectPages()
     if (pages.length === 0) {
       notify(tt('error.exportEmpty'), 'error')
       return
     }
+    const images = await renderExportEquations(meta, pages)
+    const lines = [
+      `# ${meta.name}`,
+      '',
+      `> ${tt('export.generated')} · ${new Date().toLocaleString()} · ${settings.targetLanguage}`,
+      '',
+    ]
+    const files = []
+    for (const page of pages) {
+      lines.push(`## ${tt('page.short', { page: page.index + 1 })}`, '')
+      for (const block of page.blocks ?? []) {
+        if (block.type === 'equation') {
+          const image = images.get(`${page.index}:${block.id}`)
+          const label = block.equationNumber
+            ? `${tt('equation.label')} ${block.equationNumber}`
+            : tt('equation.unnumbered')
+          if (image !== undefined) {
+            const name = `equations/${block.id}.png`
+            files.push({ name, data: dataUrlToBytes(image.dataUrl) })
+            lines.push(`![${label}](${name})`, '')
+          } else {
+            lines.push(`**${label}**`, '', '```', block.text, '```', '')
+          }
+          continue
+        }
+        const paragraph = block.paragraph
+        if (paragraph === undefined) continue
+        const translated = translations[page.index]?.[paragraph.id]?.text
+        lines.push(`> ${paragraph.text.replace(/\s+/g, ' ')}`, '')
+        if (translated) lines.push(translated, '')
+      }
+    }
+    const markdown = lines.join('\n')
+    files.unshift({ name: `${baseName(meta.name)}-bilingual.md`, data: markdown })
+    const zip = createZip(files)
+    const filename = `${baseName(meta.name)}-bilingual.zip`
+    downloadBlob(new Blob([zip], { type: 'application/zip' }), filename, 'application/zip')
+    notify(tt('toast.exported', { name: filename }))
+  }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt])
+
+  const exportHtml = useCallback(async () => {
+    const meta = docRef.current
+    if (meta === null) return
+    setExportOpen(false)
+    notify(tt('toast.exporting'))
+    const pages = await collectPages()
+    if (pages.length === 0) {
+      notify(tt('error.exportEmpty'), 'error')
+      return
+    }
+    const images = await renderExportEquations(meta, pages)
     const body = pages
       .map((page) => {
-        const cards = page.paragraphs
-          .map((paragraph) => {
+        const content = (page.blocks ?? [])
+          .map((block) => {
+            if (block.type === 'equation') {
+              const image = images.get(`${page.index}:${block.id}`)
+              const label = block.equationNumber
+                ? `${tt('equation.label')} ${block.equationNumber}`
+                : tt('equation.unnumbered')
+              const figure =
+                image !== undefined
+                  ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">`
+                  : `<pre>${escapeHtml(block.text)}</pre>`
+              return `<figure class="equation">${figure}<figcaption>${escapeHtml(label)}</figcaption></figure>`
+            }
+            const paragraph = block.paragraph
+            if (paragraph === undefined) return ''
             const translated = translations[page.index]?.[paragraph.id]?.text
             return `<div class="card"><div class="src">${escapeHtml(paragraph.text)}</div>${
               translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ''
             }</div>`
           })
           .join('\n')
-        return `<section><h2>${escapeHtml(tt('page.short', { page: page.index + 1 }))}</h2>${cards}</section>`
+        return `<section><h2>${escapeHtml(tt('page.short', { page: page.index + 1 }))}</h2>${content}</section>`
       })
       .join('\n')
     const html = `<!doctype html>
@@ -1889,8 +2722,12 @@ h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #
 .card { padding: 14px 0 16px; border-bottom: 1px dashed #e5e7eb; }
 .src { color: #4b5563; font-size: 13.5px; }
 .tr { margin-top: 7px; font-size: 15px; }
-@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card { break-inside: avoid; } }
-@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card { border-color: #374151; } .meta { color: #9ca3af; } }
+figure.equation { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: center; background: #fff; }
+figure.equation img { max-width: 100%; height: auto; }
+figure.equation pre { margin: 0; white-space: pre-wrap; text-align: left; font-size: 12px; }
+figure.equation figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
+@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation { break-inside: avoid; } }
+@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation { border-color: #374151; } figure.equation { background: #fff; } .meta { color: #9ca3af; } }
 </style>
 </head>
 <body>
@@ -1902,7 +2739,7 @@ ${body}
     const filename = `${baseName(meta.name)}-reading.html`
     downloadBlob(html, filename, 'text/html;charset=utf-8')
     notify(tt('toast.exported', { name: filename }))
-  }, [collectPages, notify, settings.targetLanguage, translations, tt])
+  }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt])
 
   const onDragEnter = useCallback((event) => {
     event.preventDefault()
@@ -1943,6 +2780,7 @@ ${body}
         setProgress(null)
         setTranslations({})
         setPageTranslationState({})
+        setTranslationErrors({})
         setSelectionResult(null)
         setSelection('')
       }
@@ -2012,9 +2850,13 @@ ${body}
 
       <header className="pmr-topbar">
         <div className="pmr-brand">
-          <div className="pmr-brand-mark">
-            <Icon name="book" size={18} />
-          </div>
+          <img
+            className="pmr-brand-mark"
+            src={PANEL_ICON}
+            alt=""
+            aria-hidden="true"
+            draggable={false}
+          />
           <div className="pmr-brand-text">
             <div className="pmr-brand-title">{tt('page.title')}</div>
             <div className="pmr-brand-sub">{tt('page.subtitle')}</div>
@@ -2148,6 +2990,19 @@ ${body}
                 {progress?.running ? tt('action.stop') : tt('action.translateAll')}
               </button>
 
+              <button
+                type="button"
+                className={`pmr-btn pmr-eq-select-btn ${
+                  equationSelectMode ? 'pmr-btn-primary' : 'pmr-btn-ghost'
+                }`}
+                onClick={beginEquationSelection}
+                title={tt('equation.select')}
+                disabled={pageModel === null}
+              >
+                <Icon name="crop" size={14} />
+                <span className="pmr-eq-select-text">{tt('equation.select')}</span>
+              </button>
+
               <div style={{ position: 'relative' }}>
                 <button
                   type="button"
@@ -2166,6 +3021,10 @@ ${body}
                     <button type="button" onClick={exportMarkdown}>
                       <Icon name="download" size={13} />
                       {tt('action.exportMarkdown')}
+                    </button>
+                    <button type="button" onClick={exportBundle}>
+                      <Icon name="file" size={13} />
+                      {tt('action.exportBundle')}
                     </button>
                     <button type="button" onClick={exportHtml}>
                       <Icon name="file" size={13} />
@@ -2330,6 +3189,21 @@ ${body}
                         }}
                       />
                     ))}
+                    {activeEquationBlock !== undefined && (
+                      <div
+                        className="pmr-hl pmr-eq-hl"
+                        style={{
+                          left: activeEquationBlock.bbox[0] * currentScale,
+                          top: activeEquationBlock.bbox[1] * currentScale,
+                          width:
+                            (activeEquationBlock.bbox[2] - activeEquationBlock.bbox[0]) *
+                            currentScale,
+                          height:
+                            (activeEquationBlock.bbox[3] - activeEquationBlock.bbox[1]) *
+                            currentScale,
+                        }}
+                      />
+                    )}
                   </div>
                   <div
                     key={textLayerKey}
@@ -2338,6 +3212,34 @@ ${body}
                     onMouseUp={handleTextMouseUp}
                     onClick={handleTextClick}
                   />
+                  {equationSelectMode && (
+                    <div
+                      className="pmr-eq-selector"
+                      onPointerDown={onEquationPointerDown}
+                      onPointerMove={onEquationPointerMove}
+                      onPointerUp={onEquationPointerUp}
+                      onPointerCancel={() => {
+                        equationDragRef.current = null
+                        setEquationRect(null)
+                      }}
+                    >
+                      {equationRect !== null && (
+                        <div
+                          className="pmr-eq-box"
+                          style={{
+                            left:
+                              Math.min(equationRect.x0, equationRect.x1) * currentScale,
+                            top:
+                              Math.min(equationRect.y0, equationRect.y1) * currentScale,
+                            width:
+                              Math.abs(equationRect.x1 - equationRect.x0) * currentScale,
+                            height:
+                              Math.abs(equationRect.y1 - equationRect.y0) * currentScale,
+                          }}
+                        />
+                      )}
+                    </div>
+                  )}
                   {renderState === 'loading' && (
                     <div className="pmr-page-loading">
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
@@ -2476,7 +3378,12 @@ ${body}
                     </div>
                     <div className="pmr-tr-hint">
                       <Icon name="sparkle" size={11} />
-                      {tt('panel.formulas')}
+                      <span>{tt('panel.formulas')}</span>
+                      {equations.length > 0 && (
+                        <span className="pmr-eq-count-badge">
+                          {tt('panel.equationCount', { count: equations.length })}
+                        </span>
+                      )}
                     </div>
                   </>
                 )}
@@ -2500,28 +3407,29 @@ ${body}
                     })}
                   </div>
                 )}
-                {paragraphs.length === 0 ? (
+                {blocks.length === 0 ? (
                   <div className="pmr-tr-empty">
                     <Icon name="file" size={22} />
                     <strong>{tt('panel.empty')}</strong>
                   </div>
-                ) : viewMode !== 'source' && !hasPageTranslation && pageStatus !== 'loading' && pageStatus !== 'error' ? (
-                  <div className="pmr-tr-empty">
-                    <Icon name="languages" size={22} />
-                    <strong>{tt('panel.waiting')}</strong>
-                    <p>{tt('panel.waitingAll')}</p>
-                    <button
-                      type="button"
-                      className="pmr-btn pmr-btn-primary"
-                      onClick={translateCurrentPage}
-                      disabled={pageBusy || progress?.running}
-                    >
-                      <Icon name="languages" size={14} />
-                      {tt('action.translatePage')}
-                    </button>
-                  </div>
                 ) : (
                   <>
+                    {waitingForTranslation && (
+                      <div className="pmr-tr-empty pmr-tr-waiting">
+                        <Icon name="languages" size={22} />
+                        <strong>{tt('panel.waiting')}</strong>
+                        <p>{tt('panel.waitingAll')}</p>
+                        <button
+                          type="button"
+                          className="pmr-btn pmr-btn-primary"
+                          onClick={translateCurrentPage}
+                          disabled={pageBusy || progress?.running}
+                        >
+                          <Icon name="languages" size={14} />
+                          {tt('action.translatePage')}
+                        </button>
+                      </div>
+                    )}
                     {pageStatus === 'error' && (
                       <div className="pmr-inline-error" role="alert">
                         <Icon name="alert" size={14} />
@@ -2534,18 +3442,48 @@ ${body}
                         </button>
                       </div>
                     )}
-                    {paragraphs.map((paragraph) => (
-                      <SegmentCard
-                        key={paragraph.id}
-                        tt={tt}
-                        paragraph={paragraph}
-                        translation={pageTranslation[paragraph.id]}
-                        status={pageStatus}
-                        mode={viewMode}
-                        active={activeParagraph === paragraph.id}
-                        onClick={() => focusParagraph(paragraph.id)}
-                      />
-                    ))}
+                    {(waitingForTranslation
+                      ? blocks.filter((block) => block.type === 'equation')
+                      : blocks
+                    ).map((block) =>
+                      block.type === 'equation' ? (
+                        <EquationBlock
+                          key={block.id}
+                          tt={tt}
+                          equation={block}
+                          pdf={doc.pdf}
+                          fingerprint={docFingerprint}
+                          pageIndex={pageIndex}
+                          cache={equationImageCacheRef}
+                          cacheVersion={modelRevision}
+                          active={activeEquation === block.id}
+                          onLocate={focusEquation}
+                          onRemove={removeEquation}
+                          onCopy={copyText}
+                        />
+                      ) : (
+                        <SegmentCard
+                          key={block.id}
+                          tt={tt}
+                          paragraph={block.paragraph}
+                          translation={pageTranslation[block.paragraphId]}
+                          status={pageStatus}
+                          mode={viewMode}
+                          active={activeParagraph === block.paragraphId}
+                          error={translationErrors[pageIndex]?.[block.paragraphId]}
+                          onRetry={() => retryParagraph(block.paragraph)}
+                          onClick={() => focusParagraph(block.paragraphId)}
+                        />
+                      ),
+                    )}
+                    {hasPageOverrides && (
+                      <div className="pmr-eq-reset">
+                        <button type="button" className="pmr-btn pmr-btn-ghost" onClick={resetPageEquations}>
+                          <Icon name="refresh" size={12} />
+                          {tt('equation.restore')}
+                        </button>
+                      </div>
+                    )}
                   </>
                 )}
               </div>
@@ -2950,14 +3888,29 @@ ${body}
 }
 
 export function PdfReaderIcon({ size = 20, active }) {
+  const px = Math.max(14, size)
   return (
     <span
       style={{
         display: 'inline-flex',
-        color: active ? 'var(--dsw-alias-brand-primary)' : 'currentColor',
+        width: px,
+        height: px,
+        flex: 'none',
+        overflow: 'hidden',
+        borderRadius: Math.round(px * 0.26),
+        userSelect: 'none',
+        boxShadow: active ? '0 0 0 1.5px var(--dsw-alias-brand-primary)' : 'none',
       }}
     >
-      <Icon name="book" size={size} strokeWidth={1.6} />
+      <img
+        src={PANEL_ICON}
+        alt=""
+        aria-hidden="true"
+        draggable={false}
+        width={px}
+        height={px}
+        style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }}
+      />
     </span>
   )
 }

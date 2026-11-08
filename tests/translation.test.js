@@ -5,7 +5,13 @@ import {
   normalizeTranslations,
   parseTranslationJson,
   splitBatches,
+  translationPrompt,
 } from '../lib/translation.js'
+import {
+  listPlaceholders,
+  restorePlaceholders,
+  validatePlaceholders,
+} from '../lib/placeholders.js'
 
 test('parses one translation per segment', () => {
   assert.deepEqual(parseTranslationJson('{"translations":["甲","乙"]}', 2), ['甲', '乙'])
@@ -61,4 +67,61 @@ test('normalizes translated values and keeps the source for empty output', () =>
       { id: 'p2', text: 'two' },
     ],
   )
+})
+
+test('prompt tells the model that formula placeholders are opaque tokens', () => {
+  const prompt = translationPrompt(
+    'zh-CN',
+    'en',
+    [],
+    [{ text: 'dimension ⟦MATH_001⟧' }],
+  )
+  assert.match(prompt, /⟦MATH_001⟧/)
+  assert.match(prompt, /opaque token/)
+  assert.match(prompt, /Never translate, split, merge/)
+})
+
+test('accepts a translation that preserves every formula placeholder once', () => {
+  const source = 'dimension ⟦MATH_001⟧ and ⟦MATH_002⟧'
+  const target = '维度 ⟦MATH_001⟧ 与 ⟦MATH_002⟧'
+  assert.deepEqual(validatePlaceholders(source, target), {
+    ok: true,
+    missing: [],
+    duplicated: [],
+    unknown: [],
+  })
+  assert.deepEqual(listPlaceholders(target), ['⟦MATH_001⟧', '⟦MATH_002⟧'])
+  assert.equal(
+    restorePlaceholders(target, [
+      { token: '⟦MATH_001⟧', text: 'd_k' },
+      { token: '⟦MATH_002⟧', text: 'd_v' },
+    ]),
+    '维度 d_k 与 d_v',
+  )
+})
+
+test('flags missing, duplicated, and unknown placeholders', () => {
+  const source = 'value ⟦MATH_001⟧'
+  assert.equal(validatePlaceholders(source, '值').reason, 'missing')
+  assert.equal(
+    validatePlaceholders(source, '值 ⟦MATH_001⟧ ⟦MATH_001⟧').reason,
+    'duplicated',
+  )
+  assert.equal(validatePlaceholders(source, '值 ⟦MATH_002⟧').reason, 'unknown')
+  assert.equal(validatePlaceholders(source, '值 ⟦MATH_999⟧').reason, 'unknown')
+})
+
+test('marks a translated segment as failed when it drops a placeholder', () => {
+  const result = normalizeTranslations(['维度与'], [
+    { id: 'p1', text: 'dimension ⟦MATH_001⟧ and ⟦MATH_002⟧' },
+  ])
+  assert.equal(result[0].error, 'placeholder')
+  assert.equal(result[0].id, 'p1')
+})
+
+test('keeps a valid placeholder translation as a success', () => {
+  const result = normalizeTranslations(['维度 ⟦MATH_001⟧'], [
+    { id: 'p1', text: 'dimension ⟦MATH_001⟧' },
+  ])
+  assert.deepEqual(result, [{ id: 'p1', text: '维度 ⟦MATH_001⟧' }])
 })

@@ -30,14 +30,11 @@ export const CSS = String.raw`
 }
 .pmr-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .pmr-brand-mark {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 30px;
   height: 30px;
   border-radius: 9px;
-  color: #fff;
-  background: linear-gradient(135deg, #2563eb, #0e7490);
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,.18);
+  object-fit: cover;
   flex: 0 0 auto;
 }
 .pmr-brand-text { min-width: 0; }
@@ -481,6 +478,128 @@ export const CSS = String.raw`
 .pmr-seg-err { margin-top: 5px; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
 .pmr-seg-skeleton { height: 10px; margin-top: 7px; border-radius: 4px; background: var(--dsw-alias-bg-layer-2); animation: pmr-pulse 1.25s ease-in-out infinite; }
 .pmr-seg-skeleton.short { width: 62%; }
+.pmr-seg-err { display: flex; align-items: center; gap: 8px; margin-top: 5px; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
+.pmr-seg-err span { min-width: 0; }
+.pmr-seg-retry {
+  margin-left: auto;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 40%, var(--dsw-alias-border-l1));
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 10px;
+  cursor: pointer;
+}
+.pmr-seg-retry:hover { background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent); }
+.pmr-tr-waiting { height: auto; min-height: 150px; margin-bottom: 6px; }
+
+.pmr-eq-card {
+  margin: 6px 0 9px;
+  padding: 7px 8px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-base);
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.pmr-eq-card.is-active {
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--dsw-alias-brand-primary) 45%, transparent);
+}
+.pmr-eq-head { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 6px; }
+.pmr-eq-label { font-size: 11px; font-weight: 650; white-space: nowrap; }
+.pmr-eq-badge {
+  flex: 0 0 auto;
+  height: 17px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 9px;
+}
+.pmr-eq-badge.is-manual {
+  color: var(--dsw-alias-brand-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);
+}
+.pmr-eq-actions { margin-left: auto; display: inline-flex; gap: 1px; }
+.pmr-eq-actions button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+.pmr-eq-actions button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-eq-actions button:disabled { opacity: .35; cursor: default; }
+.pmr-eq-actions .pmr-eq-remove:hover { color: var(--dsw-alias-state-error-primary); }
+.pmr-eq-scroll {
+  display: flex;
+  align-items: center;
+  min-height: 46px;
+  padding: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+.pmr-eq-scroll:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.pmr-eq-image { display: block; flex: 0 0 auto; max-width: none; height: auto; }
+.pmr-eq-loading { display: flex; align-items: center; gap: 7px; padding: 8px 4px; color: #64748b; font-size: 10.5px; }
+.pmr-eq-fallback { padding: 4px; color: #334155; font-size: 11px; line-height: 1.45; white-space: pre-wrap; }
+.pmr-eq-foot { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-eq-count { margin-left: auto; font-variant-numeric: tabular-nums; opacity: .7; }
+.pmr-eq-count-badge { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-eq-reset { display: flex; justify-content: center; padding: 4px 0 10px; }
+.pmr-eq-reset .pmr-btn { height: 24px; padding: 0 8px; font-size: 10px; }
+.pmr-eq-hl { background: rgba(37,99,235,.16); box-shadow: inset 0 0 0 1.5px rgba(37,99,235,.5); }
+.pmr-eq-selector {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  cursor: crosshair;
+  touch-action: none;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent);
+}
+.pmr-eq-box {
+  position: absolute;
+  border: 1.5px dashed var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
+  pointer-events: none;
+}
+.pmr-eq-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, .64);
+}
+.pmr-eq-modal-body {
+  display: flex;
+  flex-direction: column;
+  max-width: 94vw;
+  max-height: 90vh;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 24px 70px rgba(0,0,0,.35);
+}
+.pmr-eq-modal-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1); font-size: 11.5px; font-weight: 600; }
+.pmr-eq-modal-head .pmr-iconbtn { width: 24px; height: 24px; margin-left: auto; }
+.pmr-eq-modal-scroll { overflow: auto; padding: 12px; background: #fff; }
+.pmr-eq-modal-scroll img { display: block; height: auto; }
 .pmr-tr-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: 100%; min-height: 160px; padding: 26px 22px; text-align: center; color: var(--dsw-alias-label-secondary); }
 .pmr-tr-empty strong { color: var(--dsw-alias-label-primary); font-size: 12.5px; font-weight: 600; }
 .pmr-tr-empty p { margin: 0; font-size: 11.5px; line-height: 1.55; max-width: 260px; }
@@ -647,6 +766,8 @@ export const CSS = String.raw`
   .pmr-translation { flex-basis: 348px; }
   .pmr-brand-sub { display: none; }
   .pmr-toolbar .pmr-select { max-width: 108px; }
+  .pmr-eq-select-text { display: none; }
+  .pmr-eq-select-btn { width: 30px; padding: 0; }
 }
 @media (max-width: 1080px) {
   .pmr-toolbar .pmr-select { display: none; }

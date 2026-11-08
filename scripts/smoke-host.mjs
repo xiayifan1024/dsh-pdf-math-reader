@@ -55,6 +55,16 @@ const ctx = {
             yield { type: 'finish', reason: { kind: 'stop' } }
             return
           }
+          if (prompt.includes('__DROP_PLACEHOLDER__')) {
+            yield { type: 'text-delta', index: 0, text: '{"translations":["译文丢失占位符"]}' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
+          if (prompt.includes('__KEEP_PLACEHOLDER__')) {
+            yield { type: 'text-delta', index: 0, text: '{"translations":["参见 ⟦MATH_001⟧ 处"]}' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
           yield { type: 'text-delta', index: 0, text: '{"translations":["' }
           yield { type: 'text-delta', index: 0, text: '第一段译文","第二段译文"]}' }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -155,6 +165,36 @@ try {
   assert.equal(translatedBody.translations.length, 2)
   assert.equal(translatedBody.translations[0].text, '第一段译文')
   assert.equal(translatedBody.translations[1].id, 'p2')
+
+  const droppedPlaceholder = await fetch(`${origin}/pdf-reader/api/translate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      targetLanguage: 'zh-CN',
+      segments: [
+        { id: 'ph1', text: 'value __DROP_PLACEHOLDER__ ⟦MATH_001⟧' },
+      ],
+    }),
+  })
+  assert.equal(droppedPlaceholder.status, 200)
+  const droppedBody = await droppedPlaceholder.json()
+  assert.equal(droppedBody.translations[0].error, 'placeholder')
+  assert.equal(droppedBody.translations[0].placeholderIssue, 'missing')
+
+  const keptPlaceholder = await fetch(`${origin}/pdf-reader/api/translate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      targetLanguage: 'zh-CN',
+      segments: [
+        { id: 'ph2', text: 'value __KEEP_PLACEHOLDER__ ⟦MATH_001⟧' },
+      ],
+    }),
+  })
+  assert.equal(keptPlaceholder.status, 200)
+  const keptBody = await keptPlaceholder.json()
+  assert.equal(keptBody.translations[0].error, undefined)
+  assert.match(keptBody.translations[0].text, /⟦MATH_001⟧/)
 
   const malformed = await fetch(`${origin}/pdf-reader/api/translate`, {
     method: 'POST',
