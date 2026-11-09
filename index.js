@@ -26,7 +26,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ASSETS = join(HERE, 'assets')
 const ROUTE = '/pdf-reader'
 const ASSET_PREFIX = '/pdf-reader/assets/'
-const VERSION = '1.2.0'
+const VERSION = '1.3.0'
 
 const DEFAULTS = {
   provider: '',
@@ -122,7 +122,83 @@ function modelSelection(ctx, config) {
   }
   const provider = config.provider || selected?.provider || 'deepseek-account'
   const model = config.model || selected?.model || 'deepseek-flash'
-  return { provider, model, source: config.provider || config.model ? 'plugin-config' : 'profile-default' }
+  // The profile's reasoning effort only describes the default route. When the
+  // bundle config overrides either half of that route, inheriting the effort
+  // could send an unsupported level to the configured model.
+  const inheritsDefaultRoute =
+    provider === selected?.provider && model === selected?.model
+  const reasoningEffort =
+    inheritsDefaultRoute && typeof selected?.reasoningEffort === 'string'
+      ? selected.reasoningEffort
+      : undefined
+  return {
+    provider,
+    model,
+    reasoningEffort,
+    source: config.provider || config.model ? 'plugin-config' : 'profile-default',
+  }
+}
+
+function cleanModelSelection(value) {
+  if (value === null || typeof value !== 'object') return undefined
+  const provider = String(value.provider ?? '').trim().slice(0, 120)
+  const model = String(value.model ?? '').trim().slice(0, 120)
+  if (provider === '' && model === '') return undefined
+  const reasoningEffort = String(value.reasoningEffort ?? '').trim().slice(0, 80)
+  return {
+    provider,
+    model,
+    ...(reasoningEffort === '' ? {} : { reasoningEffort }),
+  }
+}
+
+/**
+ * Resolve the model route requested by one translation or chat call.
+ * `agentDefaultModel` remains the fallback when the UI sends no explicit
+ * selection; a selection without `reasoningEffort` intentionally asks for the
+ * provider default rather than inheriting the profile-level effort.
+ */
+async function resolveRequestSelection(ctx, config, body) {
+  const fallback = modelSelection(ctx, config)
+  const requested = cleanModelSelection(body?.modelSelection)
+  if (requested === undefined) return fallback
+  const llm = ctx.get('llm')
+  if (llm === undefined || typeof llm.resolveModelInfo !== 'function') {
+    throw new PluginError(
+      'TRANSLATION_UNAVAILABLE',
+      'The DSH model service is not mounted, so this plugin cannot select a model.',
+      503,
+    )
+  }
+  const provider = requested.provider || fallback.provider
+  const model = requested.model || fallback.model
+  let info
+  try {
+    info = await llm.resolveModelInfo(provider, model)
+  } catch (error) {
+    throw new PluginError(
+      'MODEL_UNAVAILABLE',
+      `Model route ${provider}/${model} is not available: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      400,
+    )
+  }
+  if (requested.reasoningEffort !== undefined) {
+    const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+    if (!efforts.some((effort) => effort.id === requested.reasoningEffort)) {
+      throw new PluginError(
+        'REASONING_UNAVAILABLE',
+        `Reasoning effort ${requested.reasoningEffort} is not supported by ${provider}/${model}.`,
+        400,
+      )
+    }
+  }
+  return {
+    provider,
+    model,
+    reasoningEffort: requested.reasoningEffort,
+  }
 }
 
 function serviceInfo(ctx) {
@@ -136,6 +212,92 @@ function serviceInfo(ctx) {
     }
   }
   return { available: llm !== undefined, providers }
+}
+
+let modelCatalogCache = { at: 0, data: null }
+const MODEL_CATALOG_TTL_MS = 60_000
+
+/**
+ * Read the provider/model catalog advertised by the mounted adapters.
+ * Reasoning metadata is model-specific, so it is resolved per model and is
+ * only a hint for the picker; the request path validates again.
+ */
+async function readModelCatalog(ctx, { force = false } = {}) {
+  const now = Date.now()
+  if (
+    !force &&
+    modelCatalogCache.data !== null &&
+    now - modelCatalogCache.at < MODEL_CATALOG_TTL_MS
+  ) {
+    return modelCatalogCache.data
+  }
+  const llm = ctx.get('llm')
+  if (llm === undefined || typeof llm.listModels !== 'function') {
+    return { providers: [], models: [], warnings: [] }
+  }
+  let providers = []
+  try {
+    providers = llm.listProviders()
+  } catch {
+    providers = []
+  }
+  const warnings = []
+  const modelEntries = []
+  await Promise.all(
+    providers.map(async (provider) => {
+      let models = []
+      try {
+        models = await llm.listModels(provider.id)
+      } catch (error) {
+        warnings.push(
+          `${provider.id}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+        return
+      }
+      if (!Array.isArray(models)) models = []
+      for (const model of models.slice(0, 200)) {
+        let info
+        try {
+          info =
+            typeof llm.resolveModelInfo === 'function'
+              ? await llm.resolveModelInfo(provider.id, model.id)
+              : undefined
+        } catch {
+          info = undefined
+        }
+        modelEntries.push({
+          provider: provider.id,
+          providerName: provider.name ?? provider.id,
+          id: model.id,
+          name: model.name ?? model.id,
+          ...(model.description ? { description: model.description } : {}),
+          ...(model.badge ? { badge: model.badge } : {}),
+          ...(info?.reasoning
+            ? {
+                reasoning: {
+                  defaultEffort: info.reasoning.defaultEffort,
+                  efforts: info.reasoning.efforts.map((effort) => ({
+                    id: effort.id,
+                    name: effort.name,
+                    ...(effort.description ? { description: effort.description } : {}),
+                  })),
+                },
+              }
+            : {}),
+        })
+      }
+    }),
+  )
+  const data = {
+    providers: providers.map((provider) => ({
+      id: provider.id,
+      name: provider.name ?? provider.id,
+    })),
+    models: modelEntries,
+    warnings,
+  }
+  modelCatalogCache = { at: now, data }
+  return data
 }
 
 function remember(cache, key, value, limit) {
@@ -178,6 +340,9 @@ async function translateOnce({ ctx, config, selection, targetLanguage, sourceLan
     const stream = llm.stream({
       provider: selection.provider,
       model: selection.model,
+      ...(selection.reasoningEffort !== undefined
+        ? { reasoningEffort: selection.reasoningEffort }
+        : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
       maxTokens: 4096,
       signal: controller.signal,
@@ -297,7 +462,7 @@ function busyDelay(ms) {
 
 async function handleTranslate(ctx, config, body, cache, signal) {
   const request = validateTranslateBody(body, config)
-  const selection = modelSelection(ctx, config)
+  const selection = await resolveRequestSelection(ctx, config, body)
   const info = serviceInfo(ctx)
   if (!info.available) {
     throw new PluginError(
@@ -319,6 +484,7 @@ async function handleTranslate(ctx, config, body, cache, signal) {
       'v1',
       selection.provider,
       selection.model,
+      selection.reasoningEffort ?? '',
       request.targetLanguage,
       request.sourceLanguage,
       request.glossary,
@@ -352,6 +518,7 @@ async function handleTranslate(ctx, config, body, cache, signal) {
     translations,
     provider: selection.provider,
     model: selection.model,
+    reasoningEffort: selection.reasoningEffort,
     batches: batches.length,
     elapsedMs: Date.now() - started,
     glossarySize: request.glossary.length,
@@ -382,7 +549,7 @@ async function handleChat(ctx, config, body, signal) {
       503,
     )
   }
-  const selection = modelSelection(ctx, config)
+  const selection = await resolveRequestSelection(ctx, config, body)
   const skillName = String(body.skill?.name ?? '').trim().slice(0, 120)
   const skillContent = String(body.skill?.content ?? '').trim().slice(0, 16000)
   const prompt = chatPrompt({
@@ -413,6 +580,9 @@ async function handleChat(ctx, config, body, signal) {
     const stream = llm.stream({
       provider: selection.provider,
       model: selection.model,
+      ...(selection.reasoningEffort !== undefined
+        ? { reasoningEffort: selection.reasoningEffort }
+        : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
       maxTokens: config.chatMaxTokens,
       signal: controller.signal,
@@ -460,6 +630,7 @@ async function handleChat(ctx, config, body, signal) {
     answer: text,
     provider: selection.provider,
     model: selection.model,
+    reasoningEffort: selection.reasoningEffort,
     elapsedMs: Date.now() - started,
   }
 }
@@ -619,6 +790,7 @@ function healthPayload(ctx, config) {
     providers: info.providers,
     provider: selection.provider,
     model: selection.model,
+    reasoningEffort: selection.reasoningEffort,
     selectionSource: selection.source,
     defaultNotesDir: defaultNotesDir(ctx),
     limits: {
@@ -797,6 +969,24 @@ function createSaveNotesRoute(ctx) {
 }
 
 
+function createModelsRoute(ctx) {
+  return async function modelsRoute(req, res) {
+    try {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { allow: 'GET, HEAD' })
+        res.end()
+        return
+      }
+      const catalog = await readModelCatalog(ctx, {
+        force: new URL(req.url, 'http://localhost').searchParams.get('refresh') === '1',
+      })
+      writeNodeJson(res, 200, { ok: true, ...catalog })
+    } catch (error) {
+      writeNodeError(res, error)
+    }
+  }
+}
+
 function createHealthResource(ctx, config) {
   return async function healthResource() {
     return jsonResponse(200, healthPayload(ctx, config))
@@ -842,6 +1032,11 @@ export function apply(ctx, config) {
       kind: 'exact',
       path: `${ROUTE}/api/health`,
       resource: createHealthResource(ctx, resolved),
+    }),
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE}/api/models`,
+      handler: createModelsRoute(ctx),
     }),
     ctx.webServer.register({
       kind: 'exact',

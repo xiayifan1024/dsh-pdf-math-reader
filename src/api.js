@@ -32,6 +32,15 @@ export async function fetchHealth(signal) {
   return await readJsonResponse(response)
 }
 
+export async function fetchModels(signal) {
+  const response = await fetch('/pdf-reader/api/models', {
+    method: 'GET',
+    credentials: 'same-origin',
+    signal,
+  })
+  return await readJsonResponse(response)
+}
+
 export async function translateSegments(payload, signal) {
   const response = await fetch('/pdf-reader/api/translate', {
     method: 'POST',

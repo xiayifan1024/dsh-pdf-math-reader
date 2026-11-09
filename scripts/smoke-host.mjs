@@ -24,9 +24,41 @@ const ctx = {
     if (name === 'llm') {
       return {
         listProviders: () => [{ id: 'deepseek-account', name: 'DeepSeek Account' }],
+        async listModels(provider) {
+          assert.equal(provider, 'deepseek-account')
+          return [
+            { provider, id: 'deepseek-flash', name: 'DeepSeek Flash' },
+            { provider, id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+          ]
+        },
+        async resolveModelInfo(provider, model) {
+          assert.equal(provider, 'deepseek-account')
+          if (model === 'missing-model') throw new Error('unknown model')
+          return {
+            provider,
+            id: model,
+            name: model,
+            reasoning:
+              model === 'deepseek-reasoner'
+                ? {
+                    defaultEffort: 'medium',
+                    efforts: [
+                      { id: 'low', name: 'Low' },
+                      { id: 'medium', name: 'Medium' },
+                      { id: 'high', name: 'High' },
+                    ],
+                  }
+                : undefined,
+          }
+        },
         async *stream(options) {
           assert.equal(options.provider, 'deepseek-account')
-          assert.equal(options.model, 'deepseek-flash')
+          if (options.model === 'deepseek-reasoner') {
+            assert.equal(options.reasoningEffort, 'high')
+          } else {
+            assert.equal(options.model, 'deepseek-flash')
+            assert.equal(options.reasoningEffort, undefined)
+          }
           const prompt = options.messages[0].content[0].text
           if (prompt.includes('research assistant')) {
             yield { type: 'text-delta', index: 0, text: 'The paper proposes a new method.' }
@@ -141,12 +173,112 @@ const server = createServer(async (req, res) => {
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
 const origin = `http://127.0.0.1:${server.address().port}`
 
+// A bundle-config override must not inherit the profile's reasoning effort.
+{
+  const overrides = []
+  const overrideRoutes = []
+  const overrideCtx = {
+    webServer: {
+      register(value) {
+        overrideRoutes.push(value)
+        return () => {}
+      },
+    },
+    effect(callback) {
+      return callback()
+    },
+    get(name) {
+      if (name === 'agentDefaultModel') {
+        return {
+          currentSelection: () => ({
+            provider: 'deepseek-account',
+            model: 'deepseek-flash',
+            reasoningEffort: 'high',
+          }),
+        }
+      }
+      if (name === 'llm') {
+        return {
+          listProviders: () => [{ id: 'deepseek-account', name: 'DeepSeek Account' }],
+          async listModels() {
+            return [{ provider: 'deepseek-account', id: 'deepseek-chat', name: 'DeepSeek Chat' }]
+          },
+          async resolveModelInfo(provider, model) {
+            return { provider, id: model, name: model }
+          },
+          async *stream(options) {
+            overrides.push(options)
+            yield { type: 'text-delta', index: 0, text: '{"translations":["a","b"]}' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  apply(overrideCtx, { model: 'deepseek-chat' })
+  const translateRoute = overrideRoutes.find((route) => route.path === '/pdf-reader/api/translate')
+  assert.ok(translateRoute, 'translate route missing')
+  const results = []
+  const res = {
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    end(payload) {
+      results.push({ status: this.status, body: JSON.parse(payload) })
+    },
+    on() {},
+    off() {},
+    once() {},
+    destroyed: false,
+  }
+  const req = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    on() {},
+    off() {},
+    once() {},
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(
+        JSON.stringify({
+          targetLanguage: 'zh-CN',
+          segments: [
+            { id: 'a', text: 'First' },
+            { id: 'b', text: 'Second' },
+          ],
+        }),
+      )
+    },
+  }
+  await translateRoute.handler(req, res)
+  assert.equal(results[0]?.status, 200, JSON.stringify(results[0]))
+  assert.equal(overrides.length, 1)
+  assert.equal(overrides[0].model, 'deepseek-chat')
+  assert.equal(overrides[0].reasoningEffort, undefined)
+}
+
 try {
   const health = await fetch(`${origin}/pdf-reader/api/health`)
   assert.equal(health.status, 200)
   const healthBody = await health.json()
   assert.equal(healthBody.llm, true)
   assert.equal(healthBody.model, 'deepseek-flash')
+
+  const models = await fetch(`${origin}/pdf-reader/api/models`)
+  assert.equal(models.status, 200)
+  const modelsBody = await models.json()
+  assert.equal(modelsBody.ok, true)
+  assert.deepEqual(
+    modelsBody.models.map((entry) => entry.id),
+    ['deepseek-flash', 'deepseek-reasoner'],
+  )
+  const reasoner = modelsBody.models.find((entry) => entry.id === 'deepseek-reasoner')
+  assert.equal(reasoner.reasoning.defaultEffort, 'medium')
+  assert.deepEqual(
+    reasoner.reasoning.efforts.map((effort) => effort.id),
+    ['low', 'medium', 'high'],
+  )
 
   const translated = await fetch(`${origin}/pdf-reader/api/translate`, {
     method: 'POST',
@@ -165,6 +297,58 @@ try {
   assert.equal(translatedBody.translations.length, 2)
   assert.equal(translatedBody.translations[0].text, '第一段译文')
   assert.equal(translatedBody.translations[1].id, 'p2')
+
+  const selectedTranslation = await fetch(`${origin}/pdf-reader/api/translate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      targetLanguage: 'zh-CN',
+      segments: [
+        { id: 'selected1', text: 'Selected model' },
+        { id: 'selected2', text: 'Second selected paragraph' },
+      ],
+      modelSelection: {
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        reasoningEffort: 'high',
+      },
+    }),
+  })
+  assert.equal(selectedTranslation.status, 200, await selectedTranslation.clone().text())
+  const selectedBody = await selectedTranslation.json()
+  assert.equal(selectedBody.model, 'deepseek-reasoner')
+  assert.equal(selectedBody.reasoningEffort, 'high')
+
+  const badReasoning = await fetch(`${origin}/pdf-reader/api/translate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      targetLanguage: 'zh-CN',
+      segments: [{ id: 'bad', text: 'Bad reasoning' }],
+      modelSelection: {
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        reasoningEffort: 'ultra',
+      },
+    }),
+  })
+  assert.equal(badReasoning.status, 400)
+  assert.equal((await badReasoning.json()).error.code, 'REASONING_UNAVAILABLE')
+
+  const missingModel = await fetch(`${origin}/pdf-reader/api/translate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      targetLanguage: 'zh-CN',
+      segments: [{ id: 'missing', text: 'Missing model' }],
+      modelSelection: {
+        provider: 'deepseek-account',
+        model: 'missing-model',
+      },
+    }),
+  })
+  assert.equal(missingModel.status, 400)
+  assert.equal((await missingModel.json()).error.code, 'MODEL_UNAVAILABLE')
 
   const droppedPlaceholder = await fetch(`${origin}/pdf-reader/api/translate`, {
     method: 'POST',
@@ -253,6 +437,26 @@ try {
   const chatBody = await chat.json()
   assert.equal(chatBody.ok, true)
   assert.ok(chatBody.answer.length > 0)
+
+  const selectedChat = await fetch(`${origin}/pdf-reader/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      question: 'What is the main contribution?',
+      context: '[Page 1]\nThe paper proposes a new method.',
+      contextLabel: 'Page 1',
+      history: [],
+      modelSelection: {
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        reasoningEffort: 'high',
+      },
+    }),
+  })
+  assert.equal(selectedChat.status, 200, await selectedChat.clone().text())
+  const selectedChatBody = await selectedChat.json()
+  assert.equal(selectedChatBody.model, 'deepseek-reasoner')
+  assert.equal(selectedChatBody.reasoningEffort, 'high')
 
   const skills = await fetch(`${origin}/pdf-reader/api/skills`)
   assert.equal(skills.status, 200)

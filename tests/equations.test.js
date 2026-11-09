@@ -343,11 +343,18 @@ test('regression: Attention paper equation (2) is complete and the table stays t
   try {
     const viewport = thirteenth.page.getViewport({ scale: 1 })
     const textContent = await thirteenth.page.getTextContent({ includeMarkedContent: false })
-    const model = buildPageModel(library, textContent, viewport, { pageIndex: 12 })
-    const paragraph = model.paragraphs.find((entry) => entry.text.includes('this spirit'))
-    assert.ok(paragraph, 'figure-label paragraph missing')
-    assert.deepEqual(paragraph.placeholders, [])
-    assert.match(paragraph.translateText, /this spirit that a/)
+    // Figure labels are attributed to the figure (see figures.test.js); they
+    // must never surface as body paragraphs or as placeholder carriers.
+    const { collectFigureRegions } = await import('../src/figures.js')
+    const figures = await collectFigureRegions(thirteenth.page, library, viewport)
+    const model = buildPageModel(library, textContent, viewport, { pageIndex: 12, figures })
+    assert.equal(
+      model.paragraphs.some((entry) => entry.text.includes('this spirit')),
+      false,
+      'a figure label must not become a paragraph',
+    )
+    assert.equal(model.figures.length, 1)
+    assert.equal(model.equations.length, 0)
   } finally {
     await thirteenth.document.destroy()
   }

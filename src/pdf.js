@@ -7,10 +7,18 @@
 
 import {
   analyzeEquations,
+  bodyFontSize,
   cropMetrics,
+  dominantFont,
+  overlapRatio,
   splitTextAtom,
   unionBox,
 } from './equations.js'
+import {
+  assignFigureLabels,
+  collectFigureRegions,
+  detectFigureRegions,
+} from './figures.js'
 import { mathToken } from '../lib/placeholders.js'
 
 const ASSET_BASE = '/pdf-reader/assets'
@@ -315,11 +323,19 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
   const pageHeight = (viewport?.height ?? 792) / scale
   const pageIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : 0
   const atoms = buildAtoms(library, textContent, viewport).flatMap(splitTextAtom)
-  const analysis = analyzeEquations(atoms, {
+  // Figure labels must leave the text flow before equation detection, otherwise
+  // an annotation such as "Input → Output" is classified as a display formula.
+  const bodyFont = options.bodyFont ?? dominantFont(atoms)
+  const bodySize = options.bodySize ?? bodyFontSize(atoms)
+  const resolvedFigures = resolveFigureRegions(options, pageWidth, pageHeight)
+  const figureRegions = resolvedFigures.regions
+  const figureInfo = assignFigureLabels(atoms, figureRegions, { bodySize })
+  const contentAtoms = atoms.filter((atom) => !figureInfo.atomIds.has(atom.index))
+  const analysis = analyzeEquations(contentAtoms, {
     pageWidth,
     pageHeight,
-    bodyFont: options.bodyFont,
-    bodySize: options.bodySize,
+    bodyFont,
+    bodySize,
     overrides: options.overrides,
   })
   const excluded = analysis.equationAtomIds
@@ -416,7 +432,7 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
     current = undefined
   }
 
-  for (const atom of atoms) {
+  for (const atom of contentAtoms) {
     if (excluded.has(atom.index)) continue
     if (atom.text.trim() === '') {
       if (current !== undefined) {
@@ -497,9 +513,11 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
     const verticalReset = line.top < previous.top - height * 0.5
     const columnJumpLeft =
       line.x < previous.x - height * 2.2 && previous.right > pageWidth * 0.58
+    const proseBreak = /[.!?。！？:：;；)\]"”’]$/.test(previous.text.trim())
     const columnJumpRight =
       line.x > previous.x + height * 2.2 &&
       line.x > pageWidth * 0.42 &&
+      proseBreak &&
       (verticalReset || line.top <= previous.bottom + height * 1.5)
     const indented =
       line.x > previous.x + height * 0.95 && gap > Math.max(0.8, medianGap * 0.45)
@@ -508,14 +526,26 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
       line.x <= previous.x + height * 0.75 &&
       gap > Math.max(1, gapThreshold * 0.55)
     const heading = line.height > previous.height * 1.24 && line.height > 9
+    // A line break in the middle of a sentence is not a paragraph break, even
+    // when the previous line is short or the next line is indented. This is
+    // common in license notes, abstracts and two-column body text.
+    const sentenceContinuation =
+      !verticalReset &&
+      !columnJumpRight &&
+      !columnJumpLeft &&
+      !heading &&
+      gap <= Math.max(gapThreshold * 1.35, height * 1.5) &&
+      !/[.!?。！？:：;；)\]"”’]$/.test(previous.text.trim()) &&
+      /^[a-zà-ÿ0-9(（\[]/.test(line.text)
     const newParagraph =
-      gap > gapThreshold ||
-      verticalReset ||
-      columnJumpRight ||
-      columnJumpLeft ||
-      indented ||
-      shortPrevious ||
-      heading
+      !sentenceContinuation &&
+      (gap > gapThreshold ||
+        verticalReset ||
+        columnJumpRight ||
+        columnJumpLeft ||
+        indented ||
+        shortPrevious ||
+        heading)
     if (newParagraph) {
       paragraphs.push(createParagraph(line))
     } else {
@@ -584,15 +614,60 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
       order: equation.order,
     })
   }
+  // A figure keeps its artwork and its labels together. `order` follows the
+  // first label; an image without labels is placed just before the text that
+  // follows it in the content stream, which is normally its caption.
+  const figureBlocks = []
+  const maxAtomOrder = atoms.reduce(
+    (max, atom) => (Number.isFinite(atom.index) ? Math.max(max, atom.index) : max),
+    0,
+  )
+  for (let index = 0; index < figureInfo.figures.length; index += 1) {
+    const figure = figureInfo.figures[index]
+    const labelAtoms = figure.labels.flatMap((line) => line.atoms)
+    const fallbackOrder = () => {
+      const below = atoms.find(
+        (atom) => atom.text.trim() !== '' && atom.top > figure.bbox[3] - 0.5,
+      )
+      return below === undefined ? maxAtomOrder + 0.5 : below.index - 0.5
+    }
+    const order =
+      labelAtoms.length > 0
+        ? Math.min(...labelAtoms.map((atom) => atom.index))
+        : fallbackOrder()
+    figureBlocks.push({
+      id: `${pageKey}-figure${index + 1}`,
+      type: 'figure',
+      pageIndex,
+      bbox: figure.bbox,
+      imageBbox: figure.imageBbox,
+      figureNumber: figure.number,
+      caption: figure.caption?.text ?? null,
+      captionBbox: figure.caption?.bbox ?? null,
+      labels: figure.labels.map((line) => ({ text: line.text, bbox: line.bbox })),
+      labelCount: figure.labels.length,
+      source: figure.source,
+      detectionSource: 'automatic',
+      text: figure.labels.map((line) => line.text).join(' ') || figure.caption?.text || '',
+      order,
+    })
+  }
+  blocks.push(...figureBlocks)
   blocks.sort(
     (left, right) =>
-      left.order - right.order || (left.type === 'equation' ? -1 : 1),
+      left.order - right.order ||
+      (left.type === 'equation' || left.type === 'figure' ? -1 : 1),
   )
   let equationIndex = 0
+  let figureIndex = 0
   for (const block of blocks) {
-    if (block.type !== 'equation') continue
-    equationIndex += 1
-    block.id = `${pageKey}-equation${equationIndex}`
+    if (block.type === 'equation') {
+      equationIndex += 1
+      block.id = `${pageKey}-equation${equationIndex}`
+    } else if (block.type === 'figure') {
+      figureIndex += 1
+      block.id = `${pageKey}-figure${figureIndex}`
+    }
   }
 
   return {
@@ -600,11 +675,44 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
     paragraphs: paragraphBlocks,
     lines: paragraphBlocks.flatMap((paragraph) => paragraph.lines),
     equations: blocks.filter((block) => block.type === 'equation'),
+    figures: blocks.filter((block) => block.type === 'figure'),
+    figureRegions,
+    // The unfiltered detection result, so callers can cache it and re-apply
+    // "not a figure" corrections on later visits without losing the region.
+    figureRegionsRaw: resolvedFigures.raw,
     atoms,
     viewport,
+    bodySize,
+    bodyFont,
+    pageIndex,
     pageWidth: viewport.width,
     pageHeight: viewport.height,
   }
+}
+
+/**
+ * Resolve the figure boxes for a page.
+ *
+ * Callers normally pass `figures` measured from the page operator list by
+ * `collectFigureRegions`. `artwork` is accepted for callers that already have
+ * the raw image/path boxes, and `overrides.figures` removes a false positive.
+ */
+function resolveFigureRegions(options, pageWidth, pageHeight) {
+  const raw = options.figures ?? options.figureRegions
+  let regions = Array.isArray(raw) ? raw.filter((region) => Array.isArray(region?.bbox)) : []
+  if (regions.length === 0 && options.artwork !== undefined) {
+    regions = detectFigureRegions(options.artwork, { pageWidth, pageHeight })
+  }
+  const detected = regions
+  const removed = Array.isArray(options.overrides?.figures) ? options.overrides.figures : []
+  const filtered =
+    removed.length === 0
+      ? detected
+      : detected.filter(
+          (region) =>
+            !removed.some((box) => Array.isArray(box) && overlapRatio(box, region.bbox) > 0.3),
+        )
+  return { regions: filtered, raw: detected }
 }
 
 function createParagraph(line) {
@@ -625,8 +733,13 @@ export async function extractPageModel(page, scale = 1, identity = undefined, op
   const library = await loadPdfJs()
   const viewport = page.getViewport({ scale })
   const textContent = await page.getTextContent({ includeMarkedContent: false })
+  let figures = options.figures
+  if (figures === undefined && options.detectFigures !== false) {
+    figures = await collectFigureRegions(page, library, viewport, options.figureOptions)
+  }
   const model = buildPageModel(library, textContent, viewport, {
     ...options,
+    figures,
     pageIndex: identity?.pageIndex ?? options.pageIndex ?? 0,
   })
   if (identity !== undefined) {

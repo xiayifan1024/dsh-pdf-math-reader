@@ -2,6 +2,7 @@ import { Component, useCallback, useEffect, useMemo, useRef, useState } from 're
 import {
   chatWithPaper,
   fetchHealth,
+  fetchModels,
   listSkills,
   loadSkill,
   saveNotes,
@@ -25,6 +26,9 @@ import {
   resolveOutline,
 } from './pdf'
 import { overlapRatio } from './equations'
+import { composeReading } from './article'
+import { collectFigureRegions } from './figures'
+import { extractReferences } from './references'
 import { restorePlaceholders } from '../lib/placeholders.js'
 import { createZip, dataUrlToBytes } from './zip'
 import { en, translate, zh } from './locales'
@@ -34,7 +38,7 @@ const SETTINGS_KEY = 'pdf-math-reader.settings.v1'
 const NOTES_KEY = 'pdf-math-reader.notes.v1'
 const EQUATIONS_KEY = 'pdf-math-reader.equations.v1'
 const PANEL_ID = 'pdf-math-reader'
-const EMPTY_OVERRIDES = { added: [], removed: [] }
+const EMPTY_OVERRIDES = { added: [], removed: [], figures: [] }
 // Sidebar tile: a small raster served by the Host under /pdf-reader/assets/.
 const PANEL_ICON = '/pdf-reader/assets/icon-128.png'
 
@@ -97,6 +101,20 @@ function newNoteId() {
   }
 }
 
+function normalizeModelSelection(value) {
+  if (value === null || typeof value !== 'object') return null
+  const provider = typeof value.provider === 'string' ? value.provider.trim() : ''
+  const model = typeof value.model === 'string' ? value.model.trim() : ''
+  if (provider === '' || model === '') return null
+  const reasoningEffort =
+    typeof value.reasoningEffort === 'string' ? value.reasoningEffort.trim() : ''
+  return {
+    provider,
+    model,
+    ...(reasoningEffort === '' ? {} : { reasoningEffort }),
+  }
+}
+
 function loadSettings() {
   const fallback = {
     targetLanguage: 'zh-CN',
@@ -104,6 +122,10 @@ function loadSettings() {
     saveDir: '',
     railWidth: 218,
     translationWidth: 390,
+    viewMode: 'bilingual',
+    readingFontSize: 16,
+    translationSelection: null,
+    chatSelection: null,
   }
   try {
     const raw = window.localStorage?.getItem(SETTINGS_KEY)
@@ -122,6 +144,12 @@ function loadSettings() {
       saveDir: typeof parsed?.saveDir === 'string' ? parsed.saveDir : '',
       railWidth: width(parsed?.railWidth, 160, 380, fallback.railWidth),
       translationWidth: width(parsed?.translationWidth, 300, 640, fallback.translationWidth),
+      viewMode: ['bilingual', 'translation', 'source'].includes(parsed?.viewMode)
+        ? parsed.viewMode
+        : fallback.viewMode,
+      readingFontSize: width(parsed?.readingFontSize, 13, 22, fallback.readingFontSize),
+      translationSelection: normalizeModelSelection(parsed?.translationSelection),
+      chatSelection: normalizeModelSelection(parsed?.chatSelection),
     }
   } catch {
     return fallback
@@ -142,7 +170,7 @@ function normalizeBox(value) {
   return box
 }
 
-/** Equation corrections persist per document fingerprint and page number. */
+/** Equation and figure corrections persist per document fingerprint and page. */
 function loadEquationOverrides() {
   try {
     const raw = window.localStorage?.getItem(EQUATIONS_KEY)
@@ -166,8 +194,11 @@ function loadEquationOverrides() {
         const removed = Array.isArray(entry?.removed)
           ? entry.removed.map(normalizeBox).filter((box) => box !== null).slice(0, 200)
           : []
-        if (added.length === 0 && removed.length === 0) continue
-        pageMap[index] = { added, removed }
+        const figures = Array.isArray(entry?.figures)
+          ? entry.figures.map(normalizeBox).filter((box) => box !== null).slice(0, 200)
+          : []
+        if (added.length === 0 && removed.length === 0 && figures.length === 0) continue
+        pageMap[index] = { added, removed, figures }
       }
       if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap
     }
@@ -184,6 +215,7 @@ function pageOverridesFor(all, fingerprint, pageIndex) {
   return {
     added: Array.isArray(entry.added) ? entry.added : [],
     removed: Array.isArray(entry.removed) ? entry.removed : [],
+    figures: Array.isArray(entry.figures) ? entry.figures : [],
   }
 }
 
@@ -516,21 +548,98 @@ function PageThumbnail({ pdf, pageNumber, label, active, width, cacheKey, onClic
   )
 }
 
-function SegmentCard({
-  tt,
-  paragraph,
-  translation,
-  status,
-  mode,
+function TranslationBlock({ tt, translation, status, error, onRetry, className }) {
+  if (error) {
+    return (
+      <div className="pmr-seg-err">
+        <span>{error}</span>
+        {onRetry !== undefined && (
+          <button
+            type="button"
+            className="pmr-seg-retry"
+            onClick={(event) => {
+              event.stopPropagation()
+              onRetry()
+            }}
+          >
+            {tt('action.retry')}
+          </button>
+        )}
+      </div>
+    )
+  }
+  if (translation?.text) return <div className={className}>{translation.text}</div>
+  if (status === 'loading') {
+    return (
+      <>
+        <div className="pmr-seg-skeleton" />
+        <div className="pmr-seg-skeleton short" />
+      </>
+    )
+  }
+  // A page-level failure already has a banner at the top of the column; do not
+  // repeat it under every title, author row and paragraph.
+  if (status === 'error') return null
+  return <div className={`${className} is-placeholder`}>{tt('panel.waiting')}</div>
+}
+
+/** Author line for exports: keep the original affiliation and add its translation. */
+function exportAuthorLine(author, pageTranslation) {
+  const translated = author.affiliationId
+    ? pageTranslation?.[author.affiliationId]?.text
+    : undefined
+  const showTranslation =
+    typeof translated === 'string' &&
+    translated.trim() !== '' &&
+    translated !== author.affiliation
+  const affiliation = showTranslation
+    ? `${author.affiliation} / ${translated}`
+    : author.affiliation
+  return [
+    `${author.name}${author.marks ? ` ${author.marks}` : ''}`,
+    affiliation,
+    author.email,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+}
+
+function CopyButton({ tt, text, label, onCopy, className = 'pmr-block-copy' }) {
+  if (onCopy === undefined || text === undefined || text === '') return null
+  return (
+    <button
+      type="button"
+      className={className}
+      title={label ?? tt('action.copy')}
+      aria-label={label ?? tt('action.copy')}
+      onClick={(event) => {
+        event.stopPropagation()
+        onCopy(text)
+      }}
+    >
+      <Icon name="copy" size={11} />
+    </button>
+  )
+}
+
+function BlockShell({
   active,
-  error,
-  onRetry,
   onClick,
+  className,
+  children,
+  onCopy,
+  copyText,
+  copyLabel,
+  tt,
 }) {
   return (
     <div
-      className={`pmr-seg-card ${active ? 'is-active' : ''}`}
-      onClick={onClick}
+      className={`${className} ${active ? 'is-active' : ''}`}
+      onClick={(event) => {
+        // Dragging to select text should not also toggle the paragraph focus.
+        if ((window.getSelection()?.toString().trim() ?? '') !== '') return
+        onClick(event)
+      }}
       role="button"
       tabIndex={0}
       onKeyDown={(event) => {
@@ -540,67 +649,381 @@ function SegmentCard({
         }
       }}
     >
-      {mode !== 'translation' && <div className="pmr-seg-src">{paragraph.text}</div>}
-      {mode !== 'source' &&
-        (error ? (
-          <div className="pmr-seg-err">
-            <span>{error}</span>
-            {onRetry !== undefined && (
-              <button
-                type="button"
-                className="pmr-seg-retry"
-                onClick={(event) => {
-                  event.stopPropagation()
-                  onRetry()
-                }}
-              >
-                {tt('action.retry')}
-              </button>
-            )}
-          </div>
-        ) : translation?.text ? (
-          <div className="pmr-seg-tr">{translation.text}</div>
-        ) : status === 'loading' ? (
-          <>
-            <div className="pmr-seg-skeleton" />
-            <div className="pmr-seg-skeleton short" />
-          </>
-        ) : status === 'error' ? (
-          <div className="pmr-seg-err">{tt('error.translate')}</div>
-        ) : (
-          <div className="pmr-seg-tr is-placeholder">{tt('panel.waiting')}</div>
-        ))}
+      <CopyButton tt={tt} text={copyText} label={copyLabel} onCopy={onCopy} />
+      {children}
     </div>
   )
 }
 
-function EquationBlock({
+function ModelControls({ tt, catalog, value, onChange, disabled = false, fallback }) {
+  const models = Array.isArray(catalog.models) ? catalog.models : []
+  const selectionId = (provider, model) =>
+    `${encodeURIComponent(provider)}|${encodeURIComponent(model)}`
+  const selectedKey = value === null ? '' : selectionId(value.provider, value.model)
+  const lookup =
+    value ??
+    (fallback?.provider && fallback?.model
+      ? { provider: fallback.provider, model: fallback.model }
+      : undefined)
+  const current = models.find(
+    (entry) => entry.provider === lookup?.provider && entry.id === lookup?.model,
+  )
+  const providers = Array.isArray(catalog.providers) ? catalog.providers : []
+  const groups = new Map()
+  for (const entry of models) {
+    if (!groups.has(entry.provider)) groups.set(entry.provider, [])
+    groups.get(entry.provider).push(entry)
+  }
+  const providerName = (id) => providers.find((entry) => entry.id === id)?.name ?? id
+  const efforts = Array.isArray(current?.reasoning?.efforts)
+    ? current.reasoning.efforts
+    : []
+  return (
+    <div className="pmr-modelbar">
+      <label className="pmr-model-field">
+        <span>{tt('model.label')}</span>
+        <select
+          className="pmr-model-select"
+          value={selectedKey}
+          disabled={disabled || catalog.status === 'loading'}
+          aria-label={tt('model.label')}
+          title={catalog.status === 'error' ? catalog.error : tt('model.hint')}
+          onChange={(event) => {
+            const nextKey = event.target.value
+            if (nextKey === '') {
+              onChange(null)
+              return
+            }
+            const [provider, model] = nextKey
+              .split('|')
+              .map((part) => decodeURIComponent(part))
+            onChange({ provider, model })
+          }}
+        >
+          <option value="">{tt('model.default')}</option>
+          {[...groups.entries()].map(([provider, entries]) => (
+            <optgroup key={provider} label={providerName(provider)}>
+              {entries.map((entry) => (
+                <option
+                  key={`${entry.provider}:${entry.id}`}
+                  value={selectionId(entry.provider, entry.id)}
+                >
+                  {entry.name || entry.id}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+          {value !== null && current === undefined && (
+            <option value={selectedKey}>{`${value.provider}/${value.model}`}</option>
+          )}
+        </select>
+      </label>
+      {efforts.length > 0 && (
+        <label className="pmr-model-field is-reasoning">
+          <span>{tt('model.reasoning')}</span>
+          <select
+            className="pmr-model-select"
+            value={value?.reasoningEffort ?? ''}
+            disabled={disabled}
+            aria-label={tt('model.reasoning')}
+            onChange={(event) => {
+              const provider = value?.provider ?? fallback?.provider
+              const model = value?.model ?? fallback?.model
+              if (!provider || !model) return
+              const effort = event.target.value
+              onChange({
+                provider,
+                model,
+                ...(effort === '' ? {} : { reasoningEffort: effort }),
+              })
+            }}
+          >
+            <option value="">{tt('model.reasoningDefault')}</option>
+            {efforts.map((effort) => (
+              <option key={effort.id} value={effort.id}>
+                {effort.name || effort.id}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      {catalog.status === 'loading' && (
+        <span className="pmr-model-state">{tt('model.loading')}</span>
+      )}
+    </div>
+  )
+}
+
+function TitleBlock({
   tt,
-  equation,
-  pdf,
-  fingerprint,
-  pageIndex,
-  cache,
-  cacheVersion,
+  block,
+  translation,
+  status,
+  mode,
   active,
-  onLocate,
-  onRemove,
+  error,
+  onRetry,
+  onClick,
   onCopy,
 }) {
+  const copyValue = mode === 'source' ? block.text : translation?.text || block.text
+  return (
+    <BlockShell
+      className="pmr-title-block"
+      active={active}
+      onClick={onClick}
+      tt={tt}
+      onCopy={onCopy}
+      copyText={copyValue}
+      copyLabel={
+        mode !== 'source' && translation?.text
+          ? tt('action.copyTranslation')
+          : tt('action.copySource')
+      }
+    >
+      {mode !== 'translation' && <div className="pmr-title-src">{block.text}</div>}
+      {mode !== 'source' && (
+        <TranslationBlock
+          tt={tt}
+          translation={translation}
+          status={status}
+          error={error}
+          onRetry={onRetry}
+          className="pmr-title-tr"
+        />
+      )}
+    </BlockShell>
+  )
+}
+
+function AuthorBlock({ tt, block, mode, active, onClick, pageTranslation, onCopy }) {
+  const copyValue = block.authors
+    .map((author) =>
+      [
+        `${author.name}${author.marks ? ` ${author.marks}` : ''}`,
+        author.affiliation,
+        author.email,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+    )
+    .join('\n')
+  return (
+    <BlockShell
+      className="pmr-author-block"
+      active={active}
+      onClick={onClick}
+      tt={tt}
+      onCopy={onCopy}
+      copyText={copyValue}
+      copyLabel={tt('action.copyAuthors')}
+    >
+      <div className="pmr-article-head">
+        <span className="pmr-article-label">{tt('reading.authors')}</span>
+        <span className="pmr-article-orig">
+          {tt('reading.authorCount', { count: block.authors.length })}
+        </span>
+      </div>
+      <div className="pmr-author-grid">
+        {block.authors.map((author, index) => {
+          const translated = author.affiliationId
+            ? pageTranslation[author.affiliationId]?.text
+            : undefined
+          const affiliation =
+            mode === 'translation' && translated ? translated : author.affiliation
+          return (
+            <div className="pmr-author" key={`${author.name}-${index}`}>
+              <div className="pmr-author-name">
+                {author.name}
+                {author.marks !== '' && <sup className="pmr-author-marks">{author.marks}</sup>}
+              </div>
+              {(affiliation !== '' || author.email !== '') && (
+                <div className="pmr-author-meta">
+                  {affiliation !== '' && (
+                    <span
+                      className="pmr-author-aff"
+                      title={
+                        mode === 'bilingual' && translated && translated !== affiliation
+                          ? translated
+                          : undefined
+                      }
+                    >
+                      {affiliation}
+                    </span>
+                  )}
+                  {author.email !== '' && (
+                    <a
+                      className="pmr-author-email"
+                      href={`mailto:${author.email}`}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      {author.email}
+                    </a>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </BlockShell>
+  )
+}
+
+function AbstractBlock({
+  tt,
+  block,
+  translation,
+  status,
+  mode,
+  active,
+  error,
+  onRetry,
+  onClick,
+  onCopy,
+}) {
+  const label = tt('reading.abstract')
+  const copyValue = mode === 'source' ? block.text : translation?.text || block.text
+  return (
+    <BlockShell
+      className={`pmr-article-block pmr-abstract ${
+        block.partIndex > 0 ? 'is-continuation' : ''
+      }`}
+      active={active}
+      onClick={onClick}
+      tt={tt}
+      onCopy={onCopy}
+      copyText={copyValue}
+      copyLabel={
+        mode !== 'source' && translation?.text
+          ? tt('action.copyTranslation')
+          : tt('action.copySource')
+      }
+    >
+      {block.showLabel !== false && (
+        <div className="pmr-article-head">
+          <span className="pmr-article-label">{label}</span>
+          {block.heading !== '' && block.heading.toLowerCase() !== label.toLowerCase() && (
+            <span className="pmr-article-orig">{block.heading}</span>
+          )}
+        </div>
+      )}
+      {mode !== 'translation' && <div className="pmr-abstract-src">{block.text}</div>}
+      {mode !== 'source' && (
+        <TranslationBlock
+          tt={tt}
+          translation={translation}
+          status={status}
+          error={error}
+          onRetry={onRetry}
+          className="pmr-abstract-tr"
+        />
+      )}
+    </BlockShell>
+  )
+}
+
+function KeywordsBlock({
+  tt,
+  block,
+  translation,
+  status,
+  mode,
+  active,
+  error,
+  onRetry,
+  onClick,
+  onCopy,
+}) {
+  const label = tt('reading.keywords')
+  const copyValue = mode === 'source' ? block.text : translation?.text || block.text
+  return (
+    <BlockShell
+      className="pmr-article-block pmr-keywords"
+      active={active}
+      onClick={onClick}
+      tt={tt}
+      onCopy={onCopy}
+      copyText={copyValue}
+      copyLabel={
+        mode !== 'source' && translation?.text
+          ? tt('action.copyTranslation')
+          : tt('action.copySource')
+      }
+    >
+      <div className="pmr-article-head">
+        <span className="pmr-article-label">{label}</span>
+        {block.heading !== '' && block.heading.toLowerCase() !== label.toLowerCase() && (
+          <span className="pmr-article-orig">{block.heading}</span>
+        )}
+      </div>
+      {mode !== 'translation' && <div className="pmr-keywords-src">{block.text}</div>}
+      {mode !== 'source' && (
+        <TranslationBlock
+          tt={tt}
+          translation={translation}
+          status={status}
+          error={error}
+          onRetry={onRetry}
+          className="pmr-keywords-tr"
+        />
+      )}
+    </BlockShell>
+  )
+}
+
+function SegmentCard({
+  tt,
+  block,
+  translation,
+  status,
+  mode,
+  active,
+  error,
+  onRetry,
+  onClick,
+  onCopy,
+}) {
+  const paragraph = block.paragraph
+  const copyValue =
+    mode === 'source' ? paragraph.text : translation?.text || paragraph.text
+  return (
+    <BlockShell
+      className={`pmr-seg-card ${block.role === 'heading' ? 'is-heading' : ''}`}
+      active={active}
+      onClick={onClick}
+      tt={tt}
+      onCopy={onCopy}
+      copyText={copyValue}
+      copyLabel={
+        mode !== 'source' && translation?.text
+          ? tt('action.copyTranslation')
+          : tt('action.copySource')
+      }
+    >
+      {mode !== 'translation' && <div className="pmr-seg-src">{paragraph.text}</div>}
+      {mode !== 'source' && (
+        <TranslationBlock
+          tt={tt}
+          translation={translation}
+          status={status}
+          error={error}
+          onRetry={onRetry}
+          className="pmr-seg-tr"
+        />
+      )}
+    </BlockShell>
+  )
+}
+
+/**
+ * Render a cropped page region (equation or figure) once and cache the data
+ * URL for the lifetime of the document. The crop is independent of the visible
+ * canvas, so it stays sharp at any zoom.
+ */
+function useCropImage({ pdf, pageIndex, cache, cacheKey, cropBbox, displayWidth, cacheVersion }) {
   const [image, setImage] = useState({ status: 'loading' })
-  const [zoomOpen, setZoomOpen] = useState(false)
-  const cropBbox = equation.imageBbox ?? equation.bbox
-  const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
-  const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7))
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
-  const cacheKey = [
-    fingerprint,
-    pageIndex,
-    equation.id,
-    cropBbox.map((value) => Math.round(value * 10) / 10).join(','),
-    Math.round(displayWidth),
-    dpr,
-  ].join(':')
 
   useEffect(() => {
     let cancelled = false
@@ -631,16 +1054,46 @@ function EquationBlock({
     return () => {
       cancelled = true
     }
-  }, [
+  }, [cache, cacheKey, cropBbox, displayWidth, dpr, pageIndex, pdf, cacheVersion])
+
+  return image
+}
+
+function EquationBlock({
+  tt,
+  equation,
+  pdf,
+  fingerprint,
+  pageIndex,
+  cache,
+  cacheVersion,
+  active,
+  onLocate,
+  onRemove,
+  onCopy,
+}) {
+  const [zoomOpen, setZoomOpen] = useState(false)
+  const cropBbox = equation.imageBbox ?? equation.bbox
+  const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
+  const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7))
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
+  const cacheKey = [
+    fingerprint,
+    pageIndex,
+    equation.id,
+    cropBbox.map((value) => Math.round(value * 10) / 10).join(','),
+    Math.round(displayWidth),
+    dpr,
+  ].join(':')
+  const image = useCropImage({
+    pdf,
+    pageIndex,
     cache,
     cacheKey,
     cropBbox,
-    dpr,
     displayWidth,
-    pageIndex,
-    pdf,
     cacheVersion,
-  ])
+  })
 
   useEffect(() => {
     if (!zoomOpen) return undefined
@@ -770,6 +1223,184 @@ function EquationBlock({
   )
 }
 
+/**
+ * A figure block keeps the artwork and its inner labels together.
+ *
+ * The labels stay in the page's text layer (so selecting text still works) but
+ * are not paragraphs: they belong to this figure, are not translated one by
+ * one, and are not mistaken for display equations.
+ */
+function FigureBlock({
+  tt,
+  figure,
+  pdf,
+  fingerprint,
+  pageIndex,
+  cache,
+  cacheVersion,
+  active,
+  onLocate,
+  onRemove,
+  onCopy,
+}) {
+  const [zoomOpen, setZoomOpen] = useState(false)
+  const cropBbox = figure.imageBbox ?? figure.bbox
+  const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
+  const displayWidth = Math.min(760, Math.max(160, bboxWidth * 1.7))
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
+  const cacheKey = [
+    fingerprint,
+    pageIndex,
+    figure.id,
+    cropBbox.map((value) => Math.round(value * 10) / 10).join(','),
+    Math.round(displayWidth),
+    dpr,
+  ].join(':')
+  const image = useCropImage({
+    pdf,
+    pageIndex,
+    cache,
+    cacheKey,
+    cropBbox,
+    displayWidth,
+    cacheVersion,
+  })
+
+  useEffect(() => {
+    if (!zoomOpen) return undefined
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setZoomOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [zoomOpen])
+
+  const label =
+    figure.figureNumber === null || figure.figureNumber === undefined
+      ? tt('figure.unnumbered')
+      : tt('figure.numbered', { number: figure.figureNumber })
+  const labels = Array.isArray(figure.labels) ? figure.labels : []
+  const labelText = labels.map((line) => line.text).join('\n')
+
+  return (
+    <section className={`pmr-eq-card pmr-fig-card ${active ? 'is-active' : ''}`} aria-label={label}>
+      <header className="pmr-eq-head">
+        <span className="pmr-eq-label">{label}</span>
+        <span className="pmr-eq-badge">{tt('figure.auto')}</span>
+        <div className="pmr-eq-actions">
+          {labelText !== '' && (
+            <button
+              type="button"
+              onClick={() => onCopy(labelText)}
+              title={tt('figure.copyLabels')}
+              aria-label={tt('figure.copyLabels')}
+            >
+              <Icon name="copy" size={12} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onLocate(figure)}
+            title={tt('figure.locate')}
+            aria-label={tt('figure.locate')}
+          >
+            <Icon name="search" size={12} />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoomOpen(true)}
+            title={tt('figure.zoom')}
+            aria-label={tt('figure.zoom')}
+            disabled={image.status !== 'ready'}
+          >
+            <Icon name="expand" size={12} />
+          </button>
+          <button
+            type="button"
+            className="pmr-eq-remove"
+            onClick={() => onRemove(figure)}
+            title={tt('figure.notFigure')}
+            aria-label={tt('figure.notFigure')}
+          >
+            <Icon name="close" size={11} />
+          </button>
+        </div>
+      </header>
+
+      <div
+        className="pmr-eq-scroll"
+        role="button"
+        tabIndex={0}
+        onClick={() => onLocate(figure)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onLocate(figure)
+          }
+        }}
+      >
+        {image.status === 'ready' ? (
+          <img
+            className="pmr-eq-image"
+            src={image.dataUrl}
+            width={image.width}
+            height={image.height}
+            alt={figure.caption ?? label}
+            draggable={false}
+          />
+        ) : image.status === 'error' ? (
+          <div className="pmr-eq-fallback">{tt('figure.renderFailed')}</div>
+        ) : (
+          <div className="pmr-eq-loading">
+            <span className="pmr-spinner" />
+            {tt('figure.rendering')}
+          </div>
+        )}
+      </div>
+
+      {labels.length > 0 && (
+        <details className="pmr-fig-labels">
+          <summary>{tt('figure.labels', { count: labels.length })}</summary>
+          <p className="pmr-fig-note">{tt('figure.labelsHint')}</p>
+          <div className="pmr-fig-label-list">
+            {labels.map((line, index) => (
+              <span key={`${figure.id}-label-${index}`} className="pmr-fig-label">
+                {line.text}
+              </span>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {zoomOpen && image.status === 'ready' && (
+        <div className="pmr-eq-modal" role="dialog" aria-label={label} onClick={() => setZoomOpen(false)}>
+          <div className="pmr-eq-modal-body" onClick={(event) => event.stopPropagation()}>
+            <div className="pmr-eq-modal-head">
+              <span>{label}</span>
+              <button
+                type="button"
+                className="pmr-iconbtn"
+                onClick={() => setZoomOpen(false)}
+                aria-label={tt('action.close')}
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            <div className="pmr-eq-modal-scroll">
+              <img
+                src={image.dataUrl}
+                alt={figure.caption ?? label}
+                style={{ width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: 'none' }}
+                draggable={false}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
 class ReaderErrorBoundary extends Component {
   constructor(props) {
     super(props)
@@ -854,6 +1485,18 @@ export function PdfReaderPage({ t }) {
   const tt = useT(t)
   const [settings, setSettings] = useState(loadSettings)
   const [health, setHealth] = useState({ status: 'loading' })
+  const translationSelectionKey =
+    settings.translationSelection === null
+      ? null
+      : `${settings.translationSelection.provider}/${settings.translationSelection.model}/${
+          settings.translationSelection.reasoningEffort ?? ''
+        }`
+  const [catalog, setCatalog] = useState({
+    status: 'loading',
+    providers: [],
+    models: [],
+    warnings: [],
+  })
   const [doc, setDoc] = useState(null)
   const [opening, setOpening] = useState(false)
   const [openError, setOpenError] = useState('')
@@ -868,10 +1511,16 @@ export function PdfReaderPage({ t }) {
   const [zoomMode, setZoomMode] = useState('fit')
   const [zoom, setZoom] = useState(1.2)
   const [railTab, setRailTab] = useState('outline')
+  const [references, setReferences] = useState({
+    status: 'idle',
+    heading: '',
+    pageIndex: null,
+    entries: [],
+  })
   const [leftOpen, setLeftOpen] = useState(true)
   const [rightOpen, setRightOpen] = useState(true)
   const [rightTab, setRightTab] = useState('translation')
-  const [viewMode, setViewMode] = useState('bilingual')
+  const [viewMode, setViewMode] = useState(settings.viewMode)
   const [activeParagraph, setActiveParagraph] = useState(null)
   const [selection, setSelection] = useState('')
   const [selectionResult, setSelectionResult] = useState(null)
@@ -941,14 +1590,25 @@ export function PdfReaderPage({ t }) {
   const paragraphs = pageModel?.paragraphs ?? []
   const blocks = pageModel?.blocks ?? []
   const equations = useMemo(() => blocks.filter((block) => block.type === 'equation'), [blocks])
+  const figures = useMemo(() => blocks.filter((block) => block.type === 'figure'), [blocks])
+  const reading = useMemo(
+    () => (pageModel === null ? { blocks: [], units: [] } : composeReading(pageModel)),
+    [pageModel],
+  )
+  const readingBlocks = reading.blocks
+  const readingUnits = reading.units
+  const unitById = useMemo(
+    () => new Map(readingUnits.map((unit) => [unit.id, unit])),
+    [readingUnits],
+  )
   const pageTranslation = translations[pageIndex] ?? {}
   const pageStatus = pageTranslationState[pageIndex]?.status ?? 'idle'
   const pageError = pageTranslationState[pageIndex]?.error ?? ''
   const pageBusy = Boolean(busyPages[pageIndex]) || Boolean(progress?.running)
-  const hasPageTranslation = paragraphs.some((paragraph) => Boolean(pageTranslation[paragraph.id]?.text))
+  const hasPageTranslation = readingUnits.some((unit) => Boolean(pageTranslation[unit.id]?.text))
   const waitingForTranslation =
     viewMode !== 'source' &&
-    paragraphs.length > 0 &&
+    readingUnits.length > 0 &&
     !hasPageTranslation &&
     pageStatus !== 'loading' &&
     pageStatus !== 'error'
@@ -959,8 +1619,13 @@ export function PdfReaderPage({ t }) {
     () => pageOverridesFor(equationOverrides, docFingerprint, pageIndex),
     [docFingerprint, equationOverrides, pageIndex],
   )
-  const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0
-  const activeEquationBlock = equations.find((equation) => equation.id === activeEquation)
+  const hasPageOverrides =
+    pageOverrides.added.length > 0 ||
+    pageOverrides.removed.length > 0 ||
+    pageOverrides.figures.length > 0
+  // Equations and figures share the highlight/active state; only their bbox
+  // and card differ.
+  const activeOverlayBlock = blocks.find((block) => block.id === activeEquation)
   const docNotes = useMemo(
     () => notes.filter((note) => note.doc === docFingerprint),
     [docFingerprint, notes],
@@ -1050,6 +1715,37 @@ export function PdfReaderPage({ t }) {
   }, [docFingerprint])
 
   useEffect(() => {
+    if (doc === null) {
+      setReferences({ status: 'idle', heading: '', pageIndex: null, entries: [] })
+      return undefined
+    }
+    const controller = new AbortController()
+    setReferences({ status: 'loading', heading: '', pageIndex: null, entries: [] })
+    extractReferences(doc.pdf, doc.outline, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return
+        setReferences({
+          status: 'ready',
+          heading: result?.heading ?? '',
+          pageIndex: result?.pageIndex ?? null,
+          entries: Array.isArray(result?.entries) ? result.entries : [],
+        })
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return
+        console.warn('pdf-math-reader: reference extraction failed', error)
+        setReferences({ status: 'error', heading: '', pageIndex: null, entries: [] })
+      })
+    return () => controller.abort()
+  }, [doc])
+
+  useEffect(() => {
+    if (railTab === 'references' && references.entries.length === 0) {
+      setRailTab('outline')
+    }
+  }, [railTab, references.entries.length])
+
+  useEffect(() => {
     const controller = new AbortController()
     fetchHealth(controller.signal)
       .then((payload) => {
@@ -1058,6 +1754,7 @@ export function PdfReaderPage({ t }) {
           status: payload.llm === true ? 'ready' : 'unavailable',
           provider: payload.provider,
           model: payload.model,
+          reasoningEffort: payload.reasoningEffort,
           providers: payload.providers,
           defaultNotesDir: payload.defaultNotesDir,
         })
@@ -1065,6 +1762,31 @@ export function PdfReaderPage({ t }) {
       .catch((error) => {
         if (controller.signal.aborted) return
         setHealth({ status: 'error', message: error?.message ?? String(error) })
+      })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetchModels(controller.signal)
+      .then((payload) => {
+        if (controller.signal.aborted) return
+        setCatalog({
+          status: 'ready',
+          providers: Array.isArray(payload.providers) ? payload.providers : [],
+          models: Array.isArray(payload.models) ? payload.models : [],
+          warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
+        })
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return
+        setCatalog({
+          status: 'error',
+          providers: [],
+          models: [],
+          warnings: [],
+          error: error?.message ?? String(error),
+        })
       })
     return () => controller.abort()
   }, [])
@@ -1135,10 +1857,22 @@ export function PdfReaderPage({ t }) {
         setRenderState('ready')
 
         let textContent
+        let figures = doc.figureCache?.get(pageIndex)
+        if (figures === undefined) {
+          try {
+            figures = await collectFigureRegions(page, library, viewport)
+            if (cancelled) return
+            doc.figureCache?.set(pageIndex, figures)
+          } catch (error) {
+            console.warn('pdf-math-reader: figure detection failed', error)
+            figures = []
+          }
+        }
         let model = {
           blocks: [],
           paragraphs: [],
           equations: [],
+          figures: [],
           lines: [],
           viewport,
           pageWidth: viewport.width,
@@ -1149,6 +1883,7 @@ export function PdfReaderPage({ t }) {
           if (cancelled) return
           model = buildPageModel(library, textContent, viewport, {
             pageIndex,
+            figures,
             overrides: pageOverridesFor(
               equationOverridesRef.current,
               doc.fingerprint,
@@ -1309,6 +2044,7 @@ export function PdfReaderPage({ t }) {
           numPages: pdf.numPages,
           outline,
           pageCache: new Map(),
+          figureCache: new Map(),
         }
         docRef.current = meta
         setDoc(meta)
@@ -1540,6 +2276,18 @@ export function PdfReaderPage({ t }) {
     [equations],
   )
 
+  const figureAtPoint = useCallback(
+    (x, y) =>
+      figures.find(
+        (figure) =>
+          x >= figure.bbox[0] - 2 &&
+          x <= figure.bbox[2] + 2 &&
+          y >= figure.bbox[1] - 2 &&
+          y <= figure.bbox[3] + 2,
+      ),
+    [figures],
+  )
+
   const commitPageOverrides = useCallback(
     (mutator) => {
       const meta = docRef.current
@@ -1562,13 +2310,18 @@ export function PdfReaderPage({ t }) {
       })
       setEquationOverrides((previous) => {
         const pages = { ...(previous[fingerprint] ?? {}) }
-        const current = pages[pageIndex] ?? { added: [], removed: [] }
+        const current = pages[pageIndex] ?? { added: [], removed: [], figures: [] }
         const updated = mutator({
           added: [...(current.added ?? [])],
           removed: [...(current.removed ?? [])],
+          figures: [...(current.figures ?? [])],
         })
         const nextPages = { ...pages }
-        if (updated.added.length === 0 && updated.removed.length === 0) {
+        if (
+          updated.added.length === 0 &&
+          updated.removed.length === 0 &&
+          (updated.figures?.length ?? 0) === 0
+        ) {
           delete nextPages[pageIndex]
         } else {
           nextPages[pageIndex] = updated
@@ -1660,8 +2413,22 @@ export function PdfReaderPage({ t }) {
     [commitPageOverrides, notify, tt],
   )
 
+  const removeFigure = useCallback(
+    (figure) => {
+      commitPageOverrides((previous) => ({
+        ...previous,
+        figures: [
+          ...previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3),
+          figure.bbox,
+        ],
+      }))
+      notify(tt('figure.removed'))
+    },
+    [commitPageOverrides, notify, tt],
+  )
+
   const resetPageEquations = useCallback(() => {
-    commitPageOverrides(() => ({ added: [], removed: [] }))
+    commitPageOverrides(() => ({ added: [], removed: [], figures: [] }))
     notify(tt('equation.reset'))
   }, [commitPageOverrides, notify, tt])
 
@@ -1772,6 +2539,12 @@ export function PdfReaderPage({ t }) {
         setActiveEquation((previous) => (previous === equation.id ? null : equation.id))
         return
       }
+      const figure = figureAtPoint(x, y)
+      if (figure !== undefined) {
+        setActiveParagraph(null)
+        setActiveEquation((previous) => (previous === figure.id ? null : figure.id))
+        return
+      }
       const line = lineAtPoint(event.clientX - rect.left, event.clientY - rect.top)
       if (line === undefined) {
         setActiveParagraph(null)
@@ -1786,7 +2559,7 @@ export function PdfReaderPage({ t }) {
         setActiveParagraph(line.paragraphId)
       }
     },
-    [activeParagraph, clearTextSelection, currentScale, equationAtPoint, lineAtPoint],
+    [activeParagraph, clearTextSelection, currentScale, equationAtPoint, figureAtPoint, lineAtPoint],
   )
 
   const saveNote = useCallback(() => {
@@ -2025,6 +2798,7 @@ export function PdfReaderPage({ t }) {
       const force = options.force === true
       const epoch = translationEpochRef.current
       const targetLanguage = settings.targetLanguage
+      const selectionKey = translationSelectionKey ?? 'default'
       const usable = targetParagraphs.filter((paragraph) => paragraph.text.trim() !== '')
       if (epoch !== translationEpochRef.current) return false
       if (usable.length === 0) {
@@ -2055,7 +2829,7 @@ export function PdfReaderPage({ t }) {
           }
           const pending = []
           for (const entry of batch) {
-            const key = `${targetLanguage}\u0000${glossaryKeyValue}\u0000${entry.text}`
+            const key = `${targetLanguage}\u0000${selectionKey}\u0000${glossaryKeyValue}\u0000${entry.text}`
             if (!force) {
               const cached = translationCacheRef.current.get(key)
               if (cached !== undefined) {
@@ -2077,6 +2851,7 @@ export function PdfReaderPage({ t }) {
               sourceLanguage: 'auto',
               glossary,
               segments: pending.map(({ entry }) => ({ id: entry.id, text: entry.text })),
+              modelSelection: settings.translationSelection,
               refresh: force,
             },
             signal,
@@ -2148,17 +2923,18 @@ export function PdfReaderPage({ t }) {
       setTranslationError,
       setTranslationFor,
       settings.targetLanguage,
+      translationSelectionKey,
       tt,
     ],
   )
 
   const translateCurrentPage = useCallback(() => {
-    if (!pageModel || paragraphs.length === 0 || pageBusy) return
+    if (!pageModel || readingUnits.length === 0 || pageBusy) return
     translationAbortRef.current?.abort()
     const controller = new AbortController()
     translationAbortRef.current = controller
     setProgress(null)
-    translatePageInternal(pageIndex, paragraphs, {
+    translatePageInternal(pageIndex, readingUnits, {
       force: hasPageTranslation,
       signal: controller.signal,
     })
@@ -2176,19 +2952,19 @@ export function PdfReaderPage({ t }) {
     pageBusy,
     pageIndex,
     pageModel,
-    paragraphs,
+    readingUnits,
     translatePageInternal,
     tt,
   ])
 
-  const retryParagraph = useCallback(
-    (paragraph) => {
-      if (!pageModel || pageBusy) return
+  const retryUnit = useCallback(
+    (unit) => {
+      if (!pageModel || pageBusy || unit === undefined) return
       translationAbortRef.current?.abort()
       const controller = new AbortController()
       translationAbortRef.current = controller
-      clearTranslationError(pageIndex, paragraph.id)
-      translatePageInternal(pageIndex, [paragraph], {
+      clearTranslationError(pageIndex, unit.id)
+      translatePageInternal(pageIndex, [unit], {
         force: true,
         signal: controller.signal,
       })
@@ -2226,6 +3002,7 @@ export function PdfReaderPage({ t }) {
         pageIndex: targetPage,
       },
       {
+        figures: meta.figureCache?.get(targetPage),
         overrides: pageOverridesFor(
           equationOverridesRef.current,
           meta.fingerprint,
@@ -2234,6 +3011,10 @@ export function PdfReaderPage({ t }) {
       },
     )
     if (docRef.current !== meta) return { blocks: [], paragraphs: [] }
+    meta.figureCache?.set(
+      targetPage,
+      model.figureRegionsRaw ?? model.figureRegions ?? [],
+    )
     meta.pageCache?.set(targetPage, model)
     return model
   }, [])
@@ -2257,8 +3038,9 @@ export function PdfReaderPage({ t }) {
         setProgress({ running: true, done: index, total: meta.numPages })
         const model = await getPageModel(index)
         if (controller.signal.aborted || epoch !== translationEpochRef.current) break
-        if (model.paragraphs.length > 0) {
-          await translatePageInternal(index, model.paragraphs, { signal: controller.signal })
+        const composed = composeReading(model)
+        if (composed.units.length > 0) {
+          await translatePageInternal(index, composed.units, { signal: controller.signal })
         }
         if (epoch !== translationEpochRef.current) break
         setProgress({ running: true, done: index + 1, total: meta.numPages })
@@ -2290,6 +3072,7 @@ export function PdfReaderPage({ t }) {
           sourceLanguage: 'auto',
           glossary,
           segments: [{ id: 'selection', text: source }],
+          modelSelection: settings.translationSelection,
           refresh: false,
         },
         controller.signal,
@@ -2314,7 +3097,7 @@ export function PdfReaderPage({ t }) {
     } finally {
       if (selectionAbortRef.current === controller) selectionAbortRef.current = null
     }
-  }, [glossary, selection, settings.targetLanguage, tt])
+  }, [glossary, selection, settings.targetLanguage, settings.translationSelection, tt])
 
   const copyText = useCallback(
     async (text) => {
@@ -2326,6 +3109,47 @@ export function PdfReaderPage({ t }) {
       }
     },
     [notify, tt],
+  )
+
+  const copyPage = useCallback(
+    (translatedOnly) => {
+      const parts = []
+      for (const block of readingBlocks) {
+        if (block.type === 'authors') {
+          const people = block.authors.map((author) => {
+            const translatedAffiliation =
+              translatedOnly && author.affiliationId
+                ? pageTranslation[author.affiliationId]?.text
+                : undefined
+            return [
+              `${author.name}${author.marks ? ` ${author.marks}` : ''}`,
+              translatedAffiliation || author.affiliation,
+              author.email,
+            ]
+              .filter(Boolean)
+              .join(' · ')
+          })
+          if (people.length > 0) parts.push(people.join('\n'))
+          continue
+        }
+        if (block.type === 'equation') {
+          if (!translatedOnly && block.text) parts.push(block.text)
+          continue
+        }
+        if (block.type === 'figure') continue
+        const translated = block.translationId
+          ? pageTranslation[block.translationId]?.text
+          : undefined
+        const value = translatedOnly ? translated : block.text ?? block.paragraph?.text
+        if (value) parts.push(value)
+      }
+      if (parts.length === 0) {
+        notify(tt(translatedOnly ? 'toast.noTranslation' : 'toast.noText'), 'error')
+        return
+      }
+      copyText(parts.join('\n\n'))
+    },
+    [copyText, notify, pageTranslation, readingBlocks, tt],
   )
 
   const clearCache = useCallback(() => {
@@ -2353,6 +3177,7 @@ export function PdfReaderPage({ t }) {
             pageIndex: index,
           },
           {
+            figures: meta.figureCache?.get(index),
             overrides: pageOverridesFor(
               equationOverridesRef.current,
               meta.fingerprint,
@@ -2361,10 +3186,14 @@ export function PdfReaderPage({ t }) {
           },
         )
         if (docRef.current !== meta) return []
+        meta.figureCache?.set(
+          index,
+          model.figureRegionsRaw ?? model.figureRegions ?? [],
+        )
         cache.set(index, model)
       }
       if ((model.blocks?.length ?? 0) > 0) {
-        pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs })
+        pages.push({ index, model, blocks: model.blocks, paragraphs: model.paragraphs })
       }
     }
     return pages
@@ -2448,6 +3277,7 @@ export function PdfReaderPage({ t }) {
             context: context.text,
             contextLabel: context.label,
             skill: skill === null ? undefined : { name: skill.name, content: skill.content },
+            modelSelection: settings.chatSelection,
           },
           controller.signal,
         )
@@ -2466,7 +3296,16 @@ export function PdfReaderPage({ t }) {
         setChatStatus('')
       }
     },
-    [buildChatContext, chatBusy, chatInput, chatMessages, chatScope, skill, tt],
+    [
+      buildChatContext,
+      chatBusy,
+      chatInput,
+      chatMessages,
+      chatScope,
+      settings.chatSelection,
+      skill,
+      tt,
+    ],
   )
 
   const stopChat = useCallback(() => {
@@ -2550,20 +3389,22 @@ export function PdfReaderPage({ t }) {
     chatEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
   }, [chatBusy, chatMessages, rightTab])
 
-  const renderExportEquations = useCallback(async (meta, pages) => {
+  const renderExportImages = useCallback(async (meta, pages) => {
     const images = new Map()
     for (const page of pages) {
-      const pageEquations = (page.blocks ?? []).filter((block) => block.type === 'equation')
-      if (pageEquations.length === 0) continue
+      const pageBlocks = (page.blocks ?? []).filter(
+        (block) => block.type === 'equation' || block.type === 'figure',
+      )
+      if (pageBlocks.length === 0) continue
       let pdfPage
       try {
         pdfPage = await meta.pdf.getPage(page.index + 1)
       } catch {
         continue
       }
-      for (const equation of pageEquations) {
+      for (const block of pageBlocks) {
         try {
-          const cropBox = equation.imageBbox ?? equation.bbox
+          const cropBox = block.imageBbox ?? block.bbox
           const result = await renderEquationCrop(pdfPage, cropBox, {
             displayWidth: Math.min(
               1400,
@@ -2573,7 +3414,7 @@ export function PdfReaderPage({ t }) {
             maxPixels: 8000000,
             maxScale: 6,
           })
-          images.set(`${page.index}:${equation.id}`, result)
+          images.set(`${page.index}:${block.id}`, result)
         } catch {
           // The text fallback keeps the export complete when a crop fails.
         }
@@ -2599,7 +3440,33 @@ export function PdfReaderPage({ t }) {
     ]
     for (const page of pages) {
       lines.push(`## ${tt('page.short', { page: page.index + 1 })}`, '')
-      for (const block of page.blocks ?? []) {
+      const reading = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] }
+      for (const block of reading.blocks) {
+        if (block.type === 'title') {
+          lines.push(`### ${block.text}`, '')
+          const translated = translations[page.index]?.[block.translationId]?.text
+          if (translated) lines.push(translated, '')
+          continue
+        }
+        if (block.type === 'authors') {
+          lines.push(`**${tt('reading.authors')}**`, '')
+          lines.push(
+            block.authors
+              .map((author) => exportAuthorLine(author, translations[page.index]))
+              .join('  \n'),
+            '',
+          )
+          continue
+        }
+        if (block.type === 'abstract' || block.type === 'keywords') {
+          const label =
+            block.type === 'abstract' ? tt('reading.abstract') : tt('reading.keywords')
+          if (block.showLabel !== false) lines.push(`**${label}**`, '')
+          lines.push(`> ${block.text}`, '')
+          const translated = translations[page.index]?.[block.translationId]?.text
+          if (translated) lines.push(translated, '')
+          continue
+        }
         if (block.type === 'equation') {
           if (block.equationNumber) {
             lines.push(`**${tt('equation.label')} ${block.equationNumber}**`, '')
@@ -2607,9 +3474,22 @@ export function PdfReaderPage({ t }) {
           lines.push('```', block.text, '```', '')
           continue
         }
+        if (block.type === 'figure') {
+          const label = block.figureNumber
+            ? `${tt('figure.label')} ${block.figureNumber}`
+            : tt('figure.unnumbered')
+          lines.push(`**${label}**`, '')
+          const labels = (block.labels ?? [])
+            .map((line) => line.text)
+            .filter((text) => text !== '')
+          if (labels.length > 0) {
+            lines.push(`${tt('figure.labelsInline')}`, '', ...labels.map((text) => `- ${text}`), '')
+          }
+          continue
+        }
         const paragraph = block.paragraph
         if (paragraph === undefined) continue
-        const translated = translations[page.index]?.[paragraph.id]?.text
+        const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text
         lines.push(`> ${paragraph.text.replace(/\s+/g, ' ')}`, '')
         if (translated) lines.push(translated, '')
       }
@@ -2629,7 +3509,7 @@ export function PdfReaderPage({ t }) {
       notify(tt('error.exportEmpty'), 'error')
       return
     }
-    const images = await renderExportEquations(meta, pages)
+    const images = await renderExportImages(meta, pages)
     const lines = [
       `# ${meta.name}`,
       '',
@@ -2639,7 +3519,33 @@ export function PdfReaderPage({ t }) {
     const files = []
     for (const page of pages) {
       lines.push(`## ${tt('page.short', { page: page.index + 1 })}`, '')
-      for (const block of page.blocks ?? []) {
+      const reading = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] }
+      for (const block of reading.blocks) {
+        if (block.type === 'title') {
+          lines.push(`### ${block.text}`, '')
+          const translated = translations[page.index]?.[block.translationId]?.text
+          if (translated) lines.push(translated, '')
+          continue
+        }
+        if (block.type === 'authors') {
+          lines.push(`**${tt('reading.authors')}**`, '')
+          lines.push(
+            block.authors
+              .map((author) => exportAuthorLine(author, translations[page.index]))
+              .join('  \n'),
+            '',
+          )
+          continue
+        }
+        if (block.type === 'abstract' || block.type === 'keywords') {
+          const label =
+            block.type === 'abstract' ? tt('reading.abstract') : tt('reading.keywords')
+          if (block.showLabel !== false) lines.push(`**${label}**`, '')
+          lines.push(`> ${block.text}`, '')
+          const translated = translations[page.index]?.[block.translationId]?.text
+          if (translated) lines.push(translated, '')
+          continue
+        }
         if (block.type === 'equation') {
           const image = images.get(`${page.index}:${block.id}`)
           const label = block.equationNumber
@@ -2654,9 +3560,27 @@ export function PdfReaderPage({ t }) {
           }
           continue
         }
+        if (block.type === 'figure') {
+          const image = images.get(`${page.index}:${block.id}`)
+          const label = block.figureNumber
+            ? `${tt('figure.label')} ${block.figureNumber}`
+            : tt('figure.unnumbered')
+          if (image !== undefined) {
+            const name = `figures/${block.id}.png`
+            files.push({ name, data: dataUrlToBytes(image.dataUrl) })
+            lines.push(`![${label}](${name})`, '')
+          }
+          const labels = (block.labels ?? [])
+            .map((line) => line.text)
+            .filter((text) => text !== '')
+          if (labels.length > 0) {
+            lines.push(`${tt('figure.labelsInline')}`, '', ...labels.map((text) => `- ${text}`), '')
+          }
+          continue
+        }
         const paragraph = block.paragraph
         if (paragraph === undefined) continue
-        const translated = translations[page.index]?.[paragraph.id]?.text
+        const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text
         lines.push(`> ${paragraph.text.replace(/\s+/g, ' ')}`, '')
         if (translated) lines.push(translated, '')
       }
@@ -2667,7 +3591,7 @@ export function PdfReaderPage({ t }) {
     const filename = `${baseName(meta.name)}-bilingual.zip`
     downloadBlob(new Blob([zip], { type: 'application/zip' }), filename, 'application/zip')
     notify(tt('toast.exported', { name: filename }))
-  }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt])
+  }, [collectPages, notify, renderExportImages, settings.targetLanguage, translations, tt])
 
   const exportHtml = useCallback(async () => {
     const meta = docRef.current
@@ -2679,25 +3603,96 @@ export function PdfReaderPage({ t }) {
       notify(tt('error.exportEmpty'), 'error')
       return
     }
-    const images = await renderExportEquations(meta, pages)
+    const images = await renderExportImages(meta, pages)
     const body = pages
       .map((page) => {
-        const content = (page.blocks ?? [])
+        const reading = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] }
+        const content = reading.blocks
           .map((block) => {
+            if (block.type === 'title') {
+              const translated = translations[page.index]?.[block.translationId]?.text
+              return `<div class="paper-title"><div class="src">${escapeHtml(block.text)}</div>${
+                translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ''
+              }</div>`
+            }
+            if (block.type === 'authors') {
+              const people = block.authors
+                .map((author) => {
+                  const translated = author.affiliationId
+                    ? translations[page.index]?.[author.affiliationId]?.text
+                    : undefined
+                  const showTranslation =
+                    typeof translated === 'string' &&
+                    translated.trim() !== '' &&
+                    translated !== author.affiliation
+                  return [
+                    `${escapeHtml(author.name)}${
+                      author.marks !== ''
+                        ? `<sup>${escapeHtml(author.marks)}</sup>`
+                        : ''
+                    }`,
+                    escapeHtml(author.affiliation),
+                    showTranslation
+                      ? `<span class="aff-tr">${escapeHtml(translated)}</span>`
+                      : '',
+                    escapeHtml(author.email),
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
+                })
+                .join(' · ')
+              return `<div class="authors"><strong>${escapeHtml(
+                tt('reading.authors'),
+              )}</strong><div>${people}</div></div>`
+            }
+            if (block.type === 'abstract' || block.type === 'keywords') {
+              const label =
+                block.type === 'abstract'
+                  ? tt('reading.abstract')
+                  : tt('reading.keywords')
+              const translated = translations[page.index]?.[block.translationId]?.text
+              return `<div class="card">${
+                block.showLabel !== false ? `<strong>${escapeHtml(label)}</strong>` : ''
+              }<div class="src">${escapeHtml(block.text)}</div>${
+                translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ''
+              }</div>`
+            }
             if (block.type === 'equation') {
               const image = images.get(`${page.index}:${block.id}`)
               const label = block.equationNumber
                 ? `${tt('equation.label')} ${block.equationNumber}`
                 : tt('equation.unnumbered')
-              const figure =
+              const preview =
                 image !== undefined
                   ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">`
                   : `<pre>${escapeHtml(block.text)}</pre>`
-              return `<figure class="equation">${figure}<figcaption>${escapeHtml(label)}</figcaption></figure>`
+              return `<figure class="equation">${preview}<figcaption>${escapeHtml(label)}</figcaption></figure>`
+            }
+            if (block.type === 'figure') {
+              const image = images.get(`${page.index}:${block.id}`)
+              const label = block.figureNumber
+                ? `${tt('figure.label')} ${block.figureNumber}`
+                : tt('figure.unnumbered')
+              const preview =
+                image !== undefined
+                  ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">`
+                  : ''
+              const labels = (block.labels ?? [])
+                .map((line) => `<li>${escapeHtml(line.text)}</li>`)
+                .join('')
+              return `<figure class="figure">${preview}<figcaption>${escapeHtml(
+                label,
+              )}</figcaption>${
+                labels !== ''
+                  ? `<details><summary>${escapeHtml(
+                      tt('figure.labels', { count: (block.labels ?? []).length }),
+                    )}</summary><ul>${labels}</ul></details>`
+                  : ''
+              }</figure>`
             }
             const paragraph = block.paragraph
             if (paragraph === undefined) return ''
-            const translated = translations[page.index]?.[paragraph.id]?.text
+            const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text
             return `<div class="card"><div class="src">${escapeHtml(paragraph.text)}</div>${
               translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ''
             }</div>`
@@ -2720,14 +3715,26 @@ h1 { font-size: 26px; line-height: 1.25; margin-bottom: 6px; }
 section { margin-top: 34px; }
 h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }
 .card { padding: 14px 0 16px; border-bottom: 1px dashed #e5e7eb; }
+.paper-title { margin: 10px 0 14px; padding-bottom: 12px; border-bottom: 1px solid #e5e7eb; }
+.paper-title .src { font-size: 25px; font-weight: 700; line-height: 1.3; color: #111827; }
+.paper-title .tr { margin-top: 8px; font-size: 23px; font-weight: 650; line-height: 1.38; }
+.authors { padding: 4px 0 18px; font-size: 13px; color: #374151; line-height: 1.6; }
+.authors .aff-tr { color: #6b7280; }
+.authors strong { display: block; margin-bottom: 4px; color: #6b7280; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
 .src { color: #4b5563; font-size: 13.5px; }
 .tr { margin-top: 7px; font-size: 15px; }
 figure.equation { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: center; background: #fff; }
 figure.equation img { max-width: 100%; height: auto; }
 figure.equation pre { margin: 0; white-space: pre-wrap; text-align: left; font-size: 12px; }
 figure.equation figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
-@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation { break-inside: avoid; } }
-@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation { border-color: #374151; } figure.equation { background: #fff; } .meta { color: #9ca3af; } }
+figure.figure { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
+figure.figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+figure.figure figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
+figure.figure details { margin-top: 8px; }
+figure.figure summary { cursor: pointer; color: #6b7280; font-size: 12px; }
+figure.figure ul { margin: 6px 0 0; padding-left: 18px; color: #4b5563; font-size: 12px; }
+@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation, figure.figure { break-inside: avoid; } }
+@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation, figure.figure { border-color: #374151; } figure.equation, figure.figure { background: #fff; } .meta { color: #9ca3af; } }
 </style>
 </head>
 <body>
@@ -2739,7 +3746,7 @@ ${body}
     const filename = `${baseName(meta.name)}-reading.html`
     downloadBlob(html, filename, 'text/html;charset=utf-8')
     notify(tt('toast.exported', { name: filename }))
-  }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt])
+  }, [collectPages, notify, renderExportImages, settings.targetLanguage, translations, tt])
 
   const onDragEnter = useCallback((event) => {
     event.preventDefault()
@@ -2784,9 +3791,27 @@ ${body}
         setSelectionResult(null)
         setSelection('')
       }
+      if (
+        patch.translationSelection !== undefined &&
+        JSON.stringify(patch.translationSelection) !==
+          JSON.stringify(settings.translationSelection)
+      ) {
+        // A model switch changes the meaning of "current translation": stop the
+        // in-flight request but keep completed text until the user retranslates.
+        translationEpochRef.current += 1
+        translationAbortRef.current?.abort()
+        translationAbortRef.current = null
+        // The selection request belongs to the same epoch: abort it. The
+        // loading card is cleared by the selection-key effect once the new
+        // model is committed, so completed results stay visible.
+        selectionAbortRef.current?.abort()
+        selectionAbortRef.current = null
+        setBusyPages({})
+        setProgress(null)
+      }
       setSettings((previous) => ({ ...previous, ...patch }))
     },
-    [settings.targetLanguage],
+    [settings.targetLanguage, settings.translationSelection],
   )
 
   const startResize = useCallback(
@@ -2821,15 +3846,40 @@ ${body}
     [settings.railWidth, settings.translationWidth, updateSettings],
   )
 
+  const changeViewMode = useCallback(
+    (mode) => {
+      setViewMode(mode)
+      updateSettings({ viewMode: mode })
+    },
+    [updateSettings],
+  )
+
+  const changeFontSize = useCallback(
+    (delta) => {
+      updateSettings({
+        readingFontSize: clamp(settings.readingFontSize + delta, 13, 22),
+      })
+    },
+    [settings.readingFontSize, updateSettings],
+  )
+
   const modeButtons = [
-    ['bilingual', tt('view.bilingual')],
-    ['translation', tt('view.translation')],
-    ['source', tt('view.source')],
+    ['bilingual', tt('view.bilingual'), 'columns'],
+    ['translation', tt('view.translation'), 'languages'],
+    ['source', tt('view.source'), 'file'],
   ]
 
   const pageProgress = progress?.running
     ? Math.round((progress.done / Math.max(1, progress.total)) * 100)
     : 0
+
+  // Switching the translation model cancels in-flight selection work. Drop a
+  // stalled "translation in progress" card on the next paint so Retry is
+  // usable at once, while completed results stay visible.
+  useEffect(() => {
+    if (translationSelectionKey === null) return
+    setSelectionResult((previous) => (previous?.status === 'loading' ? null : previous))
+  }, [translationSelectionKey])
 
   return (
     <section
@@ -3085,6 +4135,18 @@ ${body}
                 >
                   {tt('rail.pages')}
                 </button>
+                {references.entries.length > 0 && (
+                  <button
+                    type="button"
+                    className={`pmr-tabbtn ${railTab === 'references' ? 'is-active' : ''}`}
+                    onClick={() => setRailTab('references')}
+                    title={tt('rail.referenceCount', { count: references.entries.length })}
+                  >
+                    {settings.railWidth >= 200
+                      ? tt('rail.references')
+                      : tt('rail.referencesShort')}
+                  </button>
+                )}
                 <button
                   type="button"
                   className="pmr-iconbtn"
@@ -3119,7 +4181,7 @@ ${body}
                   ) : (
                     <div className="pmr-empty-note">{tt('rail.noOutline')}</div>
                   )
-                ) : (
+                ) : railTab === 'pages' ? (
                   <div className="pmr-thumbs">
                     {Array.from({ length: pageCount }, (_, index) => (
                       <PageThumbnail
@@ -3135,6 +4197,38 @@ ${body}
                         cacheKey={`${doc.fingerprint}:${index + 1}`}
                         onClick={() => goToPage(index)}
                       />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="pmr-reference-list">
+                    <div className="pmr-reference-head">
+                      <span>{tt('rail.referenceCount', { count: references.entries.length })}</span>
+                      <button
+                        type="button"
+                        className="pmr-reference-copyall"
+                        title={tt('action.copyReferences')}
+                        aria-label={tt('action.copyReferences')}
+                        onClick={() =>
+                          copyText(references.entries.map((entry) => entry.text).join('\n'))
+                        }
+                      >
+                        <Icon name="copy" size={12} />
+                      </button>
+                    </div>
+                    {references.entries.map((entry, index) => (
+                      <div className="pmr-reference-row" key={entry.id} title={entry.text}>
+                        <span className="pmr-reference-num">
+                          {entry.label === '' ? index + 1 : entry.label}
+                        </span>
+                        <span className="pmr-reference-text">{entry.text}</span>
+                        <CopyButton
+                          tt={tt}
+                          text={entry.text}
+                          label={tt('action.copy')}
+                          onCopy={copyText}
+                          className="pmr-reference-copy"
+                        />
+                      </div>
                     ))}
                   </div>
                 )}
@@ -3189,17 +4283,17 @@ ${body}
                         }}
                       />
                     ))}
-                    {activeEquationBlock !== undefined && (
+                    {activeOverlayBlock !== undefined && (
                       <div
                         className="pmr-hl pmr-eq-hl"
                         style={{
-                          left: activeEquationBlock.bbox[0] * currentScale,
-                          top: activeEquationBlock.bbox[1] * currentScale,
+                          left: activeOverlayBlock.bbox[0] * currentScale,
+                          top: activeOverlayBlock.bbox[1] * currentScale,
                           width:
-                            (activeEquationBlock.bbox[2] - activeEquationBlock.bbox[0]) *
+                            (activeOverlayBlock.bbox[2] - activeOverlayBlock.bbox[0]) *
                             currentScale,
                           height:
-                            (activeEquationBlock.bbox[3] - activeEquationBlock.bbox[1]) *
+                            (activeOverlayBlock.bbox[3] - activeOverlayBlock.bbox[1]) *
                             currentScale,
                         }}
                       />
@@ -3317,7 +4411,11 @@ ${body}
               <aside
                 className="pmr-translation"
                 aria-label={tt('panel.translation')}
-                style={{ flexBasis: settings.translationWidth, width: settings.translationWidth }}
+                style={{
+                  flexBasis: settings.translationWidth,
+                  width: settings.translationWidth,
+                  '--pmr-reading-size': `${settings.readingFontSize}px`,
+                }}
               >
               <div className="pmr-tr-head">
                 <div className="pmr-tr-tabs">
@@ -3362,26 +4460,92 @@ ${body}
                     <div className="pmr-tr-headrow" style={{ marginTop: 7 }}>
                       <span className="pmr-tr-pageno">{tt('panel.page', { page: pageIndex + 1 })}</span>
                       <div className="pmr-tr-actions">
-                        <div className="pmr-seg">
-                          {modeButtons.map(([mode, label]) => (
-                            <button
-                              key={mode}
-                              type="button"
-                              className={viewMode === mode ? 'is-active' : ''}
-                              onClick={() => setViewMode(mode)}
-                            >
-                              {label}
-                            </button>
-                          ))}
+                        <button
+                          type="button"
+                          className="pmr-iconbtn"
+                          style={{ width: 24, height: 24 }}
+                          onClick={() => copyPage(false)}
+                          title={tt('action.copyPageSource')}
+                          aria-label={tt('action.copyPageSource')}
+                        >
+                          <Icon name="copy" size={12} />
+                        </button>
+                        <button
+                          type="button"
+                          className="pmr-iconbtn"
+                          style={{ width: 24, height: 24 }}
+                          onClick={() => copyPage(true)}
+                          title={tt('action.copyPageTranslation')}
+                          aria-label={tt('action.copyPageTranslation')}
+                        >
+                          <Icon name="languages" size={12} />
+                        </button>
+                        <div
+                          className="pmr-fontctl"
+                          role="group"
+                          aria-label={tt('view.fontSize')}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => changeFontSize(-1)}
+                            disabled={settings.readingFontSize <= 13}
+                            title={tt('view.fontSmaller')}
+                            aria-label={tt('view.fontSmaller')}
+                          >
+                            A−
+                          </button>
+                          <span className="pmr-fontctl-value">{settings.readingFontSize}</span>
+                          <button
+                            type="button"
+                            onClick={() => changeFontSize(1)}
+                            disabled={settings.readingFontSize >= 22}
+                            title={tt('view.fontLarger')}
+                            aria-label={tt('view.fontLarger')}
+                          >
+                            A+
+                          </button>
                         </div>
                       </div>
                     </div>
+                    <div className="pmr-viewswitch" role="group" aria-label={tt('view.mode')}>
+                      {modeButtons.map(([mode, label, icon]) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          className={viewMode === mode ? 'is-active' : ''}
+                          aria-pressed={viewMode === mode}
+                          onClick={() => changeViewMode(mode)}
+                        >
+                          <Icon name={icon} size={13} />
+                          <span>{label}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <ModelControls
+                      tt={tt}
+                      catalog={catalog}
+                      value={settings.translationSelection}
+                      disabled={pageBusy}
+                      fallback={health}
+                      onChange={(selection) =>
+                        updateSettings({ translationSelection: selection })
+                      }
+                    />
                     <div className="pmr-tr-hint">
                       <Icon name="sparkle" size={11} />
                       <span>{tt('panel.formulas')}</span>
-                      {equations.length > 0 && (
-                        <span className="pmr-eq-count-badge">
-                          {tt('panel.equationCount', { count: equations.length })}
+                      {(equations.length > 0 || figures.length > 0) && (
+                        <span className="pmr-count-badges">
+                          {equations.length > 0 && (
+                            <span className="pmr-eq-count-badge">
+                              {tt('panel.equationCount', { count: equations.length })}
+                            </span>
+                          )}
+                          {figures.length > 0 && (
+                            <span className="pmr-eq-count-badge">
+                              {tt('panel.figureCount', { count: figures.length })}
+                            </span>
+                          )}
                         </span>
                       )}
                     </div>
@@ -3397,7 +4561,7 @@ ${body}
 
               {rightTab === 'translation' && (
                 <>
-              <div className="pmr-tr-scroll">
+              <div className="pmr-tr-scroll" data-mode={viewMode}>
                 {progress?.running && (
                   <div className="pmr-tr-hint" style={{ marginTop: 0, marginBottom: 8 }}>
                     <span className="pmr-spinner" />
@@ -3407,7 +4571,7 @@ ${body}
                     })}
                   </div>
                 )}
-                {blocks.length === 0 ? (
+                {readingBlocks.length === 0 ? (
                   <div className="pmr-tr-empty">
                     <Icon name="file" size={22} />
                     <strong>{tt('panel.empty')}</strong>
@@ -3443,39 +4607,86 @@ ${body}
                       </div>
                     )}
                     {(waitingForTranslation
-                      ? blocks.filter((block) => block.type === 'equation')
-                      : blocks
-                    ).map((block) =>
-                      block.type === 'equation' ? (
-                        <EquationBlock
-                          key={block.id}
-                          tt={tt}
-                          equation={block}
-                          pdf={doc.pdf}
-                          fingerprint={docFingerprint}
-                          pageIndex={pageIndex}
-                          cache={equationImageCacheRef}
-                          cacheVersion={modelRevision}
-                          active={activeEquation === block.id}
-                          onLocate={focusEquation}
-                          onRemove={removeEquation}
-                          onCopy={copyText}
-                        />
-                      ) : (
-                        <SegmentCard
-                          key={block.id}
-                          tt={tt}
-                          paragraph={block.paragraph}
-                          translation={pageTranslation[block.paragraphId]}
-                          status={pageStatus}
-                          mode={viewMode}
-                          active={activeParagraph === block.paragraphId}
-                          error={translationErrors[pageIndex]?.[block.paragraphId]}
-                          onRetry={() => retryParagraph(block.paragraph)}
-                          onClick={() => focusParagraph(block.paragraphId)}
-                        />
-                      ),
-                    )}
+                      ? readingBlocks.filter(
+                          (block) => block.type === 'equation' || block.type === 'figure',
+                        )
+                      : readingBlocks
+                    ).map((block) => {
+                      if (block.type === 'equation') {
+                        return (
+                          <EquationBlock
+                            key={block.id}
+                            tt={tt}
+                            equation={block}
+                            pdf={doc.pdf}
+                            fingerprint={docFingerprint}
+                            pageIndex={pageIndex}
+                            cache={equationImageCacheRef}
+                            cacheVersion={modelRevision}
+                            active={activeEquation === block.id}
+                            onLocate={focusEquation}
+                            onRemove={removeEquation}
+                            onCopy={copyText}
+                          />
+                        )
+                      }
+                      if (block.type === 'figure') {
+                        return (
+                          <FigureBlock
+                            key={block.id}
+                            tt={tt}
+                            figure={block}
+                            pdf={doc.pdf}
+                            fingerprint={docFingerprint}
+                            pageIndex={pageIndex}
+                            cache={equationImageCacheRef}
+                            cacheVersion={modelRevision}
+                            active={activeEquation === block.id}
+                            onLocate={focusEquation}
+                            onRemove={removeFigure}
+                            onCopy={copyText}
+                          />
+                        )
+                      }
+                      const translationId = block.translationId ?? block.paragraphId
+                      const translation = pageTranslation[translationId]
+                      const error = translationErrors[pageIndex]?.[translationId]
+                      const unit = unitById.get(translationId)
+                      const common = {
+                        tt,
+                        block,
+                        status: pageStatus,
+                        mode: viewMode,
+                        active: activeParagraph === block.paragraphId,
+                        error,
+                        onRetry: unit === undefined ? undefined : () => retryUnit(unit),
+                        onClick: () => focusParagraph(block.paragraphId),
+                        onCopy: copyText,
+                      }
+                      if (block.type === 'title') {
+                        return <TitleBlock key={block.id} translation={translation} {...common} />
+                      }
+                      if (block.type === 'authors') {
+                        return (
+                          <AuthorBlock
+                            key={block.id}
+                            pageTranslation={pageTranslation}
+                            {...common}
+                          />
+                        )
+                      }
+                      if (block.type === 'abstract') {
+                        return (
+                          <AbstractBlock key={block.id} translation={translation} {...common} />
+                        )
+                      }
+                      if (block.type === 'keywords') {
+                        return (
+                          <KeywordsBlock key={block.id} translation={translation} {...common} />
+                        )
+                      }
+                      return <SegmentCard key={block.id} translation={translation} {...common} />
+                    })}
                     {hasPageOverrides && (
                       <div className="pmr-eq-reset">
                         <button type="button" className="pmr-btn pmr-btn-ghost" onClick={resetPageEquations}>
@@ -3594,6 +4805,13 @@ ${body}
                               <span className="pmr-note-count">
                                 {new Date(note.updatedAt).toLocaleDateString()}
                               </span>
+                              <CopyButton
+                                tt={tt}
+                                text={note.text}
+                                label={tt('action.copy')}
+                                onCopy={copyText}
+                                className="pmr-note-copy"
+                              />
                               <button
                                 type="button"
                                 className="pmr-note-delete"
@@ -3641,6 +4859,14 @@ ${body}
                       {tt('reading.clear')}
                     </button>
                   </div>
+                  <ModelControls
+                    tt={tt}
+                    catalog={catalog}
+                    value={settings.chatSelection}
+                    disabled={chatBusy}
+                    fallback={health}
+                    onChange={(selection) => updateSettings({ chatSelection: selection })}
+                  />
                   <div className="pmr-skill-row">
                     <button
                       type="button"
@@ -3756,6 +4982,13 @@ ${body}
                             {message.role === 'user' ? 'You' : 'AI'}
                           </div>
                           <div className="pmr-msg-body">{message.content}</div>
+                          <CopyButton
+                            tt={tt}
+                            text={message.content}
+                            label={tt('action.copy')}
+                            onCopy={copyText}
+                            className="pmr-msg-copy"
+                          />
                         </div>
                       ))
                     )}

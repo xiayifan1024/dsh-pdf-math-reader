@@ -51,13 +51,30 @@ same panel.
 - PDFs are rendered locally, with paging, zoom, fit-to-width and two-column text reconstruction.
 - Side panels are resizable by dragging the splitters; widths are saved automatically.
 - The text layer uses PDF.js's native `TextLayer`, so selections line up with the page text.
+- The first page is recomposed as article structure: a split title becomes one title block, authors,
+  affiliations and e-mails form a compact author list, and the abstract and keywords get their own
+  labels. Long abstracts are grouped at complete sentence boundaries.
+- The `A−` / `A+` control at the top of the translation panel adjusts reading text size; text size
+  and display mode are remembered.
+- Source text, translations and author information can be selected and copied directly. Paragraphs,
+  titles and abstracts also expose a hover copy button, and the toolbar can copy the whole page's
+  source or translation. AI answers and reading notes have their own copy buttons.
+- When the document has a reference section, the left rail shows a **References** tab: it detects
+  References / Bibliography headings, splits numbered entries, and handles two-column and hanging
+  indent layouts. The list is read-only, with selectable text and a copy-all action.
 - `←` / `→` turn pages and `↑` / `↓` scroll the current page; `A` / `D` also turn pages.
 - The mouse wheel scrolls within a page; scrolling past the top or bottom turns to the previous or
   next page (with a 1-second cooldown).
 
 ### Translation
 
-- Paragraph-level **bilingual / translation only / original only** views.
+- Paragraph-level **bilingual / translation only / original only** views, with a prominent
+  segmented switch at the top of the translation panel that remembers the last choice.
+- Bilingual mode pairs each source paragraph with its translation; translation-only mode uses a
+  continuous article layout without per-paragraph card borders.
+- The translation and AI-reading panels each have their own **model / reasoning effort** picker, so
+  translation and Q&A can use different models. Choices are persisted locally; leaving the picker on
+  default follows the current DSH default model.
 - Translate the current page, a text selection or the whole document, with progress and a stop
   button.
 - The translation prompt requires equations, LaTeX, citations, DOIs, numbering, code and URLs to be
@@ -98,6 +115,31 @@ The image above is the actual crop produced from `tests/fixtures/attention.pdf`:
 the `T` and `d_k` scripts in equation (1) are not clipped, the scripts in equation (2) are complete,
 and the equation number is shown separately in the card title.
 
+### Figures
+
+- Figures are detected from the page's **drawing operations**, not from its text: raster image
+  XObjects and dense vector paths define the artwork region. Table rules, icons and full-page scans
+  are not treated as figures.
+- In-figure text is attributed by **visual row**: a row whose text mostly falls inside the artwork
+  (or sits right above/below it as a panel title) becomes one of that figure's labels. Captions
+  (`Figure 1:` / `Fig. 1`) stay translatable body paragraphs.
+- Figure labels no longer become body paragraphs, and annotation rows such as `Input → Output` are
+  no longer detected as display equations.
+- Each figure is one card: a high-resolution crop, its number (from the nearest caption) and a
+  collapsed list of its labels, so labels do not pile up in the translation pane.
+- Clicking the card or the label area on the page locates and highlights the artwork; long figures
+  scroll horizontally and can be viewed enlarged.
+- A false positive can be dismissed with **Not a figure**, which returns its text to the body flow.
+  Corrections persist per **document fingerprint + page number**, and auto-detection can be restored.
+
+<p align="center">
+  <img src="docs/figures-preview.png" alt="Attention paper Figure 3 detected as one figure block, its labels collapsed into a list, with the caption still a translatable paragraph" width="46%">
+</p>
+
+The image above is the real sidebar for page 13 of `tests/fixtures/attention.pdf`: the heat map and
+the text along its lines are collected into one "Figure 3" card, the labels are collapsed by default,
+and the caption remains a normal translatable paragraph.
+
 ### Notes
 
 - Click a PDF paragraph, switch to the **Notes** tab on the right and start writing.
@@ -124,11 +166,12 @@ and the equation number is shown separately in the card title.
 
 ### Export
 
-- Export bilingual Markdown; display equations are kept as numbered equation text blocks.
-- Export **Markdown + equation images ZIP**: the archive contains the `.md` file and
-  `equations/*.png`, so equations remain visible when opened offline.
-- Export printable comparison HTML; equation images are embedded as data URIs, with no external
-  files. The page can be printed to PDF directly from the browser.
+- Export bilingual Markdown; display equations are kept as numbered equation text blocks, and
+  figures as a figure number plus their label list.
+- Export **Markdown + equation/figure images ZIP**: the archive contains the `.md` file,
+  `equations/*.png` and `figures/*.png`, so equations and figures remain visible when opened offline.
+- Export printable comparison HTML; equation and figure images are embedded as data URIs, with no
+  external files. The page can be printed to PDF directly from the browser.
 
 ## Quick start
 
@@ -279,8 +322,18 @@ Implementation notes:
   back up the page, paragraph indentation and line spacing.
 - Equation regions are detected and merged with sub/superscripts, limits, fractions and numbers
   before the remaining text is reconstructed into paragraphs. The page model emits `blocks`
-  (`paragraph` / `equation`) in reading order, and body paragraphs are derived from `blocks`, so
-  older call sites (translation, notes, AI context) keep working.
+  (`paragraph` / `equation` / `figure`) in reading order, and body paragraphs are derived from
+  `blocks`, so older call sites (translation, notes, AI context) keep working.
+- Figure regions come from the page operator list: image XObjects are mapped through the CTM, vector
+  paths are clustered by proximity, then filtered by area, two-dimensional path count, fill and the
+  share of table rules. Clustering sweeps boxes sorted by y and compares only row bands that can
+  still intersect, so a heat map with a thousand cells finishes in tens of milliseconds.
+- In-figure text is attributed before equation detection. Visual rows are counted inside the
+  artwork, and a row that mostly falls inside belongs to the figure; caption rows are excluded and
+  stay in the body flow. Attributed text is neither an equation candidate nor a paragraph.
+- Figure `bbox` values also use scale-1 page coordinates, with a separate crop rect and a figure
+  number taken from the nearest caption. Detected regions are cached per document and page, so zoom
+  and sidebar resizing do not re-parse the operator list.
 - Equation `bbox` values are stored in scale-1 PDF page coordinates; highlighting and cropping
   convert through the viewport, so they stay consistent across zoom, sidebar resizing and reopening
   the document.
@@ -324,6 +377,26 @@ Equation block in the page model:
 `blocks` mixes `paragraph` and `equation` entries in reading order; `paragraphs` is derived from
 `blocks`, so translation, notes and export can still work on body paragraphs only.
 
+Figure block in the page model:
+
+```js
+{
+  id: 'page13-figure1',
+  type: 'figure',
+  pageIndex: 12,
+  bbox: [x0, y0, x1, y1],        // artwork plus its labels
+  imageBbox: [x0, y0, x1, y1],   // crop rect (the artwork)
+  figureNumber: '3',             // nearest caption number, or null
+  caption: 'Figure 3: ...',      // caption text; it also stays a paragraph
+  labels: [{ text, bbox }],      // in-figure text, grouped into visual rows
+  labelCount: 13,
+  text: '...',                   // label text for AI context and export
+  detectionSource: 'automatic'
+}
+```
+
+Figure labels are not translated; `text` and `labels` are used for display, locating and export.
+
 ## Development
 
 ```bash
@@ -341,6 +414,8 @@ lib/                     Host pure functions with standalone tests (translation,
 src/plugin.jsx           Main panel, reader, equation blocks, notes and AI reading UI
 src/pdf.js               PDF.js loading, text reconstruction, equation crops, thumbnails, outline
 src/equations.js         Equation region detection, bbox/crop sizing, manual correction merging
+src/figures.js           Figure region detection (images/vector paths), label attribution, captions
+src/references.js        Reference-section lookup, numbered entry splitting and continuation joining
 src/zip.js               Dependency-free ZIP (store) writer
 src/api.js               Same-origin HTTP API client
 src/locales.js           Chinese and English UI strings
@@ -358,14 +433,25 @@ Test coverage:
   splitting, chat history and prompts.
 - Placeholder validation: complete, duplicated and unknown markers, empty-output fallback and
   failure marking.
+- Article structure: title, eight authors with affiliations/e-mails and the abstract boundary on the
+  Attention first page; same-size title lines merged; long abstracts grouped by whole sentences
+  without splitting decimal points.
 - Equation detection: equations (1)/(2) in the real Attention PDF, fraction and script merging, table
   false positives, and zoom-invariant coordinates.
+- Figure detection: image and vector regions, exclusion of table rules, icons and full-page scans,
+  row-level label attribution, captions staying in the flow, arrow annotations staying out of the
+  equation list, and **Not a figure** restoring the text.
 - Manual correction: deleting an automatic equation, re-boxing a region and restoring the original
   text items.
 - Equation crop sizing: DPR, maximum pixel budget and the long-edge limit.
 - Central directory and local blocks of the Markdown + images ZIP.
 - Host routes, strict translation JSON parsing, skill loading, asset path traversal and
   client-disconnect cancellation.
+- Model catalog and selection: `/api/models` returns models and reasoning efforts; translation and
+  chat requests can select a route and effort, with explicit 400 errors for unknown models/efforts.
+- References: locating the References section in the real Attention PDF, splitting its 40 numbered
+  entries, joining cross-paragraph continuations, reading the left column before the right,
+  repeated headers, author-year lists, and showing the rail tab only when present.
 - Client module-loader wrapper and slot registration.
 - Joining adjacent text fragments and two-column paragraph boundaries.
 
@@ -390,6 +476,23 @@ re-evaluated when extending to other papers. The fixture is from Vaswani et al.,
 You Need* ([arXiv:1706.03762](https://arxiv.org/abs/1706.03762)) and is used only for text extraction
 and equation-region regression tests.
 
+### Figure regression fixture
+
+Figure detection on the same sample:
+
+| Page | Page content | Detection result |
+|---:|---|---|
+| 3 | Transformer architecture (one full raster image) | 1 figure, number 1, 0 labels (its text is rasterised) |
+| 4 | Scaled Dot-Product / Multi-Head Attention diagrams | 2 figures, both numbered 2; each panel title is a label |
+| 8 | Tables 2/3 | 0 figures (table rules do not qualify as vector artwork) |
+| 13 | Attention-visualisation heat map (vector artwork with text along lines) | 1 figure, number 3, 13 label rows; the caption stays a translatable paragraph |
+| 14 / 15 | Two attention-head visualisations | 1 figure each, numbers 4 / 5, 21 label rows each |
+
+The regression suite covers the figure bbox, number, caption retention, labels staying out of body
+paragraphs, arrow annotations staying out of the equation list, and **Not a figure** returning the
+text to the body flow. Vector thresholds were calibrated on this sample and synthetic cases; unusual
+layouts may still need the manual dismissal.
+
 ## Limitations and roadmap
 
 - This is a **paragraph-aligned view inside the reader**; it does not produce a reflowed monolingual
@@ -400,7 +503,10 @@ and equation-region regression tests.
 - The boundary between inline math and body text, including baselines and line breaks, is the next
   task; display equations and placeholder validation are prioritised for now.
 - Automatic detection is heuristic and needs evaluation on more papers. Manual correction is
-  available through **Select equation**, **Not an equation** and **Restore auto-detection**.
+  available through **Select equation**, **Not an equation**, **Not a figure** and **Restore
+  auto-detection**.
+- Figure labels are kept as reference text and are not translated; captions are translated as body
+  paragraphs. Figure regions whose artwork is only thin strokes without a caption may be missed.
 - Scanned PDFs without a text layer are not OCR'd; the page reports that no text was found.
 - Two-column and multi-column layouts use heuristic reconstruction; unusual layouts may need manual
   paragraph-boundary fixes.

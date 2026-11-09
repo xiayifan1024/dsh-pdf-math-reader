@@ -80,6 +80,14 @@ var PdfMathReaderPlugin = (() => {
     });
     return await readJsonResponse(response);
   }
+  async function fetchModels(signal) {
+    const response = await fetch("/pdf-reader/api/models", {
+      method: "GET",
+      credentials: "same-origin",
+      signal
+    });
+    return await readJsonResponse(response);
+  }
   async function translateSegments(payload, signal) {
     const response = await fetch("/pdf-reader/api/translate", {
       method: "POST",
@@ -178,7 +186,8 @@ var PdfMathReaderPlugin = (() => {
     search: ["M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z", "M16 16l4.5 4.5"],
     quote: ["M7 7h4v4H7z", "M13 7h4v4h-4z", "M7 11v4a2 2 0 0 0 2 2", "M13 11v4a2 2 0 0 0 2 2"],
     crop: ["M4 4h5", "M15 4h5", "M4 20h5", "M15 20h5", "M4 9v6", "M20 9v6"],
-    expand: ["M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5"]
+    expand: ["M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5"],
+    columns: ["M4 4h16v16H4z", "M12 4v16"]
   };
   function Icon({ name, size = 18, strokeWidth = 1.7, style, ...rest }) {
     const paths = PATHS[name] ?? PATHS.file;
@@ -1017,6 +1026,492 @@ var PdfMathReaderPlugin = (() => {
     };
   }
 
+  // src/figures.js
+  var FIGURE_CAPTION_RE = /^(?:figure|fig\.)\s*([0-9]{1,3}[a-z]?)\b/i;
+  var SOLID_MIN_SIDE = 2;
+  var DEFAULT_LIMITS = {
+    // A page with an enormous operator list is usually generated artwork; skip
+    // rather than freeze the reader while classifying it.
+    maxOperators: 18e4,
+    // Image regions smaller than this are logos, bullets or inline icons.
+    minImageAreaRatio: 2e-3,
+    minImageSide: 18,
+    // Vector regions need enough paths, enough two-dimensional shapes and a
+    // real page footprint. Tables consist of thin rules only and fail here.
+    minVectorAreaRatio: 0.02,
+    minVectorPaths: 5,
+    minVectorSolid: 3,
+    minVectorWidth: 40,
+    minVectorHeight: 24,
+    clusterGap: 5
+  };
+  function multiply(left, right) {
+    return [
+      left[0] * right[0] + left[2] * right[1],
+      left[1] * right[0] + left[3] * right[1],
+      left[0] * right[2] + left[2] * right[3],
+      left[1] * right[2] + left[3] * right[3],
+      left[0] * right[4] + left[2] * right[5] + left[4],
+      left[1] * right[4] + left[3] * right[5] + left[5]
+    ];
+  }
+  function transformPoint(matrix, x, y) {
+    return [matrix[0] * x + matrix[2] * y + matrix[4], matrix[1] * x + matrix[3] * y + matrix[5]];
+  }
+  function viewportBox(viewport, x0, y0, x1, y1) {
+    const left = Math.min(x0, x1);
+    const right = Math.max(x0, x1);
+    const bottom = Math.min(y0, y1);
+    const top = Math.max(y0, y1);
+    const corners = [
+      [left, bottom],
+      [right, bottom],
+      [left, top],
+      [right, top]
+    ];
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of corners) {
+      const point = typeof viewport?.convertToViewportPoint === "function" ? viewport.convertToViewportPoint(x, y) : [x, (viewport?.height ?? 792) - y];
+      minX = Math.min(minX, point[0]);
+      minY = Math.min(minY, point[1]);
+      maxX = Math.max(maxX, point[0]);
+      maxY = Math.max(maxY, point[1]);
+    }
+    return [minX, minY, maxX, maxY];
+  }
+  function pathBoundingBox(args) {
+    const minMax = Array.isArray(args?.[2]) ? args[2] : null;
+    if (minMax !== null && minMax.length === 4 && minMax.every(Number.isFinite)) {
+      return [
+        Math.min(minMax[0], minMax[2]),
+        Math.min(minMax[1], minMax[3]),
+        Math.max(minMax[0], minMax[2]),
+        Math.max(minMax[1], minMax[3])
+      ];
+    }
+    const coords = Array.isArray(args?.[1]) ? args[1] : null;
+    if (coords === null || coords.length < 4) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let index = 0; index + 1 < coords.length; index += 2) {
+      const x = coords[index];
+      const y = coords[index + 1];
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    if (!Number.isFinite(minX)) return null;
+    return [minX, minY, maxX, maxY];
+  }
+  function artworkFromOperatorList(library, operatorList, viewport, limits = {}) {
+    const ops = library?.OPS ?? {};
+    const images = [];
+    const paths = [];
+    const fnArray = operatorList?.fnArray;
+    const argsArray = operatorList?.argsArray;
+    if (!Array.isArray(fnArray) || !Array.isArray(argsArray)) return { images, paths };
+    const pageWidth = Number.isFinite(viewport?.width) ? viewport.width : 612;
+    const pageHeight = Number.isFinite(viewport?.height) ? viewport.height : 792;
+    const guardWidth = pageWidth * 4;
+    const guardHeight = pageHeight * 4;
+    const imageOps = new Set(
+      [
+        ops.paintImageXObject,
+        ops.paintJpegXObject,
+        ops.paintImageMaskXObject,
+        ops.paintSolidColorImageMask,
+        ops.paintInlineImageXObject
+      ].filter((value) => Number.isInteger(value))
+    );
+    let ctm = [1, 0, 0, 1, 0, 0];
+    const stack = [];
+    const push = () => {
+      if (stack.length < 256) stack.push(ctm);
+    };
+    const boxFromUnitSquare = () => {
+      const corners = [
+        transformPoint(ctm, 0, 0),
+        transformPoint(ctm, 1, 0),
+        transformPoint(ctm, 0, 1),
+        transformPoint(ctm, 1, 1)
+      ];
+      const xs = corners.map((point) => point[0]);
+      const ys = corners.map((point) => point[1]);
+      const box = viewportBox(viewport, Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+      return validBox(box);
+    };
+    const validBox = (box) => {
+      if (!box.every(Number.isFinite)) return null;
+      if (box[2] - box[0] <= 0.5 || box[3] - box[1] <= 0.5) return null;
+      if (box[0] < -guardWidth || box[2] > pageWidth + guardWidth || box[1] < -guardHeight || box[3] > pageHeight + guardHeight) {
+        return null;
+      }
+      return box;
+    };
+    for (let index = 0; index < fnArray.length; index += 1) {
+      const fn = fnArray[index];
+      const args = argsArray[index];
+      if (fn === ops.save) {
+        push();
+      } else if (fn === ops.restore) {
+        ctm = stack.pop() ?? ctm;
+      } else if (fn === ops.transform) {
+        if (Array.isArray(args) && args.length === 6 && args.every(Number.isFinite)) {
+          ctm = multiply(ctm, args);
+        }
+      } else if (fn === ops.paintFormXObjectBegin) {
+        push();
+        const matrix = args?.[0];
+        if (Array.isArray(matrix) && matrix.length === 6 && matrix.every(Number.isFinite)) {
+          ctm = multiply(ctm, matrix);
+        }
+      } else if (fn === ops.paintFormXObjectEnd) {
+        ctm = stack.pop() ?? ctm;
+      } else if (imageOps.has(fn)) {
+        const box = boxFromUnitSquare();
+        if (box !== null) images.push(box);
+      } else if (fn === ops.constructPath) {
+        const pdfBox = pathBoundingBox(args);
+        if (pdfBox === null) continue;
+        const corners = [
+          transformPoint(ctm, pdfBox[0], pdfBox[1]),
+          transformPoint(ctm, pdfBox[2], pdfBox[1]),
+          transformPoint(ctm, pdfBox[0], pdfBox[3]),
+          transformPoint(ctm, pdfBox[2], pdfBox[3])
+        ];
+        const xs = corners.map((point) => point[0]);
+        const ys = corners.map((point) => point[1]);
+        const box = validBox(
+          viewportBox(viewport, Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys))
+        );
+        if (box !== null) paths.push(box);
+      }
+    }
+    return { images, paths };
+  }
+  function clusterArtworkBoxes(boxes, options = {}) {
+    const gap = Number.isFinite(options.gap) ? Math.max(0, options.gap) : DEFAULT_LIMITS.clusterGap;
+    const items = (Array.isArray(boxes) ? boxes : []).filter(
+      (box) => Array.isArray(box) && box.length === 4 && box.every(Number.isFinite) && box[2] > box[0] && box[3] > box[1]
+    );
+    if (items.length === 0) return [];
+    const parent = items.map((_, index) => index);
+    const find = (index) => {
+      let root = index;
+      while (parent[root] !== root) {
+        parent[root] = parent[parent[root]];
+        root = parent[root];
+      }
+      return root;
+    };
+    const union = (left, right) => {
+      const leftRoot = find(left);
+      const rightRoot = find(right);
+      if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
+    };
+    const order = items.map((_, index) => index).sort((left, right) => items[left][1] - items[right][1]);
+    let active = [];
+    for (const index of order) {
+      const box = items[index];
+      const minBottom = box[1] - gap;
+      let write = 0;
+      for (const other of active) {
+        if (items[other][3] >= minBottom) {
+          active[write] = other;
+          write += 1;
+        }
+      }
+      active.length = write;
+      for (const other of active) {
+        const peer = items[other];
+        const dx = Math.max(0, Math.max(box[0], peer[0]) - Math.min(box[2], peer[2]));
+        if (dx <= gap) union(other, index);
+      }
+      active.push(index);
+    }
+    const groups = /* @__PURE__ */ new Map();
+    for (let index = 0; index < items.length; index += 1) {
+      const root = find(index);
+      const group = groups.get(root);
+      if (group === void 0) groups.set(root, [index]);
+      else group.push(index);
+    }
+    const clusters = [];
+    for (const indexes of groups.values()) {
+      const members = indexes.map((index) => items[index]);
+      const box = unionBox(members);
+      const ink = members.reduce((sum, member) => sum + boxArea(member), 0);
+      clusters.push({
+        bbox: box,
+        count: members.length,
+        solidCount: members.filter(
+          (member) => member[2] - member[0] >= SOLID_MIN_SIDE && member[3] - member[1] >= SOLID_MIN_SIDE
+        ).length,
+        ink,
+        boxes: members
+      });
+    }
+    clusters.sort((left, right) => boxArea(right.bbox) - boxArea(left.bbox));
+    return clusters;
+  }
+  function looksLikeTableRuling(cluster) {
+    const [x0, y0, x1, y1] = cluster.bbox;
+    const width = x1 - x0;
+    const height = y1 - y0;
+    if (width <= 0 || height <= 0) return false;
+    let horizontal = 0;
+    let vertical = 0;
+    for (const box of cluster.boxes) {
+      const boxWidth = box[2] - box[0];
+      const boxHeight = box[3] - box[1];
+      if (boxHeight <= SOLID_MIN_SIDE && boxWidth >= width * 0.5) horizontal += 1;
+      else if (boxWidth <= SOLID_MIN_SIDE && boxHeight >= height * 0.5) vertical += 1;
+    }
+    if (horizontal < 3 || vertical < 3) return false;
+    return cluster.solidCount < Math.max(3, cluster.count * 0.3);
+  }
+  function regionFromBox(box, source, extra = {}) {
+    return {
+      bbox: [box[0], box[1], box[2], box[3]],
+      source,
+      ...extra
+    };
+  }
+  function mergeRegions(regions) {
+    const remaining = [...regions].sort((left, right) => boxArea(right.bbox) - boxArea(left.bbox));
+    let merged = true;
+    while (merged) {
+      merged = false;
+      outer: for (let left = 0; left < remaining.length; left += 1) {
+        for (let right = left + 1; right < remaining.length; right += 1) {
+          const first = remaining[left];
+          const second = remaining[right];
+          const dx = Math.max(
+            0,
+            Math.max(first.bbox[0], second.bbox[0]) - Math.min(first.bbox[2], second.bbox[2])
+          );
+          const dy = Math.max(
+            0,
+            Math.max(first.bbox[1], second.bbox[1]) - Math.min(first.bbox[3], second.bbox[3])
+          );
+          const overlapping = overlapRatio(first.bbox, second.bbox) >= 0.5;
+          if (!overlapping && (dx > 2 || dy > 2)) continue;
+          const bbox = unionBox([first.bbox, second.bbox]);
+          const hasImage = first.imageBox !== void 0 || second.imageBox !== void 0;
+          remaining[left] = {
+            bbox,
+            source: first.source === second.source ? first.source : "mixed",
+            imageBox: hasImage ? [...bbox] : void 0,
+            pathCount: (first.pathCount ?? 0) + (second.pathCount ?? 0)
+          };
+          remaining.splice(right, 1);
+          merged = true;
+          break outer;
+        }
+      }
+    }
+    return remaining;
+  }
+  function detectFigureRegions(artwork, options = {}) {
+    const limits = { ...DEFAULT_LIMITS, ...options };
+    const pageWidth = Number.isFinite(options.pageWidth) ? options.pageWidth : 612;
+    const pageHeight = Number.isFinite(options.pageHeight) ? options.pageHeight : 792;
+    const pageArea = Math.max(1, pageWidth * pageHeight);
+    const images = Array.isArray(artwork?.images) ? artwork.images : [];
+    const paths = Array.isArray(artwork?.paths) ? artwork.paths : [];
+    const imageRegions = [];
+    for (const box of images) {
+      const width = box[2] - box[0];
+      const height = box[3] - box[1];
+      if (width < limits.minImageSide || height < limits.minImageSide) continue;
+      if (boxArea(box) < pageArea * limits.minImageAreaRatio) continue;
+      if (boxArea(box) > pageArea * 0.9) continue;
+      imageRegions.push(regionFromBox(box, "image", { imageBox: [...box] }));
+    }
+    const vectorRegions = [];
+    for (const cluster of clusterArtworkBoxes(paths, { gap: limits.clusterGap })) {
+      const [x0, y0, x1, y1] = cluster.bbox;
+      const width = x1 - x0;
+      const height = y1 - y0;
+      const area = width * height;
+      if (width < limits.minVectorWidth || height < limits.minVectorHeight) continue;
+      if (area < pageArea * limits.minVectorAreaRatio) continue;
+      if (area > pageArea * 0.85) continue;
+      if (cluster.count < limits.minVectorPaths) continue;
+      if (cluster.solidCount < limits.minVectorSolid) continue;
+      if (looksLikeTableRuling(cluster)) continue;
+      vectorRegions.push(
+        regionFromBox(cluster.bbox, "vector", { pathCount: cluster.count })
+      );
+    }
+    return mergeRegions([...imageRegions, ...vectorRegions]).sort(
+      (left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]
+    );
+  }
+  function captionInfo(text) {
+    const match = String(text ?? "").trim().match(FIGURE_CAPTION_RE);
+    if (match === null) return null;
+    return { number: match[1], text: String(text).trim() };
+  }
+  function assignFigureLabels(atoms, regions, options = {}) {
+    const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
+    const row = Number.isFinite(options.rowThreshold) ? options.rowThreshold : 0.6;
+    const marginX = Number.isFinite(options.marginX) ? options.marginX : Math.max(4, bodySize * 1.6);
+    const marginY = Number.isFinite(options.marginY) ? options.marginY : Math.max(3, bodySize * 1.4);
+    const atomIds = /* @__PURE__ */ new Set();
+    const figures = [];
+    const list = Array.isArray(atoms) ? atoms : [];
+    const areas = (Array.isArray(regions) ? regions : []).filter(
+      (region) => Array.isArray(region?.bbox) && region.bbox.length === 4
+    );
+    if (areas.length === 0) return { figures, atomIds };
+    const rows = buildTextRows(list, { bodySize });
+    const owners = areas.map(() => []);
+    for (const textRow of rows) {
+      const items = textRow.items.filter(
+        (atom) => atom !== null && typeof atom === "object" && String(atom.text ?? "").trim() !== ""
+      );
+      if (items.length === 0) continue;
+      if (captionInfo(textRow.text) !== null) continue;
+      let best = -1;
+      let bestRatio = 0;
+      for (let index = 0; index < areas.length; index += 1) {
+        const region = areas[index].bbox;
+        const left = region[0] - marginX;
+        const right = region[2] + marginX;
+        let inside = 0;
+        for (const atom of items) {
+          const box = atomBox(atom);
+          const centerX = (box[0] + box[2]) / 2;
+          const centerY = (box[1] + box[3]) / 2;
+          const coverage = intersectionArea(box, [left, region[1], right, region[3]]) / boxArea(box);
+          const centerInside = centerX >= left && centerX <= right && centerY >= region[1] && centerY <= region[3];
+          const verticalGap = Math.max(
+            0,
+            region[1] - box[3],
+            box[1] - region[3]
+          );
+          const horizontalOverlap = Math.min(box[2], right) - Math.max(box[0], left);
+          const alignedAboveOrBelow = verticalGap <= marginY && horizontalOverlap >= (box[2] - box[0]) * 0.5;
+          if (coverage >= 0.5 || centerInside || alignedAboveOrBelow) {
+            inside += 1;
+          }
+        }
+        const ratio = inside / items.length;
+        if (ratio > bestRatio) {
+          bestRatio = ratio;
+          best = index;
+        }
+      }
+      if (best >= 0 && bestRatio >= row) owners[best].push(...items);
+    }
+    for (let index = 0; index < areas.length; index += 1) {
+      const region = areas[index];
+      const labels = labelLines(owners[index], bodySize);
+      const kept = labels.filter((line) => captionInfo(line.text) === null);
+      const bbox = unionBox([region.bbox, ...kept.map((line) => line.bbox)]);
+      const caption = findCaption(rows, bbox);
+      figures.push({
+        bbox,
+        imageBbox: region.imageBox ?? region.bbox,
+        source: region.source ?? "vector",
+        labels: kept,
+        caption,
+        number: caption?.number ?? null,
+        labelCount: kept.length
+      });
+      for (const line of kept) {
+        for (const atom of line.atoms) atomIds.add(atom.index);
+      }
+    }
+    return { figures, atomIds };
+  }
+  function labelLines(atoms, bodySize) {
+    const sorted = [...atoms].sort((left, right) => left.y - right.y || left.x - right.x);
+    const lines = [];
+    let current;
+    const flush = () => {
+      if (current === void 0) return;
+      const items = [...current.items].sort((left, right) => left.x - right.x);
+      let text = "";
+      let previous;
+      for (const atom of items) {
+        const value = atom.text.replace(/\s+/g, " ").trim();
+        if (value === "") continue;
+        if (previous === void 0) {
+          text = value;
+        } else {
+          const gap = atom.x - previous.endX;
+          text = gap > Math.max(1.2, Math.max(atom.height, previous.height) * 0.18) ? `${text} ${value}` : `${text}${value}`;
+        }
+        previous = atom;
+      }
+      if (text !== "") {
+        lines.push({ text, bbox: unionBox(items.map(atomBox)), atoms: items });
+      }
+      current = void 0;
+    };
+    for (const atom of sorted) {
+      const tolerance = Math.max(1.5, Math.min(atom.height, bodySize) * 0.4);
+      if (current === void 0 || Math.abs(atom.y - current.baseline) > tolerance) {
+        flush();
+        current = { baseline: atom.y, items: [atom] };
+      } else {
+        current.items.push(atom);
+      }
+    }
+    flush();
+    return lines.sort((left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]);
+  }
+  function findCaption(rows, figureBox) {
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const candidates = [];
+    for (const row of rows) {
+      if (row.bottom < figureBox[1] - 2) continue;
+      if (row.top > figureBox[3] + 60) continue;
+      const overlap = Math.min(row.right, figureBox[2]) - Math.max(row.x, figureBox[0]);
+      if (overlap <= 0) continue;
+      const info = captionInfo(row.text);
+      if (info === null) continue;
+      candidates.push({
+        distance: Math.abs(row.top - figureBox[3]),
+        number: info.number,
+        text: info.text,
+        bbox: [row.x, row.top, row.right, row.bottom]
+      });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((left, right) => left.distance - right.distance);
+    const { number, text, bbox } = candidates[0];
+    return { number, text, bbox };
+  }
+  async function collectFigureRegions(page, library, viewport, options = {}) {
+    if (typeof page?.getOperatorList !== "function") return [];
+    let operatorList;
+    try {
+      operatorList = await page.getOperatorList();
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(operatorList?.fnArray)) return [];
+    const limits = { ...DEFAULT_LIMITS, ...options };
+    if (operatorList.fnArray.length > limits.maxOperators) return [];
+    const base = typeof page.getViewport === "function" ? page.getViewport({ scale: 1 }) : viewport;
+    const artwork = artworkFromOperatorList(library, operatorList, base, limits);
+    return detectFigureRegions(artwork, {
+      ...limits,
+      pageWidth: base?.width ?? 612,
+      pageHeight: base?.height ?? 792
+    });
+  }
+
   // lib/placeholders.js
   function mathToken(index) {
     return `\u27E6MATH_${String(index).padStart(3, "0")}\u27E7`;
@@ -1273,11 +1768,17 @@ var PdfMathReaderPlugin = (() => {
     const pageHeight = (viewport?.height ?? 792) / scale;
     const pageIndex = Number.isInteger(options.pageIndex) ? options.pageIndex : 0;
     const atoms = buildAtoms(library, textContent, viewport).flatMap(splitTextAtom);
-    const analysis = analyzeEquations(atoms, {
+    const bodyFont = options.bodyFont ?? dominantFont(atoms);
+    const bodySize = options.bodySize ?? bodyFontSize(atoms);
+    const resolvedFigures = resolveFigureRegions(options, pageWidth, pageHeight);
+    const figureRegions = resolvedFigures.regions;
+    const figureInfo = assignFigureLabels(atoms, figureRegions, { bodySize });
+    const contentAtoms = atoms.filter((atom) => !figureInfo.atomIds.has(atom.index));
+    const analysis = analyzeEquations(contentAtoms, {
       pageWidth,
       pageHeight,
-      bodyFont: options.bodyFont,
-      bodySize: options.bodySize,
+      bodyFont,
+      bodySize,
       overrides: options.overrides
     });
     const excluded = analysis.equationAtomIds;
@@ -1365,7 +1866,7 @@ var PdfMathReaderPlugin = (() => {
       }
       current = void 0;
     };
-    for (const atom of atoms) {
+    for (const atom of contentAtoms) {
       if (excluded.has(atom.index)) continue;
       if (atom.text.trim() === "") {
         if (current !== void 0) {
@@ -1429,11 +1930,13 @@ var PdfMathReaderPlugin = (() => {
       const height = Math.max(previous.height, line.height);
       const verticalReset = line.top < previous.top - height * 0.5;
       const columnJumpLeft = line.x < previous.x - height * 2.2 && previous.right > pageWidth * 0.58;
-      const columnJumpRight = line.x > previous.x + height * 2.2 && line.x > pageWidth * 0.42 && (verticalReset || line.top <= previous.bottom + height * 1.5);
+      const proseBreak = /[.!?。！？:：;；)\]"”’]$/.test(previous.text.trim());
+      const columnJumpRight = line.x > previous.x + height * 2.2 && line.x > pageWidth * 0.42 && proseBreak && (verticalReset || line.top <= previous.bottom + height * 1.5);
       const indented = line.x > previous.x + height * 0.95 && gap > Math.max(0.8, medianGap * 0.45);
       const shortPrevious = previous.right < pageWidth * 0.88 && line.x <= previous.x + height * 0.75 && gap > Math.max(1, gapThreshold * 0.55);
       const heading = line.height > previous.height * 1.24 && line.height > 9;
-      const newParagraph = gap > gapThreshold || verticalReset || columnJumpRight || columnJumpLeft || indented || shortPrevious || heading;
+      const sentenceContinuation = !verticalReset && !columnJumpRight && !columnJumpLeft && !heading && gap <= Math.max(gapThreshold * 1.35, height * 1.5) && !/[.!?。！？:：;；)\]"”’]$/.test(previous.text.trim()) && /^[a-zà-ÿ0-9(（\[]/.test(line.text);
+      const newParagraph = !sentenceContinuation && (gap > gapThreshold || verticalReset || columnJumpRight || columnJumpLeft || indented || shortPrevious || heading);
       if (newParagraph) {
         paragraphs.push(createParagraph(line));
       } else {
@@ -1499,25 +2002,84 @@ var PdfMathReaderPlugin = (() => {
         order: equation.order
       });
     }
+    const figureBlocks = [];
+    const maxAtomOrder = atoms.reduce(
+      (max, atom) => Number.isFinite(atom.index) ? Math.max(max, atom.index) : max,
+      0
+    );
+    for (let index = 0; index < figureInfo.figures.length; index += 1) {
+      const figure = figureInfo.figures[index];
+      const labelAtoms = figure.labels.flatMap((line) => line.atoms);
+      const fallbackOrder = () => {
+        const below = atoms.find(
+          (atom) => atom.text.trim() !== "" && atom.top > figure.bbox[3] - 0.5
+        );
+        return below === void 0 ? maxAtomOrder + 0.5 : below.index - 0.5;
+      };
+      const order = labelAtoms.length > 0 ? Math.min(...labelAtoms.map((atom) => atom.index)) : fallbackOrder();
+      figureBlocks.push({
+        id: `${pageKey}-figure${index + 1}`,
+        type: "figure",
+        pageIndex,
+        bbox: figure.bbox,
+        imageBbox: figure.imageBbox,
+        figureNumber: figure.number,
+        caption: figure.caption?.text ?? null,
+        captionBbox: figure.caption?.bbox ?? null,
+        labels: figure.labels.map((line) => ({ text: line.text, bbox: line.bbox })),
+        labelCount: figure.labels.length,
+        source: figure.source,
+        detectionSource: "automatic",
+        text: figure.labels.map((line) => line.text).join(" ") || figure.caption?.text || "",
+        order
+      });
+    }
+    blocks.push(...figureBlocks);
     blocks.sort(
-      (left, right) => left.order - right.order || (left.type === "equation" ? -1 : 1)
+      (left, right) => left.order - right.order || (left.type === "equation" || left.type === "figure" ? -1 : 1)
     );
     let equationIndex = 0;
+    let figureIndex = 0;
     for (const block of blocks) {
-      if (block.type !== "equation") continue;
-      equationIndex += 1;
-      block.id = `${pageKey}-equation${equationIndex}`;
+      if (block.type === "equation") {
+        equationIndex += 1;
+        block.id = `${pageKey}-equation${equationIndex}`;
+      } else if (block.type === "figure") {
+        figureIndex += 1;
+        block.id = `${pageKey}-figure${figureIndex}`;
+      }
     }
     return {
       blocks,
       paragraphs: paragraphBlocks,
       lines: paragraphBlocks.flatMap((paragraph) => paragraph.lines),
       equations: blocks.filter((block) => block.type === "equation"),
+      figures: blocks.filter((block) => block.type === "figure"),
+      figureRegions,
+      // The unfiltered detection result, so callers can cache it and re-apply
+      // "not a figure" corrections on later visits without losing the region.
+      figureRegionsRaw: resolvedFigures.raw,
       atoms,
       viewport,
+      bodySize,
+      bodyFont,
+      pageIndex,
       pageWidth: viewport.width,
       pageHeight: viewport.height
     };
+  }
+  function resolveFigureRegions(options, pageWidth, pageHeight) {
+    const raw = options.figures ?? options.figureRegions;
+    let regions = Array.isArray(raw) ? raw.filter((region) => Array.isArray(region?.bbox)) : [];
+    if (regions.length === 0 && options.artwork !== void 0) {
+      regions = detectFigureRegions(options.artwork, { pageWidth, pageHeight });
+    }
+    const detected = regions;
+    const removed = Array.isArray(options.overrides?.figures) ? options.overrides.figures : [];
+    const filtered = removed.length === 0 ? detected : detected.filter(
+      (region) => !removed.some((box) => Array.isArray(box) && overlapRatio(box, region.bbox) > 0.3)
+    );
+    return { regions: filtered, raw: detected };
   }
   function createParagraph(line) {
     return {
@@ -1536,8 +2098,13 @@ var PdfMathReaderPlugin = (() => {
     const library = await loadPdfJs();
     const viewport = page.getViewport({ scale });
     const textContent = await page.getTextContent({ includeMarkedContent: false });
+    let figures = options.figures;
+    if (figures === void 0 && options.detectFigures !== false) {
+      figures = await collectFigureRegions(page, library, viewport, options.figureOptions);
+    }
     const model = buildPageModel(library, textContent, viewport, {
       ...options,
+      figures,
       pageIndex: identity?.pageIndex ?? options.pageIndex ?? 0
     });
     if (identity !== void 0) {
@@ -1629,6 +2196,1253 @@ var PdfMathReaderPlugin = (() => {
     }
     if (current.length > 0) batches.push(current);
     return batches;
+  }
+
+  // src/article.js
+  var ABSTRACT_HEADING = /^(?:abstract|summary)(?=\s|[:：—–-]|$)/i;
+  var CHINESE_ABSTRACT_HEADING = /^摘\s*要(?=\s|[:：]|$)/;
+  var KEYWORDS_HEADING = /^(?:keywords?|key\s*words?|index\s+terms?|关键词|关键字)(?=\s|[:：—–-]|$)/i;
+  var SECTION_NAMES = /^(?:abstract|summary|introduction|background|related\s+work|prior\s+work|method|methods|methodology|approach|architecture|model|models|experiments?|evaluation|results?|analysis|discussion|conclusions?|references|bibliography|acknowledg(?:e)?ments?|appendix|appendices|supplementary|limitations?|future\s+work)$/i;
+  var HEADER_NOTE = /^(?:provided\s+proper\s+attribution|copyright\b|©|arxiv:|doi:|preprint\b|under\s+review|published\s+as|licensed\s+under|proceedings\s+of)/i;
+  var EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+  var MARKS_ONLY = /^[\s∗*†‡§¶#]+(?:\s*[\d,]+)?$/;
+  var ORG = /\b(?:universit(?:y|ies)|institute|institution|department|dept\.?|school|college|laborator(?:y|ies)|research|brain|google|microsoft|meta|facebook|amazon|apple|nvidia|openai|deepmind|inc\.?|ltd\.?|corp\.?|gmbh|academy|hospital|centre|center)\b|大学|学院|研究院|研究所|实验室|公司/i;
+  function normalize(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim();
+  }
+  function joinText(left, right) {
+    const a = normalize(left);
+    const b = normalize(right);
+    if (a === "") return b;
+    if (b === "") return a;
+    if (/[‐‑-]$/.test(a) && /^[a-zà-ÿ]/i.test(b)) return `${a.slice(0, -1)}${b}`;
+    if (/[\u3040-\u30ff\u3400-\u9fff]$/.test(a) || /^[\u3040-\u30ff\u3400-\u9fff]/.test(b)) {
+      return `${a}${b}`;
+    }
+    return `${a} ${b}`;
+  }
+  function unionBox2(paragraphs) {
+    const boxes = paragraphs.map((paragraph) => paragraph.bbox).filter(Boolean);
+    if (boxes.length === 0) return [0, 0, 0, 0];
+    return [
+      Math.min(...boxes.map((box) => box[0])),
+      Math.min(...boxes.map((box) => box[1])),
+      Math.max(...boxes.map((box) => box[2])),
+      Math.max(...boxes.map((box) => box[3]))
+    ];
+  }
+  function mergePlaceholders(paragraphs) {
+    const seen = /* @__PURE__ */ new Map();
+    for (const paragraph of paragraphs) {
+      for (const placeholder of paragraph.placeholders ?? []) {
+        if (placeholder?.token) seen.set(placeholder.token, placeholder);
+      }
+    }
+    return [...seen.values()];
+  }
+  function splitSentences(value) {
+    const text = String(value ?? "");
+    const spans = [];
+    let start = 0;
+    let index = 0;
+    while (index < text.length) {
+      const char = text[index];
+      let boundary = char === "\u3002" || char === "\uFF01" || char === "\uFF1F" || char === "!" || char === "?";
+      if (char === ".") {
+        const previous = text[index - 1];
+        const next = text[index + 1];
+        const decimal = /\d/.test(previous ?? "") && /\d/.test(next ?? "");
+        const dotted = /[A-Za-z]/.test(previous ?? "") && next !== void 0 && !/\s/.test(next) && next !== '"' && next !== "\u201D";
+        boundary = !decimal && !dotted && (next === void 0 || /\s/.test(next) || /["'”’)\]]/.test(next));
+      }
+      if (!boundary) {
+        index += 1;
+        continue;
+      }
+      let end = index + 1;
+      while (end < text.length && /["'”’)\]]/.test(text[end])) end += 1;
+      const span = text.slice(start, end).trim();
+      if (span !== "") spans.push(span);
+      start = end;
+      index = end;
+      while (index < text.length && /\s/.test(text[index])) index += 1;
+      start = index;
+    }
+    if (start < text.length) {
+      const span = text.slice(start).trim();
+      if (span !== "") spans.push(span);
+    }
+    return spans;
+  }
+  function groupAbstract(text, translateText, maxChars = 700) {
+    const source = splitSentences(text);
+    const translatable = splitSentences(translateText);
+    if (source.length < 2 || source.length !== translatable.length) {
+      return [{ text, translateText }];
+    }
+    const groups = [];
+    let current = null;
+    for (let index = 0; index < source.length; index += 1) {
+      const pair = { text: source[index], translateText: translatable[index] };
+      if (current === null) {
+        current = pair;
+        continue;
+      }
+      if (current.text.length + pair.text.length + 1 > maxChars) {
+        groups.push(current);
+        current = pair;
+      } else {
+        current = {
+          text: joinText(current.text, pair.text),
+          translateText: joinText(current.translateText, pair.translateText)
+        };
+      }
+    }
+    if (current !== null) groups.push(current);
+    return groups;
+  }
+  function joinParagraphs(paragraphs, key) {
+    let text = "";
+    for (const paragraph of paragraphs) text = joinText(text, paragraph[key] ?? paragraph.text);
+    return normalize(text);
+  }
+  function estimateBodySize(paragraphs) {
+    const weights = /* @__PURE__ */ new Map();
+    for (const paragraph of paragraphs) {
+      const height = Math.round(paragraph.height * 2) / 2;
+      if (!Number.isFinite(height) || height <= 0) continue;
+      weights.set(height, (weights.get(height) ?? 0) + Math.max(1, paragraph.text.length));
+    }
+    let best = 10;
+    let score = -1;
+    for (const [height, weight] of weights) {
+      if (weight > score) {
+        best = height;
+        score = weight;
+      }
+    }
+    return best;
+  }
+  function headingLabel(text) {
+    const value = normalize(text);
+    const split = (heading) => ({
+      heading,
+      content: value.slice(heading.length).replace(/^\s*[:：—–-]\s*/, "").trim()
+    });
+    let match = value.match(ABSTRACT_HEADING);
+    if (match !== null) return split(match[0]);
+    match = value.match(CHINESE_ABSTRACT_HEADING);
+    if (match !== null) return split(match[0]);
+    return null;
+  }
+  function keywordLabel(text) {
+    const value = normalize(text);
+    const match = value.match(KEYWORDS_HEADING);
+    if (match === null) return null;
+    const rest = value.slice(match[0].length);
+    return {
+      heading: match[0],
+      content: rest.replace(/^\s*[:：—–-]\s*/, "").trim()
+    };
+  }
+  function isFootnote(paragraph) {
+    return /^\s*[∗*†‡§¶#]/.test(paragraph.text ?? "");
+  }
+  function looksLikeSectionHeading(text) {
+    const value = normalize(text);
+    if (/^\d+(?:\.\d+)*[\s.)、]+\S/.test(value)) return true;
+    return SECTION_NAMES.test(value.replace(/^\d+(?:\.\d+)*[\s.)、]+/, "").replace(/[.:：]$/, ""));
+  }
+  function isHeadingParagraph(paragraph, bodySize) {
+    const text = normalize(paragraph.text);
+    if (text === "" || text.length > 150) return false;
+    if ((paragraph.lines?.length ?? 1) > 3) return false;
+    if (headingLabel(text) !== null || keywordLabel(text) !== null) return true;
+    if (/^\d+(?:\.\d+)*[\s.)、]+\S/.test(text)) return true;
+    if (SECTION_NAMES.test(text.replace(/^\d+(?:\.\d+)*[\s.)、]+/, "").replace(/[.:：]$/, ""))) {
+      return true;
+    }
+    return paragraph.height >= bodySize * 1.16 && /^[\p{Lu}\u4e00-\u9fff]/u.test(text);
+  }
+  function looksLikeAffiliation(text) {
+    return ORG.test(text);
+  }
+  var NAME_PARTICLES = /* @__PURE__ */ new Set([
+    "al",
+    "bin",
+    "da",
+    "de",
+    "del",
+    "della",
+    "den",
+    "der",
+    "di",
+    "du",
+    "el",
+    "la",
+    "le",
+    "ten",
+    "ter",
+    "van",
+    "von"
+  ]);
+  var NAME_SUFFIXES = /* @__PURE__ */ new Set(["jr", "jr.", "sr", "sr.", "ii", "iii", "iv"]);
+  function looksLikeName(text) {
+    const value = normalize(text);
+    if (value === "" || value.length > 90) return false;
+    if (EMAIL.test(value) || looksLikeAffiliation(value)) return false;
+    if (/[0-9@]/.test(value)) return false;
+    const words = value.split(" ");
+    if (words.length === 0 || words.length > 6) return false;
+    if (!/^[\p{Lu}\u4e00-\u9fff]/u.test(words[0])) return false;
+    return words.every((word, index) => {
+      const bare = word.replace(/,$/, "");
+      return /^[\p{Lu}\u4e00-\u9fff][\p{L}.'’\-]*$/u.test(bare) || index > 0 && (NAME_PARTICLES.has(bare.toLowerCase()) || NAME_SUFFIXES.has(bare.toLowerCase()));
+    });
+  }
+  function parseName(text) {
+    let value = normalize(text);
+    let marks = "";
+    const markMatch = value.match(/^(.*?)\s*([∗*†‡§¶#]+)$/);
+    if (markMatch !== null && markMatch[1].trim() !== "") {
+      value = markMatch[1];
+      marks = markMatch[2];
+    }
+    return { name: normalize(value), marks };
+  }
+  function splitRow(row, bodySize) {
+    const lines = [...row.lines].sort((left, right) => left.x - right.x);
+    const segments = [];
+    for (const line of lines) {
+      const previous = segments[segments.length - 1];
+      const gap = previous === void 0 ? Infinity : line.x - previous.right;
+      if (previous !== void 0 && gap <= Math.max(6, bodySize * 0.9)) {
+        previous.parts.push(line.text);
+        previous.right = Math.max(previous.right, line.x + line.width);
+        previous.height = Math.max(previous.height, line.height);
+      } else {
+        segments.push({
+          parts: [line.text],
+          x: line.x,
+          right: line.x + line.width,
+          top: line.top,
+          height: line.height
+        });
+      }
+    }
+    return segments.map((segment) => {
+      const text = normalize(segment.parts.join(" "));
+      const parts = segment.parts.map(normalize);
+      const marks = [];
+      const names = [];
+      for (const part of parts) {
+        if (MARKS_ONLY.test(part)) {
+          marks.push(part.replace(/[\d,]/g, "").trim());
+        } else {
+          names.push(part);
+        }
+      }
+      const parsed = parseName(names.join(" "));
+      if (parsed.marks !== "") marks.push(parsed.marks);
+      return {
+        ...segment,
+        text,
+        name: parsed.name,
+        marks: marks.filter((mark) => mark !== "").join(" ")
+      };
+    });
+  }
+  function collectLines(paragraphs, scale) {
+    const lines = [];
+    for (const paragraph of paragraphs) {
+      for (const line of paragraph.lines ?? []) {
+        const text = normalize(line.text);
+        if (text === "") continue;
+        lines.push({
+          text,
+          x: line.x / scale,
+          top: line.top / scale,
+          width: line.width / scale,
+          height: line.height / scale,
+          paragraphId: paragraph.id
+        });
+      }
+    }
+    return lines;
+  }
+  function groupRows(lines, bodySize) {
+    const sorted = [...lines].sort((left, right) => left.top - right.top || left.x - right.x);
+    const rows = [];
+    const tolerance = Math.max(2.5, bodySize * 0.5);
+    for (const line of sorted) {
+      const row = rows.find((entry) => Math.abs(entry.top - line.top) <= tolerance);
+      if (row === void 0) {
+        rows.push({ top: line.top, lines: [line] });
+      } else {
+        row.lines.push(line);
+        row.top = Math.min(row.top, line.top);
+      }
+    }
+    return rows;
+  }
+  function detectAuthors(paragraphs, bodySize, scale = 1) {
+    const rows = groupRows(collectLines(paragraphs, scale), bodySize);
+    const nameRows = [];
+    const metaRows = [];
+    let previousTop = null;
+    for (const row of rows) {
+      const segments = splitRow(row, bodySize);
+      const names = segments.filter((segment) => looksLikeName(segment.name));
+      const startsAuthorRow = names.length > 0 && (previousTop === null || row.top - previousTop > bodySize * 1.55);
+      if (startsAuthorRow) {
+        nameRows.push({
+          top: row.top,
+          total: names.length,
+          // A few PDFs leave two names in one text item. Count them as expected
+          // authors so a skipped second name makes the byline incomplete.
+          expected: names.reduce(
+            (sum, segment) => sum + splitColumnarNames(segment.name).length,
+            0
+          ),
+          unparsed: Math.max(0, segments.length - names.length),
+          authors: names.map((segment) => ({
+            name: segment.name,
+            marks: segment.marks,
+            affiliation: "",
+            email: "",
+            affiliationId: null,
+            center: segment.x + (segment.right - segment.x) / 2
+          }))
+        });
+      } else {
+        metaRows.push({ top: row.top, segments, previousTop });
+      }
+      previousTop = row.top;
+    }
+    if (nameRows.length === 0) return { authors: [], complete: false };
+    const assigned = /* @__PURE__ */ new Set();
+    for (const row of metaRows) {
+      let owner = null;
+      let distance = Infinity;
+      for (const candidate of nameRows) {
+        const delta = row.top - candidate.top;
+        if (delta < -bodySize * 0.5) continue;
+        const score = Math.abs(delta);
+        if (score < distance && delta <= bodySize * 4.2) {
+          owner = candidate;
+          distance = score;
+        }
+      }
+      if (owner === null) continue;
+      for (const segment of row.segments) {
+        const text = normalize(segment.text);
+        if (text === "" || MARKS_ONLY.test(text)) continue;
+        const target = nearestAuthor(owner.authors, segment);
+        if (target === null) continue;
+        const email = text.split(" ").find((part) => EMAIL.test(part.replace(/[,;]$/, "")));
+        if (email !== void 0) {
+          if (target.email === "") target.email = email.replace(/[,;]$/, "");
+          target.assigned = true;
+          continue;
+        }
+        if (target.affiliation === "") target.affiliation = text;
+        if (row.previousTop !== null) target.assigned = true;
+      }
+    }
+    const authors = nameRows.flatMap((row) => row.authors);
+    const missingNames = nameRows.reduce(
+      (sum, row) => sum + Math.max(0, row.expected - row.authors.length),
+      0
+    );
+    const unparsedSegments = nameRows.reduce((sum, row) => sum + row.unparsed, 0);
+    const assignedCount = authors.filter((author) => author.assigned).length;
+    const unassignedCount = authors.length - assignedCount;
+    return {
+      authors,
+      // A byline that could only be read in part is unsafe to replace: the
+      // unparsed name would disappear from the reading column and the exports.
+      complete: unparsedSegments === 0 && unassignedCount + missingNames <= (authors.length > 0 ? 1 : 0)
+    };
+  }
+  function splitColumnarNames(text) {
+    const raw = String(text ?? "").trim();
+    const parts = raw.split(/\s{2,}/).filter(Boolean);
+    if (parts.length > 1 && parts.every((part) => part.split(/\s+/).length <= 6)) {
+      return parts.map(normalize);
+    }
+    const value = normalize(raw);
+    if (looksLikeName(value)) return [value];
+    return splitNameRun(value);
+  }
+  function splitNameRun(text) {
+    const words = normalize(text).split(" ");
+    if (words.length <= 2) return [normalize(text)];
+    const starts = [];
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index];
+      const particle = NAME_PARTICLES.has(word.toLowerCase()) || /^(?:[A-Z]\.?)$/.test(word);
+      if (!particle) starts.push(index);
+    }
+    if (starts.length < 2) return [normalize(text)];
+    const names = [];
+    for (let index = 0; index < starts.length; index += 1) {
+      const begin = starts[index];
+      const finish = starts[index + 1] ?? words.length;
+      names.push(words.slice(begin, finish).join(" "));
+    }
+    const prefix = words.slice(0, starts[0]).join(" ");
+    if (prefix !== "") names[0] = `${prefix} ${names[0]}`;
+    return names.filter((name) => name !== "");
+  }
+  function collectNameRuns(paragraphs, scale) {
+    const runs = [];
+    for (const line of collectLines(paragraphs, scale)) {
+      const withoutMarks = line.text.replace(/\s*[∗*†‡§¶#]+\s*/g, " ").trim();
+      if (withoutMarks === "" || MARKS_ONLY.test(line.text) || EMAIL.test(withoutMarks)) continue;
+      if (looksLikeAffiliation(withoutMarks)) continue;
+      runs.push({ ...line, nameText: withoutMarks });
+    }
+    return runs;
+  }
+  function parseAuthors(paragraphs, bodySize, scale = 1, pageHeight = 792) {
+    const lines = collectLines(paragraphs, scale);
+    if (lines.length === 0) return [];
+    const firstLine = lines.reduce((top, line) => Math.min(top, line.top), Infinity);
+    if (!(firstLine < pageHeight * 0.6)) return [];
+    if (lines.some((line) => normalize(line.text).length > 90 || line.height > bodySize * 2)) {
+      return [];
+    }
+    const detected = detectAuthors(paragraphs, bodySize, scale);
+    if (detected.complete) return detected.authors;
+    const known = detected.authors.filter((author) => author.name !== "");
+    const runs = collectNameRuns(paragraphs, scale);
+    const used = /* @__PURE__ */ new Set();
+    for (const run of runs) {
+      if (known.some((author) => run.nameText.includes(author.name))) used.add(run);
+    }
+    const residual = runs.filter((run) => !used.has(run));
+    const authors = [...known];
+    for (const run of residual) {
+      const pieces = looksLikeName(run.nameText) ? [run.nameText] : splitColumnarNames(run.nameText);
+      if (pieces.length === 0) continue;
+      if (pieces.length === 1 && !looksLikeName(pieces[0])) {
+        if (authors.length === 1 && authors[0].affiliation === "") {
+          authors[0].affiliation = run.nameText;
+        }
+        continue;
+      }
+      for (const piece of pieces) {
+        if (!looksLikeName(piece)) continue;
+        if (authors.some((author) => author.name === piece)) continue;
+        const parsed = parseName(piece);
+        authors.push({
+          name: parsed.name,
+          marks: parsed.marks,
+          affiliation: "",
+          email: "",
+          affiliationId: null,
+          center: run.x + run.width / 2
+        });
+      }
+    }
+    return authors;
+  }
+  function nearestAuthor(authors, segment) {
+    let best = null;
+    let bestScore = -Infinity;
+    const center = segment.x + (segment.right - segment.x) / 2;
+    for (const author of authors) {
+      const score = -Math.abs(center - (author.center ?? center));
+      if (score > bestScore) {
+        best = author;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+  function findTitle(paragraphs, bodySize, pageWidth, pageHeight) {
+    let start = -1;
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      const text = normalize(paragraph.text);
+      if (text === "") continue;
+      if (paragraph.top > pageHeight * 0.48) break;
+      if (paragraph.height < bodySize * 1.16) continue;
+      if (HEADER_NOTE.test(text)) continue;
+      if (headingLabel(text) !== null || keywordLabel(text) !== null) continue;
+      if (looksLikeSectionHeading(text)) continue;
+      if (text.length < 4) continue;
+      const previous = paragraphs[index - 1];
+      if (previous !== void 0 && previous.text.length > 60 && !/[.!?。！？:：;；)\]"”’]$/.test(normalize(previous.text)) && paragraph.top - previous.bottom < bodySize * 2.2) {
+        continue;
+      }
+      const centered = Math.abs((paragraph.x + paragraph.right) / 2 - pageWidth / 2) < pageWidth * 0.22;
+      if (!centered && paragraph.height < bodySize * 1.24) continue;
+      start = index;
+      break;
+    }
+    if (start < 0) {
+      for (let index = 0; index < paragraphs.length; index += 1) {
+        const paragraph = paragraphs[index];
+        const text = normalize(paragraph.text);
+        if (paragraph.top > pageHeight * 0.35) break;
+        if (text.length < 4 || text.length > 220) continue;
+        if (HEADER_NOTE.test(text) || looksLikeSectionHeading(text)) continue;
+        if (looksLikeAffiliation(text) || /@/.test(text)) continue;
+        const lookahead = paragraphs.slice(index + 1, index + 5);
+        if (lookahead.some(
+          (candidate) => /@/.test(candidate.text) || looksLikeAffiliation(candidate.text)
+        )) {
+          start = index;
+          break;
+        }
+      }
+    }
+    if (start < 0) return null;
+    let end = start + 1;
+    for (; end < paragraphs.length; end += 1) {
+      const previous = paragraphs[end - 1];
+      const next = paragraphs[end];
+      const gap = next.top - previous.bottom;
+      if (gap > bodySize * 2.4) break;
+      if (next.height < bodySize * 0.95) break;
+      if (next.height < bodySize * 1.06 && gap > bodySize * 1.5) break;
+      if (next.text.length > 220) break;
+      const titleHeight = Math.max(
+        ...paragraphs.slice(start, end).map((entry) => entry.height)
+      );
+      const bylineAhead = paragraphs.slice(end, end + 3).some((entry) => /@/.test(entry.text) || looksLikeAffiliation(entry.text));
+      if (next.height <= bodySize * 1.06 && next.height <= titleHeight * 0.7 && looksLikeName(next.text) && bylineAhead) {
+        break;
+      }
+      if (headingLabel(next.text) !== null || keywordLabel(next.text) !== null) break;
+      if (HEADER_NOTE.test(next.text)) break;
+      if (looksLikeAffiliation(next.text) || /@/.test(next.text)) break;
+    }
+    const selected = paragraphs.slice(start, end);
+    return {
+      paragraphs: selected,
+      text: joinParagraphs(selected, "text"),
+      translateText: joinParagraphs(selected, "translateText"),
+      placeholders: mergePlaceholders(selected)
+    };
+  }
+  function findAbstract(paragraphs, pageHeight) {
+    for (let index = 0; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      if (paragraph.top > pageHeight * 0.82) break;
+      const label = headingLabel(paragraph.text);
+      if (label === null) continue;
+      const translatable = headingLabel(paragraph.translateText ?? paragraph.text);
+      return {
+        index,
+        heading: label.heading,
+        inline: label.content,
+        inlineTranslate: translatable?.content ?? label.content
+      };
+    }
+    return null;
+  }
+  function sectionStop(paragraph, bodySize) {
+    if (paragraph === void 0) return true;
+    if (keywordLabel(paragraph.text) !== null) return true;
+    if (isFootnote(paragraph)) return true;
+    if (paragraph.height < bodySize * 0.86) return true;
+    if (looksLikeSectionHeading(paragraph.text)) return true;
+    return isHeadingParagraph(paragraph, bodySize) && paragraph.height >= bodySize * 1.06;
+  }
+  function findAbstractBody(paragraphs, abstract, bodySize) {
+    const body = [];
+    if (abstract.inline !== "") body.push({ inline: abstract.inline });
+    let previous = paragraphs[abstract.index];
+    for (let index = abstract.index + 1; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      if (sectionStop(paragraph, bodySize)) break;
+      const gap = paragraph.top - (previous?.bottom ?? paragraph.top);
+      if (body.length > 0 && gap > bodySize * 2.05) break;
+      body.push({ paragraph });
+      previous = paragraph;
+    }
+    return body;
+  }
+  function findKeywords(paragraphs, startIndex, bodySize) {
+    for (let index = Math.max(0, startIndex); index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      const label = keywordLabel(paragraph.text);
+      if (label === null) continue;
+      const translatableLabel = keywordLabel(paragraph.translateText ?? paragraph.text);
+      const content = [label.content];
+      const translateContent = [translatableLabel?.content ?? label.content];
+      let previous = paragraph;
+      for (let next = index + 1; next < paragraphs.length && next <= index + 3; next += 1) {
+        const candidate = paragraphs[next];
+        if (sectionStop(candidate, bodySize)) break;
+        if (candidate.top - previous.bottom > bodySize * 1.9) break;
+        content.push(candidate.text);
+        translateContent.push(candidate.translateText ?? candidate.text);
+        previous = candidate;
+      }
+      const endIndex = previous === paragraph ? index + 1 : paragraphs.indexOf(previous) + 1;
+      return {
+        heading: label.heading,
+        text: normalize(content.filter((text) => text !== "").join(" ")),
+        translateText: normalize(translateContent.filter((text) => text !== "").join(" ")),
+        paragraphs: paragraphs.slice(index, endIndex)
+      };
+    }
+    return null;
+  }
+  function bylineEnd(paragraphs, title, abstract, bodySize) {
+    if (abstract !== null) return abstract.index;
+    for (let index = title.end; index < paragraphs.length; index += 1) {
+      const paragraph = paragraphs[index];
+      if (paragraph.height <= bodySize * 1.08 && paragraph.text.length > 180) return index;
+      if (isHeadingParagraph(paragraph, bodySize) && paragraph.height >= bodySize * 1.1) return index;
+    }
+    return paragraphs.length;
+  }
+  function blockId(pageKey, name) {
+    return `${pageKey}-${name}`;
+  }
+  function composeReading(model) {
+    const paragraphs = Array.isArray(model?.paragraphs) ? model.paragraphs : [];
+    const bodySize = model?.bodySize ?? estimateBodySize(paragraphs);
+    const scale = Number.isFinite(model?.viewport?.scale) && model.viewport.scale > 0 ? model.viewport.scale : 1;
+    const pageWidth = (model?.viewport?.width ?? 612) / scale;
+    const pageHeight = (model?.viewport?.height ?? 792) / scale;
+    const pageIndex = Number.isInteger(model?.pageIndex) ? model.pageIndex : 0;
+    const pageKey = `page${pageIndex + 1}`;
+    const composed = [];
+    const consumed = /* @__PURE__ */ new Set();
+    const suppressed = /* @__PURE__ */ new Set();
+    if (pageIndex === 0) {
+      for (const paragraph of paragraphs) {
+        if (HEADER_NOTE.test(normalize(paragraph.text))) suppressed.add(paragraph.id);
+      }
+    }
+    if (pageIndex === 0 && paragraphs.length > 0) {
+      const title = findTitle(paragraphs, bodySize, pageWidth, pageHeight);
+      const abstract = findAbstract(paragraphs, pageHeight);
+      if (title !== null) {
+        title.end = paragraphs.indexOf(title.paragraphs[title.paragraphs.length - 1]) + 1;
+        const titleBlock = {
+          id: blockId(pageKey, "title"),
+          type: "title",
+          role: "title",
+          text: title.text,
+          translateText: title.translateText,
+          placeholders: title.placeholders,
+          translationId: blockId(pageKey, "title"),
+          paragraphIds: title.paragraphs.map((paragraph) => paragraph.id),
+          paragraphId: title.paragraphs[0].id,
+          bbox: unionBox2(title.paragraphs),
+          order: Math.min(...title.paragraphs.map((paragraph) => paragraph.order ?? 0))
+        };
+        composed.push(titleBlock);
+        for (const paragraph of title.paragraphs) consumed.add(paragraph.id);
+        const end = bylineEnd(paragraphs, title, abstract, bodySize);
+        const bylineParagraphs = paragraphs.slice(title.end, end);
+        const authors = parseAuthors(bylineParagraphs, bodySize, scale, pageHeight);
+        if (authors.length > 0) {
+          const affiliations = [];
+          const byText = /* @__PURE__ */ new Map();
+          for (const author of authors) {
+            const text = normalize(author.affiliation);
+            if (text === "") continue;
+            let id = byText.get(text.toLowerCase());
+            if (id === void 0) {
+              id = blockId(pageKey, `affiliation${affiliations.length + 1}`);
+              byText.set(text.toLowerCase(), id);
+              affiliations.push({ id, text });
+            }
+            author.affiliationId = id;
+          }
+          const authorsBlock = {
+            id: blockId(pageKey, "authors"),
+            type: "authors",
+            role: "authors",
+            authors,
+            affiliations,
+            text: authors.map((author) => [author.name, author.affiliation, author.email].filter(Boolean).join(" ")).join(" \xB7 "),
+            paragraphIds: bylineParagraphs.map((paragraph) => paragraph.id),
+            paragraphId: bylineParagraphs[0]?.id,
+            bbox: unionBox2(bylineParagraphs),
+            order: Math.min(...bylineParagraphs.map((paragraph) => paragraph.order ?? 0))
+          };
+          composed.push(authorsBlock);
+          for (const paragraph of bylineParagraphs) consumed.add(paragraph.id);
+        }
+        if (abstract !== null) {
+          const body = findAbstractBody(paragraphs, abstract, bodySize);
+          const bodyParagraphs = body.map((entry) => entry.paragraph).filter(Boolean);
+          const text = normalize(
+            [abstract.inline, ...bodyParagraphs.map((paragraph) => paragraph.text)].join(" ")
+          );
+          const translateText = normalize(
+            [
+              abstract.inlineTranslate,
+              ...bodyParagraphs.map((paragraph) => paragraph.translateText ?? paragraph.text)
+            ].filter(Boolean).join(" ")
+          );
+          if (text !== "") {
+            const abstractParagraphs = [paragraphs[abstract.index], ...bodyParagraphs];
+            const placeholders = mergePlaceholders(abstractParagraphs);
+            const parts = groupAbstract(text, translateText);
+            for (let index = 0; index < parts.length; index += 1) {
+              const part = parts[index];
+              const id = `${blockId(pageKey, "abstract")}${index + 1}`;
+              composed.push({
+                id,
+                type: "abstract",
+                role: "abstract",
+                heading: abstract.heading,
+                showLabel: index === 0,
+                partIndex: index,
+                text: part.text,
+                translateText: part.translateText,
+                placeholders,
+                translationId: id,
+                paragraphIds: abstractParagraphs.map((paragraph) => paragraph.id),
+                paragraphId: paragraphs[abstract.index].id,
+                bbox: unionBox2(abstractParagraphs),
+                order: Math.min(...abstractParagraphs.map((paragraph) => paragraph.order ?? 0))
+              });
+            }
+            for (const paragraph of abstractParagraphs) consumed.add(paragraph.id);
+          }
+          const keywordStart = abstract.index + 1 + bodyParagraphs.length;
+          const keywords = findKeywords(paragraphs, keywordStart, bodySize);
+          if (keywords !== null && keywords.text !== "") {
+            composed.push({
+              id: blockId(pageKey, "keywords"),
+              type: "keywords",
+              role: "keywords",
+              heading: keywords.heading,
+              text: keywords.text,
+              translateText: keywords.translateText,
+              placeholders: mergePlaceholders(keywords.paragraphs),
+              translationId: blockId(pageKey, "keywords"),
+              paragraphIds: keywords.paragraphs.map((paragraph) => paragraph.id),
+              paragraphId: keywords.paragraphs[0].id,
+              bbox: unionBox2(keywords.paragraphs),
+              order: Math.min(...keywords.paragraphs.map((paragraph) => paragraph.order ?? 0))
+            });
+            for (const paragraph of keywords.paragraphs) consumed.add(paragraph.id);
+          }
+        }
+      }
+    }
+    const frontBlocks = [...composed].sort((left, right) => left.order - right.order);
+    const blocks = [];
+    let inserted = false;
+    for (const block of model?.blocks ?? []) {
+      if (block.type === "paragraph" && suppressed.has(block.paragraphId)) continue;
+      if (block.type === "paragraph" && consumed.has(block.paragraphId)) {
+        if (!inserted) {
+          blocks.push(...frontBlocks);
+          inserted = true;
+        }
+        continue;
+      }
+      if (block.type === "paragraph" && block.paragraph !== void 0) {
+        const role = isHeadingParagraph(block.paragraph, bodySize) ? "heading" : "paragraph";
+        blocks.push({
+          ...block,
+          role,
+          translationId: block.paragraph.id
+        });
+      } else {
+        blocks.push(block);
+      }
+    }
+    if (!inserted && frontBlocks.length > 0) blocks.push(...frontBlocks);
+    const units = [];
+    for (const block of blocks) {
+      if (block.type === "authors") {
+        for (const affiliation of block.affiliations ?? []) {
+          units.push({
+            id: affiliation.id,
+            text: affiliation.text,
+            translateText: affiliation.text,
+            placeholders: [],
+            block,
+            kind: "affiliation"
+          });
+        }
+        continue;
+      }
+      if (block.translationId !== void 0 && block.type !== "authors") {
+        if (block.type === "paragraph" || block.type === "heading") {
+          const paragraph = block.paragraph;
+          units.push({
+            id: block.translationId,
+            text: paragraph.text,
+            translateText: paragraph.translateText || paragraph.text,
+            placeholders: paragraph.placeholders ?? [],
+            block,
+            kind: "paragraph"
+          });
+        } else {
+          units.push({
+            id: block.translationId,
+            text: block.text,
+            translateText: block.translateText ?? block.text,
+            placeholders: block.placeholders ?? [],
+            block,
+            kind: block.type
+          });
+        }
+      }
+    }
+    return { blocks, units, bodySize, frontMatter: composed };
+  }
+
+  // src/references.js
+  var REFERENCE_TITLE = /^(?:references|bibliography|works\s+cited|参考文献|引用文献)$/i;
+  var REFERENCE_HEADING = /^(references|bibliography|works\s+cited|参考文献|引用文献)(?=\s|[:：]|$)/i;
+  var SECTION_NUMBER = /^\d+(?:\.\d+)*[.)、]?\s+/;
+  var ENTRY_START = /^\s*(?:\[(\d{1,3})\]|(\d{1,3})[.)])\s+/;
+  var PAGE_NUMBER = /^\d{1,3}$/;
+  var MAX_ENTRIES = 300;
+  var MAX_SCAN_PAGES = 60;
+  function normalize2(value) {
+    return String(value ?? "").replace(/\s+/g, " ").trim();
+  }
+  function joinText2(left, right) {
+    const a = normalize2(left);
+    const b = normalize2(right);
+    if (a === "") return b;
+    if (b === "") return a;
+    if (/[‐‑-]$/.test(a) && /^[a-zà-ÿ]/i.test(b)) return `${a.slice(0, -1)}${b}`;
+    return `${a} ${b}`;
+  }
+  function headingBody(text) {
+    const value = normalize2(text);
+    const match = value.match(SECTION_NUMBER);
+    return match === null ? value : value.slice(match[0].length);
+  }
+  function referenceHeading(text) {
+    const body = headingBody(text);
+    const match = body.match(REFERENCE_HEADING);
+    if (match === null) return null;
+    const rest = normalize2(body.slice(match[0].length)).replace(/^[:：]\s*/, "");
+    if (rest !== "" && !/^(?:\[|\d|[:：])/.test(rest)) return null;
+    return { heading: match[1], rest };
+  }
+  function isSectionBoundary(text) {
+    const value = normalize2(text);
+    if (value === "" || value.length > 80) return false;
+    if (/^(?:appendix(?:\s+[A-Z0-9])?|appendices?)\s*(?:[:：.。]\s*.*)?$/i.test(value)) {
+      return true;
+    }
+    if (/^(?:acknowledg(?:e)?ments?|author\s+contributions|funding|conflicts?\s+of\s+interest)\s*[:.：]?\s*$/i.test(
+      value
+    )) {
+      return true;
+    }
+    if (/^(?:附录|附\s*录)(?:\s*[A-Z0-9一二三四五六七八九十])?\s*[:：.]?\s*$/u.test(value)) {
+      return true;
+    }
+    if (/[.!?。！？]$/.test(value)) return false;
+    if (value.split(/\s+/).length > 8) return false;
+    if (/^(?:supplementary|additional\s+results)\b/i.test(value)) return true;
+    if (/^[A-Z](?:\.\d+)?\s+(?:appendix|additional\s+results|supplementary)\b/i.test(value)) {
+      return true;
+    }
+    return /^(?:figure|table|fig\.)\s*\d/i.test(value);
+  }
+  function looksLikeAuthorYearStart(text) {
+    const value = normalize2(text);
+    if (!/^[\p{Lu}\u4e00-\u9fff]/u.test(value)) return false;
+    return /(?:\((?:19|20)\d{2}[a-z]?\)|(?:19|20)\d{2}[a-z]?[.,])/.test(
+      value.slice(0, 180)
+    );
+  }
+  function detectReferenceStyle(paragraphs, startIndex) {
+    for (let index = startIndex; index < paragraphs.length; index += 1) {
+      const text = normalize2(paragraphs[index].text);
+      if (text === "" || PAGE_NUMBER.test(text)) continue;
+      if (referenceHeading(text) !== null) continue;
+      if (entryStart(text) !== null) return "numbered";
+      if (looksLikeAuthorYearStart(text)) return "unnumbered";
+      return "numbered";
+    }
+    return "numbered";
+  }
+  function entryStart(text) {
+    const match = text.match(ENTRY_START);
+    if (match === null) return null;
+    return {
+      label: match[1] ?? match[2] ?? "",
+      text: text.slice(match[0].length).trim()
+    };
+  }
+  function isContinuationLine(paragraph, current) {
+    const line = paragraph.lines?.[0];
+    if (line === void 0) return false;
+    const currentHeight = current.height || line.height || 10;
+    const currentX = Number.isFinite(current.x) ? current.x : line.x;
+    const currentWidth = current.width || line.width || 0;
+    const heightOk = line.height >= currentHeight * 0.65 && line.height <= currentHeight * 1.45;
+    const xOk = line.x >= currentX - 3 && line.x <= currentX + Math.max(30, currentHeight * 5);
+    const widthOk = line.width >= Math.min(160, Math.max(60, currentWidth * 0.35));
+    const tailLike = /^(?:\d{4}[a-z]?[.,;]?|pp?\.\s*\d|pages?\s|vol\.\s|no\.\s|doi|https?:)/i.test(
+      normalize2(paragraph.text)
+    );
+    return heightOk && xOk && (widthOk || tailLike);
+  }
+  function outlinePages(outline) {
+    if (!Array.isArray(outline)) return [];
+    return outline.filter(
+      (entry) => Number.isInteger(entry?.pageIndex) && REFERENCE_TITLE.test(headingBody(entry.title))
+    ).map((entry) => entry.pageIndex);
+  }
+  function referenceScanPages(numPages, outline) {
+    const fromOutline = outlinePages(outline);
+    if (fromOutline.length > 0) return fromOutline;
+    return Array.from(
+      { length: Math.min(numPages, MAX_SCAN_PAGES) },
+      (_, index) => numPages - 1 - index
+    );
+  }
+  function roughRows(atoms) {
+    const rows = [];
+    for (const atom of [...atoms].sort((left, right) => left.top - right.top)) {
+      let row = null;
+      for (let index = rows.length - 1; index >= Math.max(0, rows.length - 4); index -= 1) {
+        if (Math.abs(rows[index].top - atom.top) <= 4) {
+          row = rows[index];
+          break;
+        }
+      }
+      if (row === null) rows.push({ top: atom.top, atoms: [atom] });
+      else {
+        row.atoms.push(atom);
+        row.top = Math.max(row.top, atom.top);
+      }
+    }
+    return rows;
+  }
+  function columnSplit(atoms, pageWidth) {
+    const rows = roughRows(atoms.filter((atom) => atom.text.trim() !== ""));
+    if (rows.length < 6) return null;
+    let centralRows = 0;
+    for (const row of rows) {
+      const sorted = [...row.atoms].sort((left, right) => left.x - right.x);
+      let best2 = null;
+      for (let index = 1; index < sorted.length; index += 1) {
+        const gap = sorted[index].x - (sorted[index - 1].x + sorted[index - 1].width);
+        if (best2 === null || gap > best2.gap) {
+          best2 = { gap, mid: (sorted[index].x + sorted[index - 1].x + sorted[index - 1].width) / 2 };
+        }
+      }
+      if (best2 !== null && best2.gap >= 4 && best2.mid > pageWidth * 0.35 && best2.mid < pageWidth * 0.65) {
+        centralRows += 1;
+      }
+    }
+    if (centralRows < Math.max(4, rows.length * 0.3)) return null;
+    const intervals = atoms.filter(
+      (atom) => atom.text.trim() !== "" && atom.width <= pageWidth * 0.5 && atom.x >= pageWidth * 0.15 && atom.x <= pageWidth * 0.85
+    ).map((atom) => [atom.x, atom.x + atom.width]).sort((left, right) => left[0] - right[0]);
+    const merged = [];
+    for (const interval of intervals) {
+      const last = merged[merged.length - 1];
+      if (last !== void 0 && interval[0] <= last[1] + 1.5) {
+        last[1] = Math.max(last[1], interval[1]);
+      } else {
+        merged.push([...interval]);
+      }
+    }
+    let best = null;
+    for (let index = 1; index < merged.length; index += 1) {
+      const from = merged[index - 1][1];
+      const to = merged[index][0];
+      const gap = to - from;
+      const mid = (from + to) / 2;
+      if (gap < 4 || mid < pageWidth * 0.35 || mid > pageWidth * 0.65) continue;
+      if (best === null || gap > best.gap) best = { gap, split: (from + to) / 2 };
+    }
+    return best?.split ?? pageWidth / 2;
+  }
+  function buildLines(atoms) {
+    const sorted = atoms.filter((atom) => atom.text.trim() !== "").sort((left, right) => left.top - right.top || left.x - right.x);
+    const rows = [];
+    for (const atom of sorted) {
+      let row = null;
+      for (let index = rows.length - 1; index >= Math.max(0, rows.length - 3); index -= 1) {
+        if (Math.abs(rows[index].top - atom.top) <= Math.max(2, atom.height * 0.45)) {
+          row = rows[index];
+          break;
+        }
+      }
+      if (row === null) {
+        rows.push({ top: atom.top, atoms: [atom] });
+      } else {
+        row.atoms.push(atom);
+        row.top = Math.max(row.top, atom.top);
+      }
+    }
+    return rows.map((row) => {
+      const lineAtoms = [...row.atoms].sort((left, right) => left.x - right.x);
+      let text = "";
+      let endX = lineAtoms[0].x;
+      let height = 1;
+      for (const atom of lineAtoms) {
+        const gap = atom.x - endX;
+        if (text !== "" && gap > Math.max(1, atom.height * 0.18)) text += " ";
+        text += atom.text;
+        endX = Math.max(endX, atom.x + atom.width);
+        height = Math.max(height, atom.height);
+      }
+      return {
+        text: normalize2(text),
+        x: lineAtoms[0].x,
+        top: Math.min(...lineAtoms.map((atom) => atom.top)),
+        width: Math.max(1, endX - lineAtoms[0].x),
+        height
+      };
+    }).filter((line) => line.text !== "").sort((left, right) => left.top - right.top || left.x - right.x);
+  }
+  function pageLines(atoms, pageWidth) {
+    const split = columnSplit(atoms, pageWidth);
+    if (split === null) return buildLines(atoms).map((line) => ({ ...line, column: 0 }));
+    const left = buildLines(atoms.filter((atom) => atom.x < split)).map((line) => ({
+      ...line,
+      column: 0
+    }));
+    const right = buildLines(atoms.filter((atom) => atom.x >= split)).map((line) => ({
+      ...line,
+      column: 1
+    }));
+    return [...left, ...right];
+  }
+  async function pageLinesFor(pdf, library, pageIndex, signal) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const page = await pdf.getPage(pageIndex + 1);
+    const viewport = page.getViewport({ scale: 1 });
+    const textContent = await page.getTextContent({ includeMarkedContent: false });
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const lines = pageLines(buildAtoms(library, textContent, viewport), viewport.width);
+    return {
+      pageIndex,
+      paragraphs: lines.map((line, index) => ({
+        id: `page${pageIndex + 1}-line${index}`,
+        text: line.text,
+        top: line.top,
+        lines: [line]
+      }))
+    };
+  }
+  function pushEntry(entries, current) {
+    const text = normalize2(current.text);
+    if (text === "" || PAGE_NUMBER.test(text)) return;
+    if (entries.length >= MAX_ENTRIES) return;
+    entries.push({
+      id: `reference-${current.pageIndex}-${entries.length + 1}`,
+      label: current.label,
+      text,
+      pageIndex: current.pageIndex,
+      anchorTop: current.anchorTop,
+      paragraphId: current.paragraphId
+    });
+  }
+  function parseUnnumbered(pages, headingPage, firstRest, startIndex) {
+    const entries = [];
+    let current = null;
+    let stopped = false;
+    const create = (paragraph, pageIndex, text) => {
+      const line = paragraph.lines?.[0];
+      return {
+        label: "",
+        text,
+        pageIndex,
+        lastPage: pageIndex,
+        x: line?.x,
+        width: line?.width,
+        height: line?.height,
+        column: line?.column,
+        anchorTop: line?.top ?? paragraph.top,
+        paragraphId: paragraph.id
+      };
+    };
+    for (const page of pages) {
+      if (stopped) break;
+      const paragraphs = Array.isArray(page.paragraphs) ? page.paragraphs : [];
+      const begin = page.pageIndex === headingPage ? startIndex : 0;
+      for (let index = begin; index < paragraphs.length; index += 1) {
+        const paragraph = paragraphs[index];
+        const text = page.pageIndex === headingPage && index === startIndex ? firstRest : normalize2(paragraph.text);
+        if (text === "" || PAGE_NUMBER.test(text)) continue;
+        if (referenceHeading(text) !== null) continue;
+        if (isSectionBoundary(text)) {
+          if (current !== null) pushEntry(entries, current);
+          current = null;
+          stopped = true;
+          break;
+        }
+        if (current === null) {
+          current = create(paragraph, page.pageIndex, text);
+          continue;
+        }
+        const line = paragraph.lines?.[0];
+        const columnChanged = Number.isInteger(line?.column) && Number.isInteger(current.column) && line.column !== current.column;
+        const indented = Number.isFinite(line?.x) && Number.isFinite(current.x) && line.x > current.x + 8;
+        const startsNew = columnChanged || !indented && (looksLikeAuthorYearStart(text) || page.pageIndex > current.lastPage && /[.!?。！？]$/.test(current.text));
+        if (startsNew) {
+          pushEntry(entries, current);
+          current = create(paragraph, page.pageIndex, text);
+          continue;
+        }
+        current.lastPage = page.pageIndex;
+        current.text = joinText2(current.text, text);
+      }
+    }
+    if (current !== null) pushEntry(entries, current);
+    return entries;
+  }
+  function parseReferenceEntries(pages, headingPage, firstRest, startIndex, style) {
+    const headingPageModel = pages.find((page) => page.pageIndex === headingPage);
+    const resolvedStyle = style ?? detectReferenceStyle(headingPageModel?.paragraphs ?? [], startIndex);
+    if (resolvedStyle === "unnumbered") {
+      return parseUnnumbered(pages, headingPage, firstRest, startIndex);
+    }
+    const entries = [];
+    let current = null;
+    let numbered = false;
+    let stopped = false;
+    for (const page of pages) {
+      if (stopped) break;
+      const paragraphs = Array.isArray(page.paragraphs) ? page.paragraphs : [];
+      const begin = page.pageIndex === headingPage ? startIndex : 0;
+      let pageContinuation = null;
+      for (let index = begin; index < paragraphs.length; index += 1) {
+        const paragraph = paragraphs[index];
+        let text = page.pageIndex === headingPage && index === startIndex ? firstRest : normalize2(paragraph.text);
+        if (text === "" || PAGE_NUMBER.test(text)) continue;
+        if (referenceHeading(text) !== null) continue;
+        if (isSectionBoundary(text)) {
+          if (current !== null) pushEntry(entries, current);
+          current = null;
+          stopped = true;
+          break;
+        }
+        const start = entryStart(text);
+        if (start !== null) {
+          numbered = true;
+          if (current !== null) pushEntry(entries, current);
+          pageContinuation = null;
+          const line = paragraph.lines?.[0];
+          current = {
+            label: start.label,
+            text: start.text,
+            pageIndex: page.pageIndex,
+            lastPage: page.pageIndex,
+            x: line?.x,
+            width: line?.width,
+            height: line?.height,
+            anchorTop: line?.top ?? paragraph.top,
+            paragraphId: paragraph.id
+          };
+          continue;
+        }
+        if (current !== null) {
+          if (page.pageIndex !== current.lastPage && pageContinuation === null) {
+            pageContinuation = isContinuationLine(paragraph, current);
+          }
+          if (page.pageIndex !== current.lastPage && pageContinuation === false) {
+            continue;
+          }
+          current.lastPage = page.pageIndex;
+          current.text = joinText2(current.text, text);
+          continue;
+        }
+        if (!numbered && (page.pageIndex > headingPage || index > startIndex)) {
+          if (entries.length >= MAX_ENTRIES) break;
+          entries.push({
+            id: `reference-${page.pageIndex}-${entries.length + 1}`,
+            label: "",
+            text,
+            pageIndex: page.pageIndex,
+            anchorTop: paragraph.lines?.[0]?.top ?? paragraph.top,
+            paragraphId: paragraph.id
+          });
+        }
+      }
+    }
+    if (current !== null) pushEntry(entries, current);
+    return entries;
+  }
+  async function readFollowingPages(pdf, library, start, end, signal, style = "numbered") {
+    const pages = [];
+    for (let pageIndex = start; pageIndex <= end; pageIndex += 1) {
+      if (signal?.aborted) break;
+      const model = await pageLinesFor(pdf, library, pageIndex, signal);
+      const first = model.paragraphs.find(
+        (paragraph) => normalize2(paragraph.text) !== "" && !PAGE_NUMBER.test(normalize2(paragraph.text))
+      );
+      if (first === void 0 || isSectionBoundary(first.text)) break;
+      if (style === "unnumbered") {
+        pages.push(model);
+        continue;
+      }
+      const hasNumbered = model.paragraphs.some(
+        (paragraph) => entryStart(normalize2(paragraph.text)) !== null
+      );
+      if (hasNumbered) {
+        pages.push(model);
+        continue;
+      }
+      pages.push(model);
+      break;
+    }
+    return pages;
+  }
+  async function extractReferences(pdf, outline, options = {}) {
+    if (pdf === void 0 || pdf === null) return null;
+    const signal = options.signal;
+    const library = options.library ?? await loadPdfJs();
+    const numPages = Number.isInteger(pdf.numPages) ? pdf.numPages : 0;
+    if (numPages === 0) return null;
+    const scanned = referenceScanPages(numPages, outline);
+    const candidates = [];
+    for (const pageIndex of scanned) {
+      if (signal?.aborted) return null;
+      const model = await pageLinesFor(pdf, library, pageIndex, signal);
+      for (let index = 0; index < model.paragraphs.length; index += 1) {
+        const heading = referenceHeading(model.paragraphs[index].text);
+        if (heading !== null) candidates.push({ pageIndex, index, heading, model });
+      }
+    }
+    candidates.sort(
+      (left, right) => left.pageIndex - right.pageIndex || left.index - right.index
+    );
+    for (const candidate of candidates) {
+      if (signal?.aborted) return null;
+      const style = detectReferenceStyle(candidate.model.paragraphs, candidate.index);
+      const following = await readFollowingPages(
+        pdf,
+        library,
+        candidate.pageIndex + 1,
+        Math.min(numPages - 1, candidate.pageIndex + MAX_SCAN_PAGES),
+        signal,
+        style
+      );
+      const entries = parseReferenceEntries(
+        [candidate.model, ...following],
+        candidate.pageIndex,
+        candidate.heading.rest,
+        candidate.index,
+        style
+      );
+      if (entries.length > 0) {
+        return {
+          heading: candidate.heading.heading,
+          pageIndex: candidate.pageIndex,
+          entries
+        };
+      }
+    }
+    return null;
   }
 
   // src/zip.js
@@ -1787,21 +3601,44 @@ var PdfMathReaderPlugin = (() => {
     "action.stop": "\u505C\u6B62",
     "action.export": "\u5BFC\u51FA",
     "action.exportMarkdown": "\u5BFC\u51FA\u53CC\u8BED Markdown",
-    "action.exportBundle": "\u5BFC\u51FA Markdown + \u516C\u5F0F\u56FE\u7247",
+    "action.exportBundle": "\u5BFC\u51FA Markdown + \u516C\u5F0F/\u56FE\u8868\u56FE\u7247",
     "action.exportHtml": "\u5BFC\u51FA\u5BF9\u7167 HTML",
     "action.settings": "\u8BBE\u7F6E",
     "action.translateSelection": "\u7FFB\u8BD1\u9009\u4E2D",
     "action.copy": "\u590D\u5236",
     "action.copied": "\u5DF2\u590D\u5236",
+    "action.copySource": "\u590D\u5236\u539F\u6587",
+    "action.copyTranslation": "\u590D\u5236\u8BD1\u6587",
+    "action.copyAuthors": "\u590D\u5236\u4F5C\u8005\u4FE1\u606F",
+    "action.copyPageSource": "\u590D\u5236\u672C\u9875\u539F\u6587",
+    "action.copyPageTranslation": "\u590D\u5236\u672C\u9875\u8BD1\u6587",
+    "action.copyReferences": "\u590D\u5236\u5168\u90E8\u53C2\u8003\u6587\u732E",
+    "model.label": "\u6A21\u578B",
+    "model.default": "\u8DDF\u968F\u9ED8\u8BA4",
+    "model.reasoning": "\u63A8\u7406",
+    "model.reasoningDefault": "\u9ED8\u8BA4",
+    "model.loading": "\u6B63\u5728\u52A0\u8F7D\u6A21\u578B\u2026",
+    "model.hint": "\u672C\u9762\u677F\u4F7F\u7528\u7684\u6A21\u578B\u4E0E\u63A8\u7406\u7B49\u7EA7",
     "action.retry": "\u91CD\u8BD5",
     "action.clear": "\u6E05\u9664",
     "rail.outline": "\u76EE\u5F55",
     "rail.pages": "\u9875\u9762",
+    "rail.references": "\u53C2\u8003\u8BBA\u6587",
+    "rail.referencesShort": "\u53C2\u8003",
+    "rail.referenceCount": "{count} \u7BC7\u53C2\u8003\u6587\u732E",
     "rail.noOutline": "\u6B64 PDF \u6CA1\u6709\u53EF\u7528\u7684\u76EE\u5F55\u3002",
     "rail.page": "\u7B2C {page} \u9875",
     "view.bilingual": "\u53CC\u8BED",
     "view.translation": "\u4EC5\u8BD1\u6587",
     "view.source": "\u4EC5\u539F\u6587",
+    "view.mode": "\u663E\u793A\u6A21\u5F0F",
+    "view.fontSize": "\u6B63\u6587\u5B57\u53F7",
+    "view.fontSmaller": "\u7F29\u5C0F\u5B57\u53F7",
+    "view.fontLarger": "\u653E\u5927\u5B57\u53F7",
+    "reading.authors": "\u4F5C\u8005\u4E0E\u5355\u4F4D",
+    "reading.authorCount": "{count} \u4F4D\u4F5C\u8005",
+    "reading.abstract": "\u6458\u8981",
+    "reading.keywords": "\u5173\u952E\u8BCD",
     "panel.translation": "\u8BD1\u6587",
     "panel.page": "\u7B2C {page} \u9875",
     "panel.waiting": "\u7FFB\u8BD1\u672C\u9875\u540E\uFF0C\u8BD1\u6587\u4F1A\u663E\u793A\u5728\u8FD9\u91CC\u3002",
@@ -1812,6 +3649,7 @@ var PdfMathReaderPlugin = (() => {
     "panel.retryHint": "\u53EF\u4EE5\u91CD\u8BD5\uFF1B\u5982\u679C\u53CD\u590D\u5931\u8D25\uFF0C\u8BD5\u8BD5\u51CF\u5C11\u4E00\u6B21\u7FFB\u8BD1\u7684\u6BB5\u843D\u6570\u3002",
     "panel.formulas": "\u516C\u5F0F\u3001\u5F15\u7528\u4E0E\u7F16\u53F7\u4F1A\u539F\u6837\u4FDD\u7559",
     "panel.equationCount": "{count} \u4E2A\u516C\u5F0F",
+    "panel.figureCount": "{count} \u5F20\u56FE\u8868",
     "panel.placeholderFailed": "{count} \u6BB5\u7684\u516C\u5F0F\u5360\u4F4D\u7B26\u6821\u9A8C\u5931\u8D25",
     "equation.label": "\u516C\u5F0F",
     "equation.numbered": "\u516C\u5F0F {number}",
@@ -1833,6 +3671,21 @@ var PdfMathReaderPlugin = (() => {
     "equation.emptyRegion": "\u6846\u9009\u533A\u57DF\u6CA1\u6709\u53EF\u8BC6\u522B\u7684\u6587\u672C\uFF0C\u8BF7\u91CD\u65B0\u6846\u9009\u3002",
     "equation.tooSmall": "\u6846\u9009\u533A\u57DF\u592A\u5C0F\uFF0C\u8BF7\u62D6\u62FD\u51FA\u5B8C\u6574\u516C\u5F0F\u3002",
     "equation.context": "\u516C\u5F0F {number}",
+    "figure.label": "\u56FE\u8868",
+    "figure.numbered": "\u56FE {number}",
+    "figure.unnumbered": "\u56FE\u8868",
+    "figure.auto": "\u81EA\u52A8\u8BC6\u522B",
+    "figure.locate": "\u5B9A\u4F4D\u5230\u56FE",
+    "figure.zoom": "\u653E\u5927\u67E5\u770B",
+    "figure.notFigure": "\u4E0D\u662F\u56FE\u8868",
+    "figure.removed": "\u5DF2\u53D6\u6D88\u56FE\u8868\u6807\u8BB0\uFF0C\u56FE\u5185\u6587\u5B57\u4F1A\u56DE\u5230\u6B63\u6587",
+    "figure.copyLabels": "\u590D\u5236\u56FE\u5185\u6587\u5B57",
+    "figure.rendering": "\u6B63\u5728\u751F\u6210\u56FE\u8868\u56FE\u2026",
+    "figure.renderFailed": "\u56FE\u8868\u88C1\u526A\u5931\u8D25\uFF0C\u53EF\u5728\u9875\u9762\u4E2D\u67E5\u770B\u539F\u56FE\u3002",
+    "figure.labels": "\u56FE\u5185\u6587\u5B57 {count} \u6761",
+    "figure.labelsHint": "\u8FD9\u4E9B\u6587\u5B57\u5C5E\u4E8E\u56FE\u5185\u6807\u6CE8\uFF0C\u968F\u56FE\u4FDD\u7559\uFF0C\u4E0D\u518D\u4F5C\u4E3A\u6B63\u6587\u6BB5\u843D\u7FFB\u8BD1\u3002",
+    "figure.labelsInline": "\u56FE\u5185\u6587\u5B57\uFF1A",
+    "figure.context": "\u56FE\u8868 {number}",
     "tab.translation": "\u8BD1\u6587",
     "tab.notes": "\u7B14\u8BB0",
     "tab.reading": "AI \u9605\u8BFB",
@@ -1920,6 +3773,8 @@ var PdfMathReaderPlugin = (() => {
     "toast.opened": "\u5DF2\u6253\u5F00 {name}",
     "toast.exporting": "\u6B63\u5728\u751F\u6210\u5BFC\u51FA\u6587\u4EF6\u2026",
     "toast.copied": "\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F",
+    "toast.noTranslation": "\u672C\u9875\u8FD8\u6CA1\u6709\u53EF\u590D\u5236\u7684\u8BD1\u6587",
+    "toast.noText": "\u6CA1\u6709\u53EF\u590D\u5236\u7684\u6587\u672C",
     "toast.exported": "\u5DF2\u5BFC\u51FA {name}",
     "toast.cancelled": "\u5DF2\u505C\u6B62\u7FFB\u8BD1",
     "toast.cacheCleared": "\u7FFB\u8BD1\u7F13\u5B58\u5DF2\u6E05\u9664",
@@ -1959,21 +3814,44 @@ var PdfMathReaderPlugin = (() => {
     "action.stop": "Stop",
     "action.export": "Export",
     "action.exportMarkdown": "Export bilingual Markdown",
-    "action.exportBundle": "Export Markdown + equation images",
+    "action.exportBundle": "Export Markdown + equation/figure images",
     "action.exportHtml": "Export reading HTML",
     "action.settings": "Settings",
     "action.translateSelection": "Translate selection",
     "action.copy": "Copy",
     "action.copied": "Copied",
+    "action.copySource": "Copy source",
+    "action.copyTranslation": "Copy translation",
+    "action.copyAuthors": "Copy authors",
+    "action.copyPageSource": "Copy page source",
+    "action.copyPageTranslation": "Copy page translation",
+    "action.copyReferences": "Copy all references",
+    "model.label": "Model",
+    "model.default": "Profile default",
+    "model.reasoning": "Reasoning",
+    "model.reasoningDefault": "Default",
+    "model.loading": "Loading models\u2026",
+    "model.hint": "Model and reasoning effort used by this panel",
     "action.retry": "Retry",
     "action.clear": "Clear",
     "rail.outline": "Contents",
     "rail.pages": "Pages",
+    "rail.references": "References",
+    "rail.referencesShort": "Refs",
+    "rail.referenceCount": "{count} references",
     "rail.noOutline": "This PDF has no outline.",
     "rail.page": "Page {page}",
     "view.bilingual": "Bilingual",
     "view.translation": "Translation",
     "view.source": "Source",
+    "view.mode": "Display mode",
+    "view.fontSize": "Reading font size",
+    "view.fontSmaller": "Smaller text",
+    "view.fontLarger": "Larger text",
+    "reading.authors": "Authors & affiliations",
+    "reading.authorCount": "{count} authors",
+    "reading.abstract": "Abstract",
+    "reading.keywords": "Keywords",
     "panel.translation": "Translation",
     "panel.page": "Page {page}",
     "panel.waiting": "Translate this page to see it here.",
@@ -1984,6 +3862,7 @@ var PdfMathReaderPlugin = (() => {
     "panel.retryHint": "Retry, or send fewer paragraphs in one batch if it keeps failing.",
     "panel.formulas": "Formulas, citations and numbering are preserved",
     "panel.equationCount": "{count} equations",
+    "panel.figureCount": "{count} figures",
     "panel.placeholderFailed": "Formula placeholder validation failed for {count} segments",
     "equation.label": "Equation",
     "equation.numbered": "Equation {number}",
@@ -2005,6 +3884,21 @@ var PdfMathReaderPlugin = (() => {
     "equation.emptyRegion": "No text was found inside the selected box. Try again.",
     "equation.tooSmall": "The selected box is too small. Drag around the whole equation.",
     "equation.context": "Equation {number}",
+    "figure.label": "Figure",
+    "figure.numbered": "Figure {number}",
+    "figure.unnumbered": "Figure",
+    "figure.auto": "Auto-detected",
+    "figure.locate": "Locate figure",
+    "figure.zoom": "Zoom in",
+    "figure.notFigure": "Not a figure",
+    "figure.removed": "Figure mark removed; its text returns to the body flow",
+    "figure.copyLabels": "Copy labels",
+    "figure.rendering": "Rendering figure\u2026",
+    "figure.renderFailed": "Could not crop the figure; view it on the page instead.",
+    "figure.labels": "{count} labels inside",
+    "figure.labelsHint": "These labels belong to the figure and stay with it; they are not translated as body paragraphs.",
+    "figure.labelsInline": "Labels inside the figure:",
+    "figure.context": "Figure {number}",
     "tab.translation": "Translation",
     "tab.notes": "Notes",
     "tab.reading": "AI reading",
@@ -2092,6 +3986,8 @@ var PdfMathReaderPlugin = (() => {
     "toast.opened": "Opened {name}",
     "toast.exporting": "Preparing the export\u2026",
     "toast.copied": "Copied to clipboard",
+    "toast.noTranslation": "No translated text on this page to copy yet",
+    "toast.noText": "No text to copy",
     "toast.exported": "Exported {name}",
     "toast.cancelled": "Translation stopped",
     "toast.cacheCleared": "Translation cache cleared",
@@ -2198,7 +4094,11 @@ var PdfMathReaderPlugin = (() => {
 .pmr-btn:disabled, .pmr-iconbtn:disabled, .pmr-tabbtn:disabled { opacity: .42; cursor: default; }
 .pmr-btn:focus-visible, .pmr-iconbtn:focus-visible, .pmr-tabbtn:focus-visible,
 .pmr-select:focus-visible, .pmr-input:focus-visible, .pmr-textarea:focus-visible,
-.pmr-seg:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.pmr-model-select:focus-visible,
+.pmr-viewswitch button:focus-visible, .pmr-fontctl button:focus-visible,
+.pmr-seg button:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px;
+}
 .pmr-btn-primary {
   background: var(--dsw-alias-brand-primary);
   color: #fff;
@@ -2263,6 +4163,66 @@ var PdfMathReaderPlugin = (() => {
 .pmr-outline-num { flex: 0 0 auto; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary); opacity: .75; }
 .pmr-outline-title { min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .pmr-empty-note { padding: 18px 12px; color: var(--dsw-alias-label-secondary); font-size: 11.5px; line-height: 1.5; }
+.pmr-reference-list { display: flex; flex-direction: column; gap: 2px; }
+.pmr-reference-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 7px 7px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.pmr-reference-copyall {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+.pmr-reference-copyall:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-reference-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 26px 6px 7px;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+  line-height: 1.45;
+  text-align: left;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pmr-reference-copy {
+  position: absolute;
+  top: 4px;
+  right: 2px;
+  width: 20px;
+  height: 20px;
+  opacity: 0;
+}
+.pmr-reference-row:hover .pmr-reference-copy { opacity: 1; }
+@media (hover: none) { .pmr-reference-copy { opacity: .8; } }
+.pmr-reference-num {
+  flex: 0 0 auto;
+  min-width: 17px;
+  text-align: right;
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+  opacity: .75;
+}
+.pmr-reference-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .pmr-thumbs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .pmr-thumb {
   display: flex;
@@ -2424,11 +4384,62 @@ var PdfMathReaderPlugin = (() => {
   background: var(--dsw-alias-bg-layer-1);
   overflow: hidden;
 }
-.pmr-tr-head { flex: 0 0 auto; padding: 9px 12px 8px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
-.pmr-tr-headrow { display: flex; align-items: center; gap: 8px; }
+.pmr-tr-head { flex: 0 0 auto; padding: 10px 14px 11px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.pmr-tr-headrow { display: flex; align-items: center; gap: 8px; min-height: 24px; }
 .pmr-tr-title { font-size: 12px; font-weight: 650; }
-.pmr-tr-pageno { font-size: 11px; color: var(--dsw-alias-label-secondary); }
+.pmr-tr-pageno { font-size: 11.5px; font-weight: 600; color: var(--dsw-alias-label-secondary); letter-spacing: .015em; }
 .pmr-tr-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+.pmr-fontctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  height: 24px;
+  padding: 0 2px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-base);
+}
+.pmr-fontctl button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 19px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pmr-fontctl button:hover:not(:disabled) { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-fontctl button:disabled { opacity: .35; cursor: default; }
+.pmr-fontctl-value { min-width: 18px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.pmr-modelbar { display: flex; align-items: center; gap: 6px; margin-top: 8px; min-width: 0; }
+.pmr-model-field { display: flex; align-items: center; gap: 5px; min-width: 0; flex: 1 1 0; }
+.pmr-model-field > span {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.pmr-model-field.is-reasoning { flex: 0 1 122px; }
+.pmr-model-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 26px;
+  padding: 0 5px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font-size: 10.5px;
+}
+.pmr-model-select:disabled { opacity: .6; }
+.pmr-model-state { flex: 0 0 auto; color: var(--dsw-alias-label-secondary); font-size: 9.5px; white-space: nowrap; }
 .pmr-seg {
   display: inline-flex;
   padding: 2px;
@@ -2438,7 +4449,39 @@ var PdfMathReaderPlugin = (() => {
 }
 .pmr-seg button { height: 23px; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); padding: 0 7px; font-size: 10.5px; cursor: pointer; }
 .pmr-seg button.is-active { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font-weight: 600; }
-.pmr-tr-hint { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: var(--dsw-alias-label-secondary); font-size: 10.5px; }
+.pmr-viewswitch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  margin-top: 8px;
+  padding: 3px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-base);
+}
+.pmr-viewswitch button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 29px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pmr-viewswitch button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-viewswitch button.is-active {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 11%, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-brand-primary);
+  font-weight: 650;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-brand-primary) 26%, transparent);
+}
+.pmr-tr-hint { display: flex; align-items: center; gap: 5px; margin-top: 8px; color: var(--dsw-alias-label-secondary); font-size: 10.5px; }
 .pmr-tr-tabs { display: flex; align-items: center; gap: 3px; }
 .pmr-rtab {
   display: inline-flex;
@@ -2468,7 +4511,17 @@ var PdfMathReaderPlugin = (() => {
   display: grid;
   place-items: center;
 }
-.pmr-tr-scroll { flex: 1 1 auto; overflow: auto; padding: 9px 10px 18px; }
+.pmr-tr-scroll {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 13px 14px 32px;
+  font-size: var(--pmr-reading-size, 16px);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pmr-seg-src, .pmr-seg-tr, .pmr-title-src, .pmr-title-tr,
+.pmr-abstract-src, .pmr-abstract-tr, .pmr-keywords-src, .pmr-keywords-tr,
+.pmr-author-name, .pmr-author-meta { user-select: text; -webkit-user-select: text; }
 .pmr-notes-pane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .pmr-return-row { flex: 0 0 auto; padding: 8px 10px 0; }
 .pmr-return-row .pmr-btn { height: 25px; padding: 0 8px; font-size: 10.5px; }
@@ -2514,6 +4567,8 @@ var PdfMathReaderPlugin = (() => {
 .pmr-note-card:hover, .pmr-note-card:focus-visible { border-color: var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); outline: none; }
 .pmr-note-meta { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
 .pmr-note-count { font-size: 9.5px; color: var(--dsw-alias-label-secondary); margin-left: auto; }
+.pmr-note-copy { width: 20px; height: 20px; flex: 0 0 auto; }
+.pmr-note-copy:hover { color: var(--dsw-alias-label-primary); }
 .pmr-note-delete { width: 20px; height: 20px; border: 0; border-radius: 5px; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; display: grid; place-items: center; }
 .pmr-note-delete:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-state-error-primary); }
 .pmr-note-source { color: var(--dsw-alias-label-secondary); font-size: 10.5px; line-height: 1.5; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
@@ -2521,6 +4576,7 @@ var PdfMathReaderPlugin = (() => {
 .pmr-chat-pane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 .pmr-chat-toolbar { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .pmr-chat-toolbar .pmr-btn { margin-left: auto; height: 24px; padding: 0 8px; font-size: 10.5px; }
+.pmr-chat-pane > .pmr-modelbar { padding: 0 10px; }
 .pmr-skill-row { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; padding: 7px 10px 0; }
 .pmr-skill-chip {
   display: inline-flex;
@@ -2568,7 +4624,9 @@ var PdfMathReaderPlugin = (() => {
   cursor: pointer;
 }
 .pmr-chat-examples button:hover { border-color: var(--dsw-alias-border-l2); color: var(--dsw-alias-label-primary); }
-.pmr-msg { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; align-items: flex-start; }
+.pmr-msg { position: relative; display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; align-items: flex-start; }
+.pmr-msg-copy { position: absolute; top: 2px; right: 2px; width: 22px; height: 22px; opacity: 0; }
+.pmr-msg:hover .pmr-msg-copy, .pmr-msg-copy:focus-visible { opacity: 1; }
 .pmr-msg.is-user { align-items: flex-end; }
 .pmr-msg-role { font-size: 9.5px; color: var(--dsw-alias-label-secondary); padding: 0 3px; }
 .pmr-msg-body {
@@ -2589,19 +4647,180 @@ var PdfMathReaderPlugin = (() => {
 .pmr-chat-compose .pmr-textarea { min-height: 56px; flex: 1 1 auto; resize: vertical; }
 .pmr-chat-compose .pmr-btn { height: 30px; flex: 0 0 auto; }
 .pmr-chat-foot { flex: 0 0 auto; padding: 0 10px 8px; color: var(--dsw-alias-label-secondary); font-size: 9.5px; line-height: 1.4; }
+.pmr-block-copy, .pmr-msg-copy, .pmr-note-copy, .pmr-reference-copy {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  opacity: .42;
+  transition: opacity .12s ease, color .12s ease;
+}
+.pmr-block-copy { position: absolute; top: 4px; right: 4px; z-index: 2; width: 22px; height: 22px; }
+.pmr-block-copy:hover, .pmr-msg-copy:hover, .pmr-note-copy:hover, .pmr-reference-copy:hover,
+.pmr-block-copy:focus-visible, .pmr-msg-copy:focus-visible, .pmr-note-copy:focus-visible,
+.pmr-reference-copy:focus-visible {
+  opacity: 1;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-seg-card:hover .pmr-block-copy,
+.pmr-title-block:hover .pmr-block-copy,
+.pmr-author-block:hover .pmr-block-copy,
+.pmr-article-block:hover .pmr-block-copy { opacity: 1; }
+@media (hover: none) { .pmr-block-copy { opacity: .8; } }
 .pmr-seg-card {
   position: relative;
-  padding: 8px 9px 9px;
+  margin: 0 2px 12px;
+  padding: 6px 24px 7px 8px;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: 9px;
   cursor: pointer;
   transition: background .12s ease, border-color .12s ease;
 }
 .pmr-seg-card:hover { background: var(--dsw-alias-bg-layer-2); }
 .pmr-seg-card.is-active { border-color: var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); }
-.pmr-seg-src { font-size: 11.5px; line-height: 1.55; color: var(--dsw-alias-label-secondary); }
-.pmr-seg-tr { margin-top: 5px; font-size: 12.5px; line-height: 1.6; color: var(--dsw-alias-label-primary); }
-.pmr-seg-tr.is-placeholder { color: var(--dsw-alias-label-secondary); font-style: italic; }
+.pmr-seg-src {
+  font-size: calc(var(--pmr-reading-size, 16px) - 2.5px);
+  line-height: 1.62;
+  color: color-mix(in srgb, var(--dsw-alias-label-primary) 76%, transparent);
+  letter-spacing: .004em;
+}
+.pmr-seg-tr {
+  margin-top: 5px;
+  font-size: var(--pmr-reading-size, 16px);
+  line-height: 1.74;
+  color: var(--dsw-alias-label-primary);
+  letter-spacing: .006em;
+}
+.pmr-seg-card.is-heading { margin-top: 28px; margin-bottom: 10px; padding: 2px 5px; }
+.pmr-seg-card.is-heading .pmr-seg-src {
+  font-size: calc(var(--pmr-reading-size, 16px) - 1px);
+  font-weight: 650;
+  line-height: 1.42;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-seg-card.is-heading .pmr-seg-tr {
+  margin-top: 4px;
+  font-size: calc(var(--pmr-reading-size, 16px) + 1px);
+  font-weight: 650;
+  line-height: 1.42;
+}
+.pmr-seg-tr.is-placeholder { color: var(--dsw-alias-label-secondary); font-style: italic; font-size: 12px; }
+
+.pmr-title-block {
+  position: relative;
+  margin: 4px 0 10px;
+  padding: 8px 26px 15px 5px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  cursor: pointer;
+}
+.pmr-title-src {
+  font-size: calc(var(--pmr-reading-size, 16px) + 5px);
+  line-height: 1.3;
+  font-weight: 720;
+  letter-spacing: -.012em;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-title-tr {
+  margin-top: 9px;
+  font-size: calc(var(--pmr-reading-size, 16px) + 4px);
+  line-height: 1.38;
+  font-weight: 700;
+  letter-spacing: -.004em;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-title-tr.is-placeholder { margin-top: 6px; font-size: 12px; font-weight: 400; color: var(--dsw-alias-label-secondary); font-style: italic; }
+.pmr-title-block.is-active { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent); }
+
+.pmr-author-block {
+  position: relative;
+  margin: 2px 0 20px;
+  padding: 2px 26px 2px 5px;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.pmr-author-block.is-active { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent); }
+.pmr-article-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; }
+.pmr-article-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--dsw-alias-brand-primary);
+}
+.pmr-article-orig { font-size: 10.5px; color: var(--dsw-alias-label-secondary); letter-spacing: .02em; }
+.pmr-author-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 14px; }
+.pmr-author { min-width: 0; }
+.pmr-author-name {
+  font-size: calc(var(--pmr-reading-size, 16px) - 1.5px);
+  font-weight: 650;
+  line-height: 1.35;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-author-marks { margin-left: 1px; font-size: .62em; font-weight: 500; color: var(--dsw-alias-brand-primary); }
+.pmr-author-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px 8px;
+  margin-top: 2px;
+  font-size: calc(var(--pmr-reading-size, 16px) - 4.5px);
+  line-height: 1.5;
+  color: var(--dsw-alias-label-secondary);
+}
+.pmr-author-aff { color: color-mix(in srgb, var(--dsw-alias-label-primary) 72%, transparent); }
+.pmr-author-aff-tr { color: var(--dsw-alias-label-secondary); }
+.pmr-author-aff-tr::before { content: '· '; }
+.pmr-author-email { color: color-mix(in srgb, var(--dsw-alias-brand-primary) 82%, var(--dsw-alias-label-primary)); text-decoration: none; overflow-wrap: anywhere; }
+.pmr-author-email:hover { text-decoration: underline; }
+
+.pmr-article-block { position: relative; margin: 18px 0 20px; padding: 2px 26px 2px 5px; border-radius: 9px; cursor: pointer; }
+.pmr-abstract.is-continuation { margin-top: -10px; }
+.pmr-article-block.is-active { background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent); }
+.pmr-abstract-src {
+  font-size: calc(var(--pmr-reading-size, 16px) - 2px);
+  line-height: 1.68;
+  color: color-mix(in srgb, var(--dsw-alias-label-primary) 78%, transparent);
+}
+.pmr-abstract-tr {
+  margin-top: 7px;
+  font-size: var(--pmr-reading-size, 16px);
+  line-height: 1.8;
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-abstract-tr.is-placeholder, .pmr-keywords-tr.is-placeholder {
+  color: var(--dsw-alias-label-secondary);
+  font-style: italic;
+  font-size: 12px;
+}
+.pmr-keywords { margin-top: 14px; }
+.pmr-keywords-src {
+  font-size: calc(var(--pmr-reading-size, 16px) - 2px);
+  line-height: 1.65;
+  color: color-mix(in srgb, var(--dsw-alias-label-primary) 78%, transparent);
+}
+.pmr-keywords-tr { margin-top: 5px; font-size: var(--pmr-reading-size, 16px); line-height: 1.7; color: var(--dsw-alias-label-primary); }
+
+.pmr-tr-scroll[data-mode="translation"] .pmr-seg-card {
+  margin: 0 0 14px;
+  padding: 0 24px 0 5px;
+  border-color: transparent;
+  background: transparent;
+}
+.pmr-tr-scroll[data-mode="translation"] .pmr-seg-card:hover { background: transparent; }
+.pmr-tr-scroll[data-mode="translation"] .pmr-seg-card.is-active {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 5%, transparent);
+}
+.pmr-tr-scroll[data-mode="translation"] .pmr-seg-card.is-heading { margin-top: 28px; margin-bottom: 10px; }
+.pmr-tr-scroll[data-mode="translation"] .pmr-seg-tr { margin-top: 0; }
+.pmr-tr-scroll[data-mode="translation"] .pmr-title-block,
+.pmr-tr-scroll[data-mode="translation"] .pmr-author-block,
+.pmr-tr-scroll[data-mode="translation"] .pmr-article-block {
+  background: transparent;
+}
 .pmr-seg-err { margin-top: 5px; font-size: 11px; color: var(--dsw-alias-state-error-primary); }
 .pmr-seg-skeleton { height: 10px; margin-top: 7px; border-radius: 4px; background: var(--dsw-alias-bg-layer-2); animation: pmr-pulse 1.25s ease-in-out infinite; }
 .pmr-seg-skeleton.short { width: 62%; }
@@ -2686,6 +4905,30 @@ var PdfMathReaderPlugin = (() => {
 .pmr-eq-foot { display: flex; align-items: center; gap: 8px; margin-top: 5px; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
 .pmr-eq-count { margin-left: auto; font-variant-numeric: tabular-nums; opacity: .7; }
 .pmr-eq-count-badge { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-count-badges { margin-left: auto; display: inline-flex; gap: 6px; }
+.pmr-count-badges .pmr-eq-count-badge { margin-left: 0; }
+.pmr-fig-labels { margin-top: 6px; padding-top: 5px; border-top: 1px dashed var(--dsw-alias-border-l1); }
+.pmr-fig-labels summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+  list-style-position: inside;
+}
+.pmr-fig-labels summary:hover { color: var(--dsw-alias-label-primary); }
+.pmr-fig-note { margin: 5px 0 0; color: var(--dsw-alias-label-secondary); font-size: 9.5px; line-height: 1.45; }
+.pmr-fig-label-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.pmr-fig-label {
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 9.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.pmr-fig-card .pmr-eq-scroll { min-height: 60px; }
 .pmr-eq-reset { display: flex; justify-content: center; padding: 4px 0 10px; }
 .pmr-eq-reset .pmr-btn { height: 24px; padding: 0 8px; font-size: 10px; }
 .pmr-eq-hl { background: rgba(37,99,235,.16); box-shadow: inset 0 0 0 1.5px rgba(37,99,235,.5); }
@@ -2975,7 +5218,7 @@ var PdfMathReaderPlugin = (() => {
   var NOTES_KEY = "pdf-math-reader.notes.v1";
   var EQUATIONS_KEY = "pdf-math-reader.equations.v1";
   var PANEL_ID = "pdf-math-reader";
-  var EMPTY_OVERRIDES = { added: [], removed: [] };
+  var EMPTY_OVERRIDES = { added: [], removed: [], figures: [] };
   var PANEL_ICON = "/pdf-reader/assets/icon-128.png";
   var LANGUAGES = [
     { id: "zh-CN", label: "\u7B80\u4F53\u4E2D\u6587" },
@@ -3016,13 +5259,29 @@ var PdfMathReaderPlugin = (() => {
       return `note-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
   }
+  function normalizeModelSelection(value) {
+    if (value === null || typeof value !== "object") return null;
+    const provider = typeof value.provider === "string" ? value.provider.trim() : "";
+    const model = typeof value.model === "string" ? value.model.trim() : "";
+    if (provider === "" || model === "") return null;
+    const reasoningEffort = typeof value.reasoningEffort === "string" ? value.reasoningEffort.trim() : "";
+    return {
+      provider,
+      model,
+      ...reasoningEffort === "" ? {} : { reasoningEffort }
+    };
+  }
   function loadSettings() {
     const fallback = {
       targetLanguage: "zh-CN",
       glossaryText: "",
       saveDir: "",
       railWidth: 218,
-      translationWidth: 390
+      translationWidth: 390,
+      viewMode: "bilingual",
+      readingFontSize: 16,
+      translationSelection: null,
+      chatSelection: null
     };
     try {
       const raw = window.localStorage?.getItem(SETTINGS_KEY);
@@ -3037,7 +5296,11 @@ var PdfMathReaderPlugin = (() => {
         glossaryText: typeof parsed?.glossaryText === "string" ? parsed.glossaryText : "",
         saveDir: typeof parsed?.saveDir === "string" ? parsed.saveDir : "",
         railWidth: width(parsed?.railWidth, 160, 380, fallback.railWidth),
-        translationWidth: width(parsed?.translationWidth, 300, 640, fallback.translationWidth)
+        translationWidth: width(parsed?.translationWidth, 300, 640, fallback.translationWidth),
+        viewMode: ["bilingual", "translation", "source"].includes(parsed?.viewMode) ? parsed.viewMode : fallback.viewMode,
+        readingFontSize: width(parsed?.readingFontSize, 13, 22, fallback.readingFontSize),
+        translationSelection: normalizeModelSelection(parsed?.translationSelection),
+        chatSelection: normalizeModelSelection(parsed?.chatSelection)
       };
     } catch {
       return fallback;
@@ -3071,8 +5334,9 @@ var PdfMathReaderPlugin = (() => {
           if (!Number.isInteger(index) || index < 0) continue;
           const added = Array.isArray(entry?.added) ? entry.added.map((item) => normalizeBox(item?.bbox)).filter((box) => box !== null).map((box) => ({ bbox: box })).slice(0, 200) : [];
           const removed = Array.isArray(entry?.removed) ? entry.removed.map(normalizeBox).filter((box) => box !== null).slice(0, 200) : [];
-          if (added.length === 0 && removed.length === 0) continue;
-          pageMap[index] = { added, removed };
+          const figures = Array.isArray(entry?.figures) ? entry.figures.map(normalizeBox).filter((box) => box !== null).slice(0, 200) : [];
+          if (added.length === 0 && removed.length === 0 && figures.length === 0) continue;
+          pageMap[index] = { added, removed, figures };
         }
         if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap;
       }
@@ -3087,7 +5351,8 @@ var PdfMathReaderPlugin = (() => {
     if (entry === null || entry === void 0) return EMPTY_OVERRIDES;
     return {
       added: Array.isArray(entry.added) ? entry.added : [],
-      removed: Array.isArray(entry.removed) ? entry.removed : []
+      removed: Array.isArray(entry.removed) ? entry.removed : [],
+      figures: Array.isArray(entry.figures) ? entry.figures : []
     };
   }
   function baseName(name) {
@@ -3359,22 +5624,79 @@ var PdfMathReaderPlugin = (() => {
       }
     );
   }
-  function SegmentCard({
-    tt,
-    paragraph,
-    translation,
-    status,
-    mode,
+  function TranslationBlock({ tt, translation, status, error, onRetry, className }) {
+    if (error) {
+      return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-seg-err", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: error }),
+        onRetry !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "button",
+          {
+            type: "button",
+            className: "pmr-seg-retry",
+            onClick: (event) => {
+              event.stopPropagation();
+              onRetry();
+            },
+            children: tt("action.retry")
+          }
+        )
+      ] });
+    }
+    if (translation?.text) return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className, children: translation.text });
+    if (status === "loading") {
+      return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton" }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton short" })
+      ] });
+    }
+    if (status === "error") return null;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: `${className} is-placeholder`, children: tt("panel.waiting") });
+  }
+  function exportAuthorLine(author, pageTranslation) {
+    const translated = author.affiliationId ? pageTranslation?.[author.affiliationId]?.text : void 0;
+    const showTranslation = typeof translated === "string" && translated.trim() !== "" && translated !== author.affiliation;
+    const affiliation = showTranslation ? `${author.affiliation} / ${translated}` : author.affiliation;
+    return [
+      `${author.name}${author.marks ? ` ${author.marks}` : ""}`,
+      affiliation,
+      author.email
+    ].filter(Boolean).join(" \xB7 ");
+  }
+  function CopyButton({ tt, text, label, onCopy, className = "pmr-block-copy" }) {
+    if (onCopy === void 0 || text === void 0 || text === "") return null;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+      "button",
+      {
+        type: "button",
+        className,
+        title: label ?? tt("action.copy"),
+        "aria-label": label ?? tt("action.copy"),
+        onClick: (event) => {
+          event.stopPropagation();
+          onCopy(text);
+        },
+        children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "copy", size: 11 })
+      }
+    );
+  }
+  function BlockShell({
     active,
-    error,
-    onRetry,
-    onClick
+    onClick,
+    className,
+    children,
+    onCopy,
+    copyText,
+    copyLabel,
+    tt
   }) {
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
       "div",
       {
-        className: `pmr-seg-card ${active ? "is-active" : ""}`,
-        onClick,
+        className: `${className} ${active ? "is-active" : ""}`,
+        onClick: (event) => {
+          if ((window.getSelection()?.toString().trim() ?? "") !== "") return;
+          onClick(event);
+        },
         role: "button",
         tabIndex: 0,
         onKeyDown: (event) => {
@@ -3384,56 +5706,323 @@ var PdfMathReaderPlugin = (() => {
           }
         },
         children: [
-          mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-src", children: paragraph.text }),
-          mode !== "source" && (error ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-seg-err", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: error }),
-            onRetry !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-              "button",
-              {
-                type: "button",
-                className: "pmr-seg-retry",
-                onClick: (event) => {
-                  event.stopPropagation();
-                  onRetry();
-                },
-                children: tt("action.retry")
-              }
-            )
-          ] }) : translation?.text ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-tr", children: translation.text }) : status === "loading" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton" }),
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-skeleton short" })
-          ] }) : status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-err", children: tt("error.translate") }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-tr is-placeholder", children: tt("panel.waiting") }))
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(CopyButton, { tt, text: copyText, label: copyLabel, onCopy }),
+          children
         ]
       }
     );
   }
-  function EquationBlock({
+  function ModelControls({ tt, catalog, value, onChange, disabled = false, fallback }) {
+    const models = Array.isArray(catalog.models) ? catalog.models : [];
+    const selectionId = (provider, model) => `${encodeURIComponent(provider)}|${encodeURIComponent(model)}`;
+    const selectedKey = value === null ? "" : selectionId(value.provider, value.model);
+    const lookup = value ?? (fallback?.provider && fallback?.model ? { provider: fallback.provider, model: fallback.model } : void 0);
+    const current = models.find(
+      (entry) => entry.provider === lookup?.provider && entry.id === lookup?.model
+    );
+    const providers = Array.isArray(catalog.providers) ? catalog.providers : [];
+    const groups = /* @__PURE__ */ new Map();
+    for (const entry of models) {
+      if (!groups.has(entry.provider)) groups.set(entry.provider, []);
+      groups.get(entry.provider).push(entry);
+    }
+    const providerName = (id) => providers.find((entry) => entry.id === id)?.name ?? id;
+    const efforts = Array.isArray(current?.reasoning?.efforts) ? current.reasoning.efforts : [];
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-modelbar", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("label", { className: "pmr-model-field", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("model.label") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+          "select",
+          {
+            className: "pmr-model-select",
+            value: selectedKey,
+            disabled: disabled || catalog.status === "loading",
+            "aria-label": tt("model.label"),
+            title: catalog.status === "error" ? catalog.error : tt("model.hint"),
+            onChange: (event) => {
+              const nextKey = event.target.value;
+              if (nextKey === "") {
+                onChange(null);
+                return;
+              }
+              const [provider, model] = nextKey.split("|").map((part) => decodeURIComponent(part));
+              onChange({ provider, model });
+            },
+            children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("option", { value: "", children: tt("model.default") }),
+              [...groups.entries()].map(([provider, entries]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("optgroup", { label: providerName(provider), children: entries.map((entry) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "option",
+                {
+                  value: selectionId(entry.provider, entry.id),
+                  children: entry.name || entry.id
+                },
+                `${entry.provider}:${entry.id}`
+              )) }, provider)),
+              value !== null && current === void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("option", { value: selectedKey, children: `${value.provider}/${value.model}` })
+            ]
+          }
+        )
+      ] }),
+      efforts.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("label", { className: "pmr-model-field is-reasoning", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("model.reasoning") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+          "select",
+          {
+            className: "pmr-model-select",
+            value: value?.reasoningEffort ?? "",
+            disabled,
+            "aria-label": tt("model.reasoning"),
+            onChange: (event) => {
+              const provider = value?.provider ?? fallback?.provider;
+              const model = value?.model ?? fallback?.model;
+              if (!provider || !model) return;
+              const effort = event.target.value;
+              onChange({
+                provider,
+                model,
+                ...effort === "" ? {} : { reasoningEffort: effort }
+              });
+            },
+            children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("option", { value: "", children: tt("model.reasoningDefault") }),
+              efforts.map((effort) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("option", { value: effort.id, children: effort.name || effort.id }, effort.id))
+            ]
+          }
+        )
+      ] }),
+      catalog.status === "loading" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-model-state", children: tt("model.loading") })
+    ] });
+  }
+  function TitleBlock({
     tt,
-    equation,
-    pdf,
-    fingerprint,
-    pageIndex,
-    cache,
-    cacheVersion,
+    block,
+    translation,
+    status,
+    mode,
     active,
-    onLocate,
-    onRemove,
+    error,
+    onRetry,
+    onClick,
     onCopy
   }) {
+    const copyValue = mode === "source" ? block.text : translation?.text || block.text;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      BlockShell,
+      {
+        className: "pmr-title-block",
+        active,
+        onClick,
+        tt,
+        onCopy,
+        copyText: copyValue,
+        copyLabel: mode !== "source" && translation?.text ? tt("action.copyTranslation") : tt("action.copySource"),
+        children: [
+          mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-title-src", children: block.text }),
+          mode !== "source" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            TranslationBlock,
+            {
+              tt,
+              translation,
+              status,
+              error,
+              onRetry,
+              className: "pmr-title-tr"
+            }
+          )
+        ]
+      }
+    );
+  }
+  function AuthorBlock({ tt, block, mode, active, onClick, pageTranslation, onCopy }) {
+    const copyValue = block.authors.map(
+      (author) => [
+        `${author.name}${author.marks ? ` ${author.marks}` : ""}`,
+        author.affiliation,
+        author.email
+      ].filter(Boolean).join(" \xB7 ")
+    ).join("\n");
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      BlockShell,
+      {
+        className: "pmr-author-block",
+        active,
+        onClick,
+        tt,
+        onCopy,
+        copyText: copyValue,
+        copyLabel: tt("action.copyAuthors"),
+        children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-article-head", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-label", children: tt("reading.authors") }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-orig", children: tt("reading.authorCount", { count: block.authors.length }) })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-author-grid", children: block.authors.map((author, index) => {
+            const translated = author.affiliationId ? pageTranslation[author.affiliationId]?.text : void 0;
+            const affiliation = mode === "translation" && translated ? translated : author.affiliation;
+            return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-author", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-author-name", children: [
+                author.name,
+                author.marks !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("sup", { className: "pmr-author-marks", children: author.marks })
+              ] }),
+              (affiliation !== "" || author.email !== "") && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-author-meta", children: [
+                affiliation !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                  "span",
+                  {
+                    className: "pmr-author-aff",
+                    title: mode === "bilingual" && translated && translated !== affiliation ? translated : void 0,
+                    children: affiliation
+                  }
+                ),
+                author.email !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                  "a",
+                  {
+                    className: "pmr-author-email",
+                    href: `mailto:${author.email}`,
+                    onClick: (event) => event.stopPropagation(),
+                    children: author.email
+                  }
+                )
+              ] })
+            ] }, `${author.name}-${index}`);
+          }) })
+        ]
+      }
+    );
+  }
+  function AbstractBlock({
+    tt,
+    block,
+    translation,
+    status,
+    mode,
+    active,
+    error,
+    onRetry,
+    onClick,
+    onCopy
+  }) {
+    const label = tt("reading.abstract");
+    const copyValue = mode === "source" ? block.text : translation?.text || block.text;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      BlockShell,
+      {
+        className: `pmr-article-block pmr-abstract ${block.partIndex > 0 ? "is-continuation" : ""}`,
+        active,
+        onClick,
+        tt,
+        onCopy,
+        copyText: copyValue,
+        copyLabel: mode !== "source" && translation?.text ? tt("action.copyTranslation") : tt("action.copySource"),
+        children: [
+          block.showLabel !== false && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-article-head", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-label", children: label }),
+            block.heading !== "" && block.heading.toLowerCase() !== label.toLowerCase() && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-orig", children: block.heading })
+          ] }),
+          mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-abstract-src", children: block.text }),
+          mode !== "source" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            TranslationBlock,
+            {
+              tt,
+              translation,
+              status,
+              error,
+              onRetry,
+              className: "pmr-abstract-tr"
+            }
+          )
+        ]
+      }
+    );
+  }
+  function KeywordsBlock({
+    tt,
+    block,
+    translation,
+    status,
+    mode,
+    active,
+    error,
+    onRetry,
+    onClick,
+    onCopy
+  }) {
+    const label = tt("reading.keywords");
+    const copyValue = mode === "source" ? block.text : translation?.text || block.text;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      BlockShell,
+      {
+        className: "pmr-article-block pmr-keywords",
+        active,
+        onClick,
+        tt,
+        onCopy,
+        copyText: copyValue,
+        copyLabel: mode !== "source" && translation?.text ? tt("action.copyTranslation") : tt("action.copySource"),
+        children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-article-head", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-label", children: label }),
+            block.heading !== "" && block.heading.toLowerCase() !== label.toLowerCase() && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-article-orig", children: block.heading })
+          ] }),
+          mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-keywords-src", children: block.text }),
+          mode !== "source" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            TranslationBlock,
+            {
+              tt,
+              translation,
+              status,
+              error,
+              onRetry,
+              className: "pmr-keywords-tr"
+            }
+          )
+        ]
+      }
+    );
+  }
+  function SegmentCard({
+    tt,
+    block,
+    translation,
+    status,
+    mode,
+    active,
+    error,
+    onRetry,
+    onClick,
+    onCopy
+  }) {
+    const paragraph = block.paragraph;
+    const copyValue = mode === "source" ? paragraph.text : translation?.text || paragraph.text;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+      BlockShell,
+      {
+        className: `pmr-seg-card ${block.role === "heading" ? "is-heading" : ""}`,
+        active,
+        onClick,
+        tt,
+        onCopy,
+        copyText: copyValue,
+        copyLabel: mode !== "source" && translation?.text ? tt("action.copyTranslation") : tt("action.copySource"),
+        children: [
+          mode !== "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg-src", children: paragraph.text }),
+          mode !== "source" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            TranslationBlock,
+            {
+              tt,
+              translation,
+              status,
+              error,
+              onRetry,
+              className: "pmr-seg-tr"
+            }
+          )
+        ]
+      }
+    );
+  }
+  function useCropImage({ pdf, pageIndex, cache, cacheKey, cropBbox, displayWidth, cacheVersion }) {
     const [image, setImage] = (0, import_react2.useState)({ status: "loading" });
-    const [zoomOpen, setZoomOpen] = (0, import_react2.useState)(false);
-    const cropBbox = equation.imageBbox ?? equation.bbox;
-    const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0]);
-    const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7));
     const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-    const cacheKey = [
-      fingerprint,
-      pageIndex,
-      equation.id,
-      cropBbox.map((value) => Math.round(value * 10) / 10).join(","),
-      Math.round(displayWidth),
-      dpr
-    ].join(":");
     (0, import_react2.useEffect)(() => {
       let cancelled = false;
       let promise = cache.current.get(cacheKey);
@@ -3461,16 +6050,44 @@ var PdfMathReaderPlugin = (() => {
       return () => {
         cancelled = true;
       };
-    }, [
+    }, [cache, cacheKey, cropBbox, displayWidth, dpr, pageIndex, pdf, cacheVersion]);
+    return image;
+  }
+  function EquationBlock({
+    tt,
+    equation,
+    pdf,
+    fingerprint,
+    pageIndex,
+    cache,
+    cacheVersion,
+    active,
+    onLocate,
+    onRemove,
+    onCopy
+  }) {
+    const [zoomOpen, setZoomOpen] = (0, import_react2.useState)(false);
+    const cropBbox = equation.imageBbox ?? equation.bbox;
+    const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0]);
+    const displayWidth = Math.min(760, Math.max(140, bboxWidth * 1.7));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const cacheKey = [
+      fingerprint,
+      pageIndex,
+      equation.id,
+      cropBbox.map((value) => Math.round(value * 10) / 10).join(","),
+      Math.round(displayWidth),
+      dpr
+    ].join(":");
+    const image = useCropImage({
+      pdf,
+      pageIndex,
       cache,
       cacheKey,
       cropBbox,
-      dpr,
       displayWidth,
-      pageIndex,
-      pdf,
       cacheVersion
-    ]);
+    });
     (0, import_react2.useEffect)(() => {
       if (!zoomOpen) return void 0;
       const onKeyDown = (event) => {
@@ -3594,6 +6211,161 @@ $$`),
       }
     );
   }
+  function FigureBlock({
+    tt,
+    figure,
+    pdf,
+    fingerprint,
+    pageIndex,
+    cache,
+    cacheVersion,
+    active,
+    onLocate,
+    onRemove,
+    onCopy
+  }) {
+    const [zoomOpen, setZoomOpen] = (0, import_react2.useState)(false);
+    const cropBbox = figure.imageBbox ?? figure.bbox;
+    const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0]);
+    const displayWidth = Math.min(760, Math.max(160, bboxWidth * 1.7));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    const cacheKey = [
+      fingerprint,
+      pageIndex,
+      figure.id,
+      cropBbox.map((value) => Math.round(value * 10) / 10).join(","),
+      Math.round(displayWidth),
+      dpr
+    ].join(":");
+    const image = useCropImage({
+      pdf,
+      pageIndex,
+      cache,
+      cacheKey,
+      cropBbox,
+      displayWidth,
+      cacheVersion
+    });
+    (0, import_react2.useEffect)(() => {
+      if (!zoomOpen) return void 0;
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") setZoomOpen(false);
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    }, [zoomOpen]);
+    const label = figure.figureNumber === null || figure.figureNumber === void 0 ? tt("figure.unnumbered") : tt("figure.numbered", { number: figure.figureNumber });
+    const labels = Array.isArray(figure.labels) ? figure.labels : [];
+    const labelText = labels.map((line) => line.text).join("\n");
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: `pmr-eq-card pmr-fig-card ${active ? "is-active" : ""}`, "aria-label": label, children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "pmr-eq-head", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-label", children: label }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-badge", children: tt("figure.auto") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-actions", children: [
+          labelText !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
+              onClick: () => onCopy(labelText),
+              title: tt("figure.copyLabels"),
+              "aria-label": tt("figure.copyLabels"),
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "copy", size: 12 })
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
+              onClick: () => onLocate(figure),
+              title: tt("figure.locate"),
+              "aria-label": tt("figure.locate"),
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "search", size: 12 })
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
+              onClick: () => setZoomOpen(true),
+              title: tt("figure.zoom"),
+              "aria-label": tt("figure.zoom"),
+              disabled: image.status !== "ready",
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "expand", size: 12 })
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
+              className: "pmr-eq-remove",
+              onClick: () => onRemove(figure),
+              title: tt("figure.notFigure"),
+              "aria-label": tt("figure.notFigure"),
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 11 })
+            }
+          )
+        ] })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+        "div",
+        {
+          className: "pmr-eq-scroll",
+          role: "button",
+          tabIndex: 0,
+          onClick: () => onLocate(figure),
+          onKeyDown: (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              onLocate(figure);
+            }
+          },
+          children: image.status === "ready" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "img",
+            {
+              className: "pmr-eq-image",
+              src: image.dataUrl,
+              width: image.width,
+              height: image.height,
+              alt: figure.caption ?? label,
+              draggable: false
+            }
+          ) : image.status === "error" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-fallback", children: tt("figure.renderFailed") }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-loading", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
+            tt("figure.rendering")
+          ] })
+        }
+      ),
+      labels.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("details", { className: "pmr-fig-labels", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("summary", { children: tt("figure.labels", { count: labels.length }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "pmr-fig-note", children: tt("figure.labelsHint") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-fig-label-list", children: labels.map((line, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-fig-label", children: line.text }, `${figure.id}-label-${index}`)) })
+      ] }),
+      zoomOpen && image.status === "ready" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal", role: "dialog", "aria-label": label, onClick: () => setZoomOpen(false), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-body", onClick: (event) => event.stopPropagation(), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label }),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
+              className: "pmr-iconbtn",
+              onClick: () => setZoomOpen(false),
+              "aria-label": tt("action.close"),
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 14 })
+            }
+          )
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal-scroll", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "img",
+          {
+            src: image.dataUrl,
+            alt: figure.caption ?? label,
+            style: { width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: "none" },
+            draggable: false
+          }
+        ) })
+      ] }) })
+    ] });
+  }
   var ReaderErrorBoundary = class extends import_react2.Component {
     constructor(props) {
       super(props);
@@ -3671,6 +6443,13 @@ $$`),
     const tt = useT(t);
     const [settings, setSettings] = (0, import_react2.useState)(loadSettings);
     const [health, setHealth] = (0, import_react2.useState)({ status: "loading" });
+    const translationSelectionKey = settings.translationSelection === null ? null : `${settings.translationSelection.provider}/${settings.translationSelection.model}/${settings.translationSelection.reasoningEffort ?? ""}`;
+    const [catalog, setCatalog] = (0, import_react2.useState)({
+      status: "loading",
+      providers: [],
+      models: [],
+      warnings: []
+    });
     const [doc, setDoc] = (0, import_react2.useState)(null);
     const [opening, setOpening] = (0, import_react2.useState)(false);
     const [openError, setOpenError] = (0, import_react2.useState)("");
@@ -3685,10 +6464,16 @@ $$`),
     const [zoomMode, setZoomMode] = (0, import_react2.useState)("fit");
     const [zoom, setZoom] = (0, import_react2.useState)(1.2);
     const [railTab, setRailTab] = (0, import_react2.useState)("outline");
+    const [references, setReferences] = (0, import_react2.useState)({
+      status: "idle",
+      heading: "",
+      pageIndex: null,
+      entries: []
+    });
     const [leftOpen, setLeftOpen] = (0, import_react2.useState)(true);
     const [rightOpen, setRightOpen] = (0, import_react2.useState)(true);
     const [rightTab, setRightTab] = (0, import_react2.useState)("translation");
-    const [viewMode, setViewMode] = (0, import_react2.useState)("bilingual");
+    const [viewMode, setViewMode] = (0, import_react2.useState)(settings.viewMode);
     const [activeParagraph, setActiveParagraph] = (0, import_react2.useState)(null);
     const [selection, setSelection] = (0, import_react2.useState)("");
     const [selectionResult, setSelectionResult] = (0, import_react2.useState)(null);
@@ -3756,12 +6541,23 @@ $$`),
     const paragraphs = pageModel?.paragraphs ?? [];
     const blocks = pageModel?.blocks ?? [];
     const equations = (0, import_react2.useMemo)(() => blocks.filter((block) => block.type === "equation"), [blocks]);
+    const figures = (0, import_react2.useMemo)(() => blocks.filter((block) => block.type === "figure"), [blocks]);
+    const reading = (0, import_react2.useMemo)(
+      () => pageModel === null ? { blocks: [], units: [] } : composeReading(pageModel),
+      [pageModel]
+    );
+    const readingBlocks = reading.blocks;
+    const readingUnits = reading.units;
+    const unitById = (0, import_react2.useMemo)(
+      () => new Map(readingUnits.map((unit) => [unit.id, unit])),
+      [readingUnits]
+    );
     const pageTranslation = translations[pageIndex] ?? {};
     const pageStatus = pageTranslationState[pageIndex]?.status ?? "idle";
     const pageError = pageTranslationState[pageIndex]?.error ?? "";
     const pageBusy = Boolean(busyPages[pageIndex]) || Boolean(progress?.running);
-    const hasPageTranslation = paragraphs.some((paragraph) => Boolean(pageTranslation[paragraph.id]?.text));
-    const waitingForTranslation = viewMode !== "source" && paragraphs.length > 0 && !hasPageTranslation && pageStatus !== "loading" && pageStatus !== "error";
+    const hasPageTranslation = readingUnits.some((unit) => Boolean(pageTranslation[unit.id]?.text));
+    const waitingForTranslation = viewMode !== "source" && readingUnits.length > 0 && !hasPageTranslation && pageStatus !== "loading" && pageStatus !== "error";
     const currentScale = pageModel?.viewport?.scale ?? 1;
     const activeLines = pageModel?.paragraphs.find((paragraph) => paragraph.id === activeParagraph)?.lines ?? [];
     const docFingerprint = doc?.fingerprint ?? "";
@@ -3769,8 +6565,8 @@ $$`),
       () => pageOverridesFor(equationOverrides, docFingerprint, pageIndex),
       [docFingerprint, equationOverrides, pageIndex]
     );
-    const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0;
-    const activeEquationBlock = equations.find((equation) => equation.id === activeEquation);
+    const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0 || pageOverrides.figures.length > 0;
+    const activeOverlayBlock = blocks.find((block) => block.id === activeEquation);
     const docNotes = (0, import_react2.useMemo)(
       () => notes.filter((note) => note.doc === docFingerprint),
       [docFingerprint, notes]
@@ -3838,6 +6634,33 @@ $$`),
       chatContextCacheRef.current.clear();
     }, [docFingerprint]);
     (0, import_react2.useEffect)(() => {
+      if (doc === null) {
+        setReferences({ status: "idle", heading: "", pageIndex: null, entries: [] });
+        return void 0;
+      }
+      const controller = new AbortController();
+      setReferences({ status: "loading", heading: "", pageIndex: null, entries: [] });
+      extractReferences(doc.pdf, doc.outline, { signal: controller.signal }).then((result) => {
+        if (controller.signal.aborted) return;
+        setReferences({
+          status: "ready",
+          heading: result?.heading ?? "",
+          pageIndex: result?.pageIndex ?? null,
+          entries: Array.isArray(result?.entries) ? result.entries : []
+        });
+      }).catch((error) => {
+        if (controller.signal.aborted) return;
+        console.warn("pdf-math-reader: reference extraction failed", error);
+        setReferences({ status: "error", heading: "", pageIndex: null, entries: [] });
+      });
+      return () => controller.abort();
+    }, [doc]);
+    (0, import_react2.useEffect)(() => {
+      if (railTab === "references" && references.entries.length === 0) {
+        setRailTab("outline");
+      }
+    }, [railTab, references.entries.length]);
+    (0, import_react2.useEffect)(() => {
       const controller = new AbortController();
       fetchHealth(controller.signal).then((payload) => {
         if (controller.signal.aborted) return;
@@ -3845,12 +6668,35 @@ $$`),
           status: payload.llm === true ? "ready" : "unavailable",
           provider: payload.provider,
           model: payload.model,
+          reasoningEffort: payload.reasoningEffort,
           providers: payload.providers,
           defaultNotesDir: payload.defaultNotesDir
         });
       }).catch((error) => {
         if (controller.signal.aborted) return;
         setHealth({ status: "error", message: error?.message ?? String(error) });
+      });
+      return () => controller.abort();
+    }, []);
+    (0, import_react2.useEffect)(() => {
+      const controller = new AbortController();
+      fetchModels(controller.signal).then((payload) => {
+        if (controller.signal.aborted) return;
+        setCatalog({
+          status: "ready",
+          providers: Array.isArray(payload.providers) ? payload.providers : [],
+          models: Array.isArray(payload.models) ? payload.models : [],
+          warnings: Array.isArray(payload.warnings) ? payload.warnings : []
+        });
+      }).catch((error) => {
+        if (controller.signal.aborted) return;
+        setCatalog({
+          status: "error",
+          providers: [],
+          models: [],
+          warnings: [],
+          error: error?.message ?? String(error)
+        });
       });
       return () => controller.abort();
     }, []);
@@ -3909,10 +6755,22 @@ $$`),
           setPageSize({ width: viewport.width, height: viewport.height });
           setRenderState("ready");
           let textContent;
+          let figures2 = doc.figureCache?.get(pageIndex);
+          if (figures2 === void 0) {
+            try {
+              figures2 = await collectFigureRegions(page, library, viewport);
+              if (cancelled) return;
+              doc.figureCache?.set(pageIndex, figures2);
+            } catch (error) {
+              console.warn("pdf-math-reader: figure detection failed", error);
+              figures2 = [];
+            }
+          }
           let model = {
             blocks: [],
             paragraphs: [],
             equations: [],
+            figures: [],
             lines: [],
             viewport,
             pageWidth: viewport.width,
@@ -3923,6 +6781,7 @@ $$`),
             if (cancelled) return;
             model = buildPageModel(library, textContent, viewport, {
               pageIndex,
+              figures: figures2,
               overrides: pageOverridesFor(
                 equationOverridesRef.current,
                 doc.fingerprint,
@@ -4077,7 +6936,8 @@ $$`),
             fingerprint: fileFingerprint(file),
             numPages: pdf.numPages,
             outline,
-            pageCache: /* @__PURE__ */ new Map()
+            pageCache: /* @__PURE__ */ new Map(),
+            figureCache: /* @__PURE__ */ new Map()
           };
           docRef.current = meta;
           setDoc(meta);
@@ -4268,6 +7128,12 @@ $$`),
       ),
       [equations]
     );
+    const figureAtPoint = (0, import_react2.useCallback)(
+      (x, y) => figures.find(
+        (figure) => x >= figure.bbox[0] - 2 && x <= figure.bbox[2] + 2 && y >= figure.bbox[1] - 2 && y <= figure.bbox[3] + 2
+      ),
+      [figures]
+    );
     const commitPageOverrides = (0, import_react2.useCallback)(
       (mutator) => {
         const meta = docRef.current;
@@ -4287,13 +7153,14 @@ $$`),
         });
         setEquationOverrides((previous) => {
           const pages = { ...previous[fingerprint] ?? {} };
-          const current = pages[pageIndex] ?? { added: [], removed: [] };
+          const current = pages[pageIndex] ?? { added: [], removed: [], figures: [] };
           const updated = mutator({
             added: [...current.added ?? []],
-            removed: [...current.removed ?? []]
+            removed: [...current.removed ?? []],
+            figures: [...current.figures ?? []]
           });
           const nextPages = { ...pages };
-          if (updated.added.length === 0 && updated.removed.length === 0) {
+          if (updated.added.length === 0 && updated.removed.length === 0 && (updated.figures?.length ?? 0) === 0) {
             delete nextPages[pageIndex];
           } else {
             nextPages[pageIndex] = updated;
@@ -4382,8 +7249,21 @@ $$`),
       },
       [commitPageOverrides, notify, tt]
     );
+    const removeFigure = (0, import_react2.useCallback)(
+      (figure) => {
+        commitPageOverrides((previous) => ({
+          ...previous,
+          figures: [
+            ...previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3),
+            figure.bbox
+          ]
+        }));
+        notify(tt("figure.removed"));
+      },
+      [commitPageOverrides, notify, tt]
+    );
     const resetPageEquations = (0, import_react2.useCallback)(() => {
-      commitPageOverrides(() => ({ added: [], removed: [] }));
+      commitPageOverrides(() => ({ added: [], removed: [], figures: [] }));
       notify(tt("equation.reset"));
     }, [commitPageOverrides, notify, tt]);
     const beginEquationSelection = (0, import_react2.useCallback)(() => {
@@ -4488,6 +7368,12 @@ $$`),
           setActiveEquation((previous) => previous === equation.id ? null : equation.id);
           return;
         }
+        const figure = figureAtPoint(x, y);
+        if (figure !== void 0) {
+          setActiveParagraph(null);
+          setActiveEquation((previous) => previous === figure.id ? null : figure.id);
+          return;
+        }
         const line = lineAtPoint(event.clientX - rect.left, event.clientY - rect.top);
         if (line === void 0) {
           setActiveParagraph(null);
@@ -4502,7 +7388,7 @@ $$`),
           setActiveParagraph(line.paragraphId);
         }
       },
-      [activeParagraph, clearTextSelection, currentScale, equationAtPoint, lineAtPoint]
+      [activeParagraph, clearTextSelection, currentScale, equationAtPoint, figureAtPoint, lineAtPoint]
     );
     const saveNote = (0, import_react2.useCallback)(() => {
       const text = noteText.trim();
@@ -4717,6 +7603,7 @@ $$`),
         const force = options.force === true;
         const epoch = translationEpochRef.current;
         const targetLanguage = settings.targetLanguage;
+        const selectionKey = translationSelectionKey ?? "default";
         const usable = targetParagraphs.filter((paragraph) => paragraph.text.trim() !== "");
         if (epoch !== translationEpochRef.current) return false;
         if (usable.length === 0) {
@@ -4747,7 +7634,7 @@ $$`),
             }
             const pending = [];
             for (const entry of batch) {
-              const key = `${targetLanguage}\0${glossaryKeyValue}\0${entry.text}`;
+              const key = `${targetLanguage}\0${selectionKey}\0${glossaryKeyValue}\0${entry.text}`;
               if (!force) {
                 const cached = translationCacheRef.current.get(key);
                 if (cached !== void 0) {
@@ -4769,6 +7656,7 @@ $$`),
                 sourceLanguage: "auto",
                 glossary,
                 segments: pending.map(({ entry }) => ({ id: entry.id, text: entry.text })),
+                modelSelection: settings.translationSelection,
                 refresh: force
               },
               signal
@@ -4837,16 +7725,17 @@ $$`),
         setTranslationError,
         setTranslationFor,
         settings.targetLanguage,
+        translationSelectionKey,
         tt
       ]
     );
     const translateCurrentPage = (0, import_react2.useCallback)(() => {
-      if (!pageModel || paragraphs.length === 0 || pageBusy) return;
+      if (!pageModel || readingUnits.length === 0 || pageBusy) return;
       translationAbortRef.current?.abort();
       const controller = new AbortController();
       translationAbortRef.current = controller;
       setProgress(null);
-      translatePageInternal(pageIndex, paragraphs, {
+      translatePageInternal(pageIndex, readingUnits, {
         force: hasPageTranslation,
         signal: controller.signal
       }).catch((error) => {
@@ -4862,18 +7751,18 @@ $$`),
       pageBusy,
       pageIndex,
       pageModel,
-      paragraphs,
+      readingUnits,
       translatePageInternal,
       tt
     ]);
-    const retryParagraph = (0, import_react2.useCallback)(
-      (paragraph) => {
-        if (!pageModel || pageBusy) return;
+    const retryUnit = (0, import_react2.useCallback)(
+      (unit) => {
+        if (!pageModel || pageBusy || unit === void 0) return;
         translationAbortRef.current?.abort();
         const controller = new AbortController();
         translationAbortRef.current = controller;
-        clearTranslationError(pageIndex, paragraph.id);
-        translatePageInternal(pageIndex, [paragraph], {
+        clearTranslationError(pageIndex, unit.id);
+        translatePageInternal(pageIndex, [unit], {
           force: true,
           signal: controller.signal
         }).catch((error) => {
@@ -4908,6 +7797,7 @@ $$`),
           pageIndex: targetPage
         },
         {
+          figures: meta.figureCache?.get(targetPage),
           overrides: pageOverridesFor(
             equationOverridesRef.current,
             meta.fingerprint,
@@ -4916,6 +7806,10 @@ $$`),
         }
       );
       if (docRef.current !== meta) return { blocks: [], paragraphs: [] };
+      meta.figureCache?.set(
+        targetPage,
+        model.figureRegionsRaw ?? model.figureRegions ?? []
+      );
       meta.pageCache?.set(targetPage, model);
       return model;
     }, []);
@@ -4937,8 +7831,9 @@ $$`),
           setProgress({ running: true, done: index, total: meta.numPages });
           const model = await getPageModel(index);
           if (controller.signal.aborted || epoch !== translationEpochRef.current) break;
-          if (model.paragraphs.length > 0) {
-            await translatePageInternal(index, model.paragraphs, { signal: controller.signal });
+          const composed = composeReading(model);
+          if (composed.units.length > 0) {
+            await translatePageInternal(index, composed.units, { signal: controller.signal });
           }
           if (epoch !== translationEpochRef.current) break;
           setProgress({ running: true, done: index + 1, total: meta.numPages });
@@ -4969,6 +7864,7 @@ $$`),
             sourceLanguage: "auto",
             glossary,
             segments: [{ id: "selection", text: source }],
+            modelSelection: settings.translationSelection,
             refresh: false
           },
           controller.signal
@@ -4989,7 +7885,7 @@ $$`),
       } finally {
         if (selectionAbortRef.current === controller) selectionAbortRef.current = null;
       }
-    }, [glossary, selection, settings.targetLanguage, tt]);
+    }, [glossary, selection, settings.targetLanguage, settings.translationSelection, tt]);
     const copyText = (0, import_react2.useCallback)(
       async (text) => {
         try {
@@ -5000,6 +7896,39 @@ $$`),
         }
       },
       [notify, tt]
+    );
+    const copyPage = (0, import_react2.useCallback)(
+      (translatedOnly) => {
+        const parts = [];
+        for (const block of readingBlocks) {
+          if (block.type === "authors") {
+            const people = block.authors.map((author) => {
+              const translatedAffiliation = translatedOnly && author.affiliationId ? pageTranslation[author.affiliationId]?.text : void 0;
+              return [
+                `${author.name}${author.marks ? ` ${author.marks}` : ""}`,
+                translatedAffiliation || author.affiliation,
+                author.email
+              ].filter(Boolean).join(" \xB7 ");
+            });
+            if (people.length > 0) parts.push(people.join("\n"));
+            continue;
+          }
+          if (block.type === "equation") {
+            if (!translatedOnly && block.text) parts.push(block.text);
+            continue;
+          }
+          if (block.type === "figure") continue;
+          const translated = block.translationId ? pageTranslation[block.translationId]?.text : void 0;
+          const value = translatedOnly ? translated : block.text ?? block.paragraph?.text;
+          if (value) parts.push(value);
+        }
+        if (parts.length === 0) {
+          notify(tt(translatedOnly ? "toast.noTranslation" : "toast.noText"), "error");
+          return;
+        }
+        copyText(parts.join("\n\n"));
+      },
+      [copyText, notify, pageTranslation, readingBlocks, tt]
     );
     const clearCache = (0, import_react2.useCallback)(() => {
       translationCacheRef.current.clear();
@@ -5025,6 +7954,7 @@ $$`),
               pageIndex: index
             },
             {
+              figures: meta.figureCache?.get(index),
               overrides: pageOverridesFor(
                 equationOverridesRef.current,
                 meta.fingerprint,
@@ -5033,10 +7963,14 @@ $$`),
             }
           );
           if (docRef.current !== meta) return [];
+          meta.figureCache?.set(
+            index,
+            model.figureRegionsRaw ?? model.figureRegions ?? []
+          );
           cache.set(index, model);
         }
         if ((model.blocks?.length ?? 0) > 0) {
-          pages.push({ index, blocks: model.blocks, paragraphs: model.paragraphs });
+          pages.push({ index, model, blocks: model.blocks, paragraphs: model.paragraphs });
         }
       }
       return pages;
@@ -5110,7 +8044,8 @@ ${text.slice(-5600)}` : text;
               history,
               context: context.text,
               contextLabel: context.label,
-              skill: skill === null ? void 0 : { name: skill.name, content: skill.content }
+              skill: skill === null ? void 0 : { name: skill.name, content: skill.content },
+              modelSelection: settings.chatSelection
             },
             controller.signal
           );
@@ -5129,7 +8064,16 @@ ${text.slice(-5600)}` : text;
           setChatStatus("");
         }
       },
-      [buildChatContext, chatBusy, chatInput, chatMessages, chatScope, skill, tt]
+      [
+        buildChatContext,
+        chatBusy,
+        chatInput,
+        chatMessages,
+        chatScope,
+        settings.chatSelection,
+        skill,
+        tt
+      ]
     );
     const stopChat = (0, import_react2.useCallback)(() => {
       chatAbortRef.current?.abort();
@@ -5205,20 +8149,22 @@ ${text.slice(-5600)}` : text;
       if (rightTab !== "reading") return;
       chatEndRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
     }, [chatBusy, chatMessages, rightTab]);
-    const renderExportEquations = (0, import_react2.useCallback)(async (meta, pages) => {
+    const renderExportImages = (0, import_react2.useCallback)(async (meta, pages) => {
       const images = /* @__PURE__ */ new Map();
       for (const page of pages) {
-        const pageEquations = (page.blocks ?? []).filter((block) => block.type === "equation");
-        if (pageEquations.length === 0) continue;
+        const pageBlocks = (page.blocks ?? []).filter(
+          (block) => block.type === "equation" || block.type === "figure"
+        );
+        if (pageBlocks.length === 0) continue;
         let pdfPage;
         try {
           pdfPage = await meta.pdf.getPage(page.index + 1);
         } catch {
           continue;
         }
-        for (const equation of pageEquations) {
+        for (const block of pageBlocks) {
           try {
-            const cropBox = equation.imageBbox ?? equation.bbox;
+            const cropBox = block.imageBbox ?? block.bbox;
             const result = await renderEquationCrop(pdfPage, cropBox, {
               displayWidth: Math.min(
                 1400,
@@ -5228,7 +8174,7 @@ ${text.slice(-5600)}` : text;
               maxPixels: 8e6,
               maxScale: 6
             });
-            images.set(`${page.index}:${equation.id}`, result);
+            images.set(`${page.index}:${block.id}`, result);
           } catch {
           }
         }
@@ -5252,7 +8198,30 @@ ${text.slice(-5600)}` : text;
       ];
       for (const page of pages) {
         lines.push(`## ${tt("page.short", { page: page.index + 1 })}`, "");
-        for (const block of page.blocks ?? []) {
+        const reading2 = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] };
+        for (const block of reading2.blocks) {
+          if (block.type === "title") {
+            lines.push(`### ${block.text}`, "");
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            if (translated2) lines.push(translated2, "");
+            continue;
+          }
+          if (block.type === "authors") {
+            lines.push(`**${tt("reading.authors")}**`, "");
+            lines.push(
+              block.authors.map((author) => exportAuthorLine(author, translations[page.index])).join("  \n"),
+              ""
+            );
+            continue;
+          }
+          if (block.type === "abstract" || block.type === "keywords") {
+            const label = block.type === "abstract" ? tt("reading.abstract") : tt("reading.keywords");
+            if (block.showLabel !== false) lines.push(`**${label}**`, "");
+            lines.push(`> ${block.text}`, "");
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            if (translated2) lines.push(translated2, "");
+            continue;
+          }
           if (block.type === "equation") {
             if (block.equationNumber) {
               lines.push(`**${tt("equation.label")} ${block.equationNumber}**`, "");
@@ -5260,9 +8229,18 @@ ${text.slice(-5600)}` : text;
             lines.push("```", block.text, "```", "");
             continue;
           }
+          if (block.type === "figure") {
+            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            lines.push(`**${label}**`, "");
+            const labels = (block.labels ?? []).map((line) => line.text).filter((text) => text !== "");
+            if (labels.length > 0) {
+              lines.push(`${tt("figure.labelsInline")}`, "", ...labels.map((text) => `- ${text}`), "");
+            }
+            continue;
+          }
           const paragraph = block.paragraph;
           if (paragraph === void 0) continue;
-          const translated = translations[page.index]?.[paragraph.id]?.text;
+          const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text;
           lines.push(`> ${paragraph.text.replace(/\s+/g, " ")}`, "");
           if (translated) lines.push(translated, "");
         }
@@ -5281,7 +8259,7 @@ ${text.slice(-5600)}` : text;
         notify(tt("error.exportEmpty"), "error");
         return;
       }
-      const images = await renderExportEquations(meta, pages);
+      const images = await renderExportImages(meta, pages);
       const lines = [
         `# ${meta.name}`,
         "",
@@ -5291,7 +8269,30 @@ ${text.slice(-5600)}` : text;
       const files = [];
       for (const page of pages) {
         lines.push(`## ${tt("page.short", { page: page.index + 1 })}`, "");
-        for (const block of page.blocks ?? []) {
+        const reading2 = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] };
+        for (const block of reading2.blocks) {
+          if (block.type === "title") {
+            lines.push(`### ${block.text}`, "");
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            if (translated2) lines.push(translated2, "");
+            continue;
+          }
+          if (block.type === "authors") {
+            lines.push(`**${tt("reading.authors")}**`, "");
+            lines.push(
+              block.authors.map((author) => exportAuthorLine(author, translations[page.index])).join("  \n"),
+              ""
+            );
+            continue;
+          }
+          if (block.type === "abstract" || block.type === "keywords") {
+            const label = block.type === "abstract" ? tt("reading.abstract") : tt("reading.keywords");
+            if (block.showLabel !== false) lines.push(`**${label}**`, "");
+            lines.push(`> ${block.text}`, "");
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            if (translated2) lines.push(translated2, "");
+            continue;
+          }
           if (block.type === "equation") {
             const image = images.get(`${page.index}:${block.id}`);
             const label = block.equationNumber ? `${tt("equation.label")} ${block.equationNumber}` : tt("equation.unnumbered");
@@ -5304,9 +8305,23 @@ ${text.slice(-5600)}` : text;
             }
             continue;
           }
+          if (block.type === "figure") {
+            const image = images.get(`${page.index}:${block.id}`);
+            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            if (image !== void 0) {
+              const name = `figures/${block.id}.png`;
+              files.push({ name, data: dataUrlToBytes(image.dataUrl) });
+              lines.push(`![${label}](${name})`, "");
+            }
+            const labels = (block.labels ?? []).map((line) => line.text).filter((text) => text !== "");
+            if (labels.length > 0) {
+              lines.push(`${tt("figure.labelsInline")}`, "", ...labels.map((text) => `- ${text}`), "");
+            }
+            continue;
+          }
           const paragraph = block.paragraph;
           if (paragraph === void 0) continue;
-          const translated = translations[page.index]?.[paragraph.id]?.text;
+          const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text;
           lines.push(`> ${paragraph.text.replace(/\s+/g, " ")}`, "");
           if (translated) lines.push(translated, "");
         }
@@ -5317,7 +8332,7 @@ ${text.slice(-5600)}` : text;
       const filename = `${baseName(meta.name)}-bilingual.zip`;
       downloadBlob(new Blob([zip], { type: "application/zip" }), filename, "application/zip");
       notify(tt("toast.exported", { name: filename }));
-    }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt]);
+    }, [collectPages, notify, renderExportImages, settings.targetLanguage, translations, tt]);
     const exportHtml = (0, import_react2.useCallback)(async () => {
       const meta = docRef.current;
       if (meta === null) return;
@@ -5328,18 +8343,54 @@ ${text.slice(-5600)}` : text;
         notify(tt("error.exportEmpty"), "error");
         return;
       }
-      const images = await renderExportEquations(meta, pages);
+      const images = await renderExportImages(meta, pages);
       const body = pages.map((page) => {
-        const content = (page.blocks ?? []).map((block) => {
+        const reading2 = page.model ? composeReading(page.model) : { blocks: page.blocks ?? [] };
+        const content = reading2.blocks.map((block) => {
+          if (block.type === "title") {
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            return `<div class="paper-title"><div class="src">${escapeHtml(block.text)}</div>${translated2 ? `<div class="tr">${escapeHtml(translated2)}</div>` : ""}</div>`;
+          }
+          if (block.type === "authors") {
+            const people = block.authors.map((author) => {
+              const translated2 = author.affiliationId ? translations[page.index]?.[author.affiliationId]?.text : void 0;
+              const showTranslation = typeof translated2 === "string" && translated2.trim() !== "" && translated2 !== author.affiliation;
+              return [
+                `${escapeHtml(author.name)}${author.marks !== "" ? `<sup>${escapeHtml(author.marks)}</sup>` : ""}`,
+                escapeHtml(author.affiliation),
+                showTranslation ? `<span class="aff-tr">${escapeHtml(translated2)}</span>` : "",
+                escapeHtml(author.email)
+              ].filter(Boolean).join(" \xB7 ");
+            }).join(" \xB7 ");
+            return `<div class="authors"><strong>${escapeHtml(
+              tt("reading.authors")
+            )}</strong><div>${people}</div></div>`;
+          }
+          if (block.type === "abstract" || block.type === "keywords") {
+            const label = block.type === "abstract" ? tt("reading.abstract") : tt("reading.keywords");
+            const translated2 = translations[page.index]?.[block.translationId]?.text;
+            return `<div class="card">${block.showLabel !== false ? `<strong>${escapeHtml(label)}</strong>` : ""}<div class="src">${escapeHtml(block.text)}</div>${translated2 ? `<div class="tr">${escapeHtml(translated2)}</div>` : ""}</div>`;
+          }
           if (block.type === "equation") {
             const image = images.get(`${page.index}:${block.id}`);
             const label = block.equationNumber ? `${tt("equation.label")} ${block.equationNumber}` : tt("equation.unnumbered");
-            const figure = image !== void 0 ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">` : `<pre>${escapeHtml(block.text)}</pre>`;
-            return `<figure class="equation">${figure}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
+            const preview = image !== void 0 ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">` : `<pre>${escapeHtml(block.text)}</pre>`;
+            return `<figure class="equation">${preview}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
+          }
+          if (block.type === "figure") {
+            const image = images.get(`${page.index}:${block.id}`);
+            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            const preview = image !== void 0 ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">` : "";
+            const labels = (block.labels ?? []).map((line) => `<li>${escapeHtml(line.text)}</li>`).join("");
+            return `<figure class="figure">${preview}<figcaption>${escapeHtml(
+              label
+            )}</figcaption>${labels !== "" ? `<details><summary>${escapeHtml(
+              tt("figure.labels", { count: (block.labels ?? []).length })
+            )}</summary><ul>${labels}</ul></details>` : ""}</figure>`;
           }
           const paragraph = block.paragraph;
           if (paragraph === void 0) return "";
-          const translated = translations[page.index]?.[paragraph.id]?.text;
+          const translated = translations[page.index]?.[block.translationId ?? paragraph.id]?.text;
           return `<div class="card"><div class="src">${escapeHtml(paragraph.text)}</div>${translated ? `<div class="tr">${escapeHtml(translated)}</div>` : ""}</div>`;
         }).join("\n");
         return `<section><h2>${escapeHtml(tt("page.short", { page: page.index + 1 }))}</h2>${content}</section>`;
@@ -5358,14 +8409,26 @@ h1 { font-size: 26px; line-height: 1.25; margin-bottom: 6px; }
 section { margin-top: 34px; }
 h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #6b7280; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }
 .card { padding: 14px 0 16px; border-bottom: 1px dashed #e5e7eb; }
+.paper-title { margin: 10px 0 14px; padding-bottom: 12px; border-bottom: 1px solid #e5e7eb; }
+.paper-title .src { font-size: 25px; font-weight: 700; line-height: 1.3; color: #111827; }
+.paper-title .tr { margin-top: 8px; font-size: 23px; font-weight: 650; line-height: 1.38; }
+.authors { padding: 4px 0 18px; font-size: 13px; color: #374151; line-height: 1.6; }
+.authors .aff-tr { color: #6b7280; }
+.authors strong { display: block; margin-bottom: 4px; color: #6b7280; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
 .src { color: #4b5563; font-size: 13.5px; }
 .tr { margin-top: 7px; font-size: 15px; }
 figure.equation { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; text-align: center; background: #fff; }
 figure.equation img { max-width: 100%; height: auto; }
 figure.equation pre { margin: 0; white-space: pre-wrap; text-align: left; font-size: 12px; }
 figure.equation figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
-@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation { break-inside: avoid; } }
-@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation { border-color: #374151; } figure.equation { background: #fff; } .meta { color: #9ca3af; } }
+figure.figure { margin: 18px 0; padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }
+figure.figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+figure.figure figcaption { margin-top: 8px; color: #6b7280; font-size: 12px; }
+figure.figure details { margin-top: 8px; }
+figure.figure summary { cursor: pointer; color: #6b7280; font-size: 12px; }
+figure.figure ul { margin: 6px 0 0; padding-left: 18px; color: #4b5563; font-size: 12px; }
+@media print { body { max-width: none; margin: 0; padding: 0; } section { break-inside: avoid-page; } .card, figure.equation, figure.figure { break-inside: avoid; } }
+@media (prefers-color-scheme: dark) { body { color: #e5e7eb; background: #111827; } .src { color: #9ca3af; } h2 { color: #9ca3af; border-color: #374151; } .card, figure.equation, figure.figure { border-color: #374151; } figure.equation, figure.figure { background: #fff; } .meta { color: #9ca3af; } }
 </style>
 </head>
 <body>
@@ -5377,7 +8440,7 @@ ${body}
       const filename = `${baseName(meta.name)}-reading.html`;
       downloadBlob(html, filename, "text/html;charset=utf-8");
       notify(tt("toast.exported", { name: filename }));
-    }, [collectPages, notify, renderExportEquations, settings.targetLanguage, translations, tt]);
+    }, [collectPages, notify, renderExportImages, settings.targetLanguage, translations, tt]);
     const onDragEnter = (0, import_react2.useCallback)((event) => {
       event.preventDefault();
       dragDepthRef.current += 1;
@@ -5417,9 +8480,18 @@ ${body}
           setSelectionResult(null);
           setSelection("");
         }
+        if (patch.translationSelection !== void 0 && JSON.stringify(patch.translationSelection) !== JSON.stringify(settings.translationSelection)) {
+          translationEpochRef.current += 1;
+          translationAbortRef.current?.abort();
+          translationAbortRef.current = null;
+          selectionAbortRef.current?.abort();
+          selectionAbortRef.current = null;
+          setBusyPages({});
+          setProgress(null);
+        }
         setSettings((previous) => ({ ...previous, ...patch }));
       },
-      [settings.targetLanguage]
+      [settings.targetLanguage, settings.translationSelection]
     );
     const startResize = (0, import_react2.useCallback)(
       (side, event) => {
@@ -5452,12 +8524,31 @@ ${body}
       },
       [settings.railWidth, settings.translationWidth, updateSettings]
     );
+    const changeViewMode = (0, import_react2.useCallback)(
+      (mode) => {
+        setViewMode(mode);
+        updateSettings({ viewMode: mode });
+      },
+      [updateSettings]
+    );
+    const changeFontSize = (0, import_react2.useCallback)(
+      (delta) => {
+        updateSettings({
+          readingFontSize: clamp2(settings.readingFontSize + delta, 13, 22)
+        });
+      },
+      [settings.readingFontSize, updateSettings]
+    );
     const modeButtons = [
-      ["bilingual", tt("view.bilingual")],
-      ["translation", tt("view.translation")],
-      ["source", tt("view.source")]
+      ["bilingual", tt("view.bilingual"), "columns"],
+      ["translation", tt("view.translation"), "languages"],
+      ["source", tt("view.source"), "file"]
     ];
     const pageProgress = progress?.running ? Math.round(progress.done / Math.max(1, progress.total) * 100) : 0;
+    (0, import_react2.useEffect)(() => {
+      if (translationSelectionKey === null) return;
+      setSelectionResult((previous) => previous?.status === "loading" ? null : previous);
+    }, [translationSelectionKey]);
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
       "section",
       {
@@ -5735,6 +8826,16 @@ ${body}
                           children: tt("rail.pages")
                         }
                       ),
+                      references.entries.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                        "button",
+                        {
+                          type: "button",
+                          className: `pmr-tabbtn ${railTab === "references" ? "is-active" : ""}`,
+                          onClick: () => setRailTab("references"),
+                          title: tt("rail.referenceCount", { count: references.entries.length }),
+                          children: settings.railWidth >= 200 ? tt("rail.references") : tt("rail.referencesShort")
+                        }
+                      ),
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                         "button",
                         {
@@ -5764,7 +8865,7 @@ ${body}
                         ]
                       },
                       entry.id
-                    )) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-empty-note", children: tt("rail.noOutline") }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-thumbs", children: Array.from({ length: pageCount }, (_, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                    )) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-empty-note", children: tt("rail.noOutline") }) : railTab === "pages" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-thumbs", children: Array.from({ length: pageCount }, (_, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                       PageThumbnail,
                       {
                         pdf: doc.pdf,
@@ -5778,7 +8879,36 @@ ${body}
                         onClick: () => goToPage(index)
                       },
                       index
-                    )) }) })
+                    )) }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-reference-list", children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-reference-head", children: [
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("rail.referenceCount", { count: references.entries.length }) }),
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                          "button",
+                          {
+                            type: "button",
+                            className: "pmr-reference-copyall",
+                            title: tt("action.copyReferences"),
+                            "aria-label": tt("action.copyReferences"),
+                            onClick: () => copyText(references.entries.map((entry) => entry.text).join("\n")),
+                            children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "copy", size: 12 })
+                          }
+                        )
+                      ] }),
+                      references.entries.map((entry, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-reference-row", title: entry.text, children: [
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-reference-num", children: entry.label === "" ? index + 1 : entry.label }),
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-reference-text", children: entry.text }),
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                          CopyButton,
+                          {
+                            tt,
+                            text: entry.text,
+                            label: tt("action.copy"),
+                            onCopy: copyText,
+                            className: "pmr-reference-copy"
+                          }
+                        )
+                      ] }, entry.id))
+                    ] }) })
                   ]
                 }
               ),
@@ -5828,15 +8958,15 @@ ${body}
                         },
                         line.id
                       )),
-                      activeEquationBlock !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                      activeOverlayBlock !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                         "div",
                         {
                           className: "pmr-hl pmr-eq-hl",
                           style: {
-                            left: activeEquationBlock.bbox[0] * currentScale,
-                            top: activeEquationBlock.bbox[1] * currentScale,
-                            width: (activeEquationBlock.bbox[2] - activeEquationBlock.bbox[0]) * currentScale,
-                            height: (activeEquationBlock.bbox[3] - activeEquationBlock.bbox[1]) * currentScale
+                            left: activeOverlayBlock.bbox[0] * currentScale,
+                            top: activeOverlayBlock.bbox[1] * currentScale,
+                            width: (activeOverlayBlock.bbox[2] - activeOverlayBlock.bbox[0]) * currentScale,
+                            height: (activeOverlayBlock.bbox[3] - activeOverlayBlock.bbox[1]) * currentScale
                           }
                         }
                       )
@@ -5942,7 +9072,11 @@ ${body}
                 {
                   className: "pmr-translation",
                   "aria-label": tt("panel.translation"),
-                  style: { flexBasis: settings.translationWidth, width: settings.translationWidth },
+                  style: {
+                    flexBasis: settings.translationWidth,
+                    width: settings.translationWidth,
+                    "--pmr-reading-size": `${settings.readingFontSize}px`
+                  },
                   children: [
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-head", children: [
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-tabs", children: [
@@ -5999,21 +9133,98 @@ ${body}
                       rightTab === "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
                         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-headrow", style: { marginTop: 7 }, children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-tr-pageno", children: tt("panel.page", { page: pageIndex + 1 }) }),
-                          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-tr-actions", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-seg", children: modeButtons.map(([mode, label]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-                            "button",
-                            {
-                              type: "button",
-                              className: viewMode === mode ? "is-active" : "",
-                              onClick: () => setViewMode(mode),
-                              children: label
-                            },
-                            mode
-                          )) }) })
+                          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-actions", children: [
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                              "button",
+                              {
+                                type: "button",
+                                className: "pmr-iconbtn",
+                                style: { width: 24, height: 24 },
+                                onClick: () => copyPage(false),
+                                title: tt("action.copyPageSource"),
+                                "aria-label": tt("action.copyPageSource"),
+                                children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "copy", size: 12 })
+                              }
+                            ),
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                              "button",
+                              {
+                                type: "button",
+                                className: "pmr-iconbtn",
+                                style: { width: 24, height: 24 },
+                                onClick: () => copyPage(true),
+                                title: tt("action.copyPageTranslation"),
+                                "aria-label": tt("action.copyPageTranslation"),
+                                children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "languages", size: 12 })
+                              }
+                            ),
+                            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                              "div",
+                              {
+                                className: "pmr-fontctl",
+                                role: "group",
+                                "aria-label": tt("view.fontSize"),
+                                children: [
+                                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                    "button",
+                                    {
+                                      type: "button",
+                                      onClick: () => changeFontSize(-1),
+                                      disabled: settings.readingFontSize <= 13,
+                                      title: tt("view.fontSmaller"),
+                                      "aria-label": tt("view.fontSmaller"),
+                                      children: "A\u2212"
+                                    }
+                                  ),
+                                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-fontctl-value", children: settings.readingFontSize }),
+                                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                    "button",
+                                    {
+                                      type: "button",
+                                      onClick: () => changeFontSize(1),
+                                      disabled: settings.readingFontSize >= 22,
+                                      title: tt("view.fontLarger"),
+                                      "aria-label": tt("view.fontLarger"),
+                                      children: "A+"
+                                    }
+                                  )
+                                ]
+                              }
+                            )
+                          ] })
                         ] }),
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-viewswitch", role: "group", "aria-label": tt("view.mode"), children: modeButtons.map(([mode, label, icon]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                          "button",
+                          {
+                            type: "button",
+                            className: viewMode === mode ? "is-active" : "",
+                            "aria-pressed": viewMode === mode,
+                            onClick: () => changeViewMode(mode),
+                            children: [
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: icon, size: 13 }),
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label })
+                            ]
+                          },
+                          mode
+                        )) }),
+                        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                          ModelControls,
+                          {
+                            tt,
+                            catalog,
+                            value: settings.translationSelection,
+                            disabled: pageBusy,
+                            fallback: health,
+                            onChange: (selection2) => updateSettings({ translationSelection: selection2 })
+                          }
+                        ),
                         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-hint", children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "sparkle", size: 11 }),
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("panel.formulas") }),
-                          equations.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-count-badge", children: tt("panel.equationCount", { count: equations.length }) })
+                          (equations.length > 0 || figures.length > 0) && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "pmr-count-badges", children: [
+                            equations.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-count-badge", children: tt("panel.equationCount", { count: equations.length }) }),
+                            figures.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-count-badge", children: tt("panel.figureCount", { count: figures.length }) })
+                          ] })
                         ] })
                       ] }),
                       rightTab === "notes" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-hint", children: [
@@ -6022,7 +9233,7 @@ ${body}
                       ] })
                     ] }),
                     rightTab === "translation" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-                      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-scroll", children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-scroll", "data-mode": viewMode, children: [
                         progress?.running && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-hint", style: { marginTop: 0, marginBottom: 8 }, children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
                           tt("progress.page", {
@@ -6030,7 +9241,7 @@ ${body}
                             total: progress.total
                           })
                         ] }),
-                        blocks.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty", children: [
+                        readingBlocks.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-tr-empty", children: [
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "file", size: 22 }),
                           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: tt("panel.empty") })
                         ] }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
@@ -6060,39 +9271,83 @@ ${body}
                             ] }),
                             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: translateCurrentPage, children: tt("action.retry") })
                           ] }),
-                          (waitingForTranslation ? blocks.filter((block) => block.type === "equation") : blocks).map(
-                            (block) => block.type === "equation" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-                              EquationBlock,
-                              {
-                                tt,
-                                equation: block,
-                                pdf: doc.pdf,
-                                fingerprint: docFingerprint,
-                                pageIndex,
-                                cache: equationImageCacheRef,
-                                cacheVersion: modelRevision,
-                                active: activeEquation === block.id,
-                                onLocate: focusEquation,
-                                onRemove: removeEquation,
-                                onCopy: copyText
-                              },
-                              block.id
-                            ) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-                              SegmentCard,
-                              {
-                                tt,
-                                paragraph: block.paragraph,
-                                translation: pageTranslation[block.paragraphId],
-                                status: pageStatus,
-                                mode: viewMode,
-                                active: activeParagraph === block.paragraphId,
-                                error: translationErrors[pageIndex]?.[block.paragraphId],
-                                onRetry: () => retryParagraph(block.paragraph),
-                                onClick: () => focusParagraph(block.paragraphId)
-                              },
-                              block.id
-                            )
-                          ),
+                          (waitingForTranslation ? readingBlocks.filter(
+                            (block) => block.type === "equation" || block.type === "figure"
+                          ) : readingBlocks).map((block) => {
+                            if (block.type === "equation") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                EquationBlock,
+                                {
+                                  tt,
+                                  equation: block,
+                                  pdf: doc.pdf,
+                                  fingerprint: docFingerprint,
+                                  pageIndex,
+                                  cache: equationImageCacheRef,
+                                  cacheVersion: modelRevision,
+                                  active: activeEquation === block.id,
+                                  onLocate: focusEquation,
+                                  onRemove: removeEquation,
+                                  onCopy: copyText
+                                },
+                                block.id
+                              );
+                            }
+                            if (block.type === "figure") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                FigureBlock,
+                                {
+                                  tt,
+                                  figure: block,
+                                  pdf: doc.pdf,
+                                  fingerprint: docFingerprint,
+                                  pageIndex,
+                                  cache: equationImageCacheRef,
+                                  cacheVersion: modelRevision,
+                                  active: activeEquation === block.id,
+                                  onLocate: focusEquation,
+                                  onRemove: removeFigure,
+                                  onCopy: copyText
+                                },
+                                block.id
+                              );
+                            }
+                            const translationId = block.translationId ?? block.paragraphId;
+                            const translation = pageTranslation[translationId];
+                            const error = translationErrors[pageIndex]?.[translationId];
+                            const unit = unitById.get(translationId);
+                            const common = {
+                              tt,
+                              block,
+                              status: pageStatus,
+                              mode: viewMode,
+                              active: activeParagraph === block.paragraphId,
+                              error,
+                              onRetry: unit === void 0 ? void 0 : () => retryUnit(unit),
+                              onClick: () => focusParagraph(block.paragraphId),
+                              onCopy: copyText
+                            };
+                            if (block.type === "title") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(TitleBlock, { translation, ...common }, block.id);
+                            }
+                            if (block.type === "authors") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                AuthorBlock,
+                                {
+                                  pageTranslation,
+                                  ...common
+                                },
+                                block.id
+                              );
+                            }
+                            if (block.type === "abstract") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(AbstractBlock, { translation, ...common }, block.id);
+                            }
+                            if (block.type === "keywords") {
+                              return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(KeywordsBlock, { translation, ...common }, block.id);
+                            }
+                            return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SegmentCard, { translation, ...common }, block.id);
+                          }),
                           hasPageOverrides && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-reset", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: resetPageEquations, children: [
                             /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "refresh", size: 12 }),
                             tt("equation.restore")
@@ -6200,6 +9455,16 @@ ${body}
                               ] }),
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-note-count", children: new Date(note.updatedAt).toLocaleDateString() }),
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                CopyButton,
+                                {
+                                  tt,
+                                  text: note.text,
+                                  label: tt("action.copy"),
+                                  onCopy: copyText,
+                                  className: "pmr-note-copy"
+                                }
+                              ),
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                                 "button",
                                 {
                                   type: "button",
@@ -6251,6 +9516,17 @@ ${body}
                           }
                         )
                       ] }),
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                        ModelControls,
+                        {
+                          tt,
+                          catalog,
+                          value: settings.chatSelection,
+                          disabled: chatBusy,
+                          fallback: health,
+                          onChange: (selection2) => updateSettings({ chatSelection: selection2 })
+                        }
+                      ),
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-skill-row", children: [
                         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
                           "button",
@@ -6359,7 +9635,17 @@ ${body}
                             className: `pmr-msg ${message.role === "user" ? "is-user" : "is-assistant"}`,
                             children: [
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-msg-role", children: message.role === "user" ? "You" : "AI" }),
-                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-msg-body", children: message.content })
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-msg-body", children: message.content }),
+                              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                CopyButton,
+                                {
+                                  tt,
+                                  text: message.content,
+                                  label: tt("action.copy"),
+                                  onCopy: copyText,
+                                  className: "pmr-msg-copy"
+                                }
+                              )
                             ]
                           },
                           `${message.role}-${index}`
