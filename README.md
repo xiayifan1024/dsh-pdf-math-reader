@@ -4,6 +4,8 @@
 
 <h1 align="center">dsh-pdf-math-reader</h1>
 
+<p align="center"><a href="README.en.md">English</a> · 简体中文</p>
+
 > PDF Math Reader — 在 DeepSeek Harness 中阅读、翻译、记笔记与 AI 问答一体化的学术 PDF 工作台。
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
