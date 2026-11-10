@@ -151,12 +151,43 @@ export function renderThumbnail(page, canvas, width, signal) {
   })
 }
 
-export function renderPdfPage(page, canvas, scale, signal) {
+/** Device pixel ratio used for every page raster; cached rasters key on it. */
+export function pdfPixelRatio() {
+  return Math.min(window.devicePixelRatio || 1, 2)
+}
+
+/**
+ * Serialize every write to one canvas.
+ *
+ * Page renders, cached-raster blits and preview blits all share this queue, so a
+ * fast 1 → 2 → 1 cannot let an older render overwrite the page that was restored
+ * after it started.
+ */
+function enqueueCanvas(canvas, task) {
   const previous = renderQueues.get(canvas) ?? Promise.resolve()
-  const job = previous.catch(() => {}).then(async () => {
+  const job = previous.catch(() => {}).then(task)
+  renderQueues.set(canvas, job)
+  return job
+}
+
+/** Whether the browser can turn a canvas into an ImageBitmap at all. */
+export function supportsRasterSnapshot() {
+  return typeof createImageBitmap === 'function'
+}
+
+/**
+ * Render one page into `canvas` and, when asked, start a snapshot of it.
+ *
+ * The copy is *started* inside the queued task that painted the page, so it can
+ * only ever copy this page's pixels, but the task and its caller do not wait for
+ * it: the page becomes ready and the next page may start rendering while the
+ * browser finishes the copy. Callers await `snapshot` only when writing the cache.
+ */
+export function renderPdfPage(page, canvas, scale, signal, options = {}) {
+  return enqueueCanvas(canvas, async () => {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     const viewport = page.getViewport({ scale })
-    const ratio = Math.min(window.devicePixelRatio || 1, 2)
+    const ratio = pdfPixelRatio()
     canvas.width = Math.max(1, Math.floor(viewport.width * ratio))
     canvas.height = Math.max(1, Math.floor(viewport.height * ratio))
     canvas.style.width = `${viewport.width}px`
@@ -176,10 +207,47 @@ export function renderPdfPage(page, canvas, scale, signal) {
     } finally {
       signal?.removeEventListener?.('abort', cancel)
     }
-    return viewport
+    return {
+      viewport,
+      snapshot: options.snapshot === true ? copyCanvas(canvas) : null,
+    }
   })
-  renderQueues.set(canvas, job)
-  return job
+}
+
+/** Copy a canvas into an ImageBitmap, or null when the browser cannot. */
+async function copyCanvas(canvas) {
+  if (typeof createImageBitmap !== 'function') return null
+  try {
+    return await createImageBitmap(canvas)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Paint a cached raster onto the page canvas.
+ *
+ * The raster's own pixels decide the canvas buffer, while `width`/`height` are the
+ * target viewport's CSS size: a raster captured at another scale is stretched to
+ * the page box while it serves as a preview, and a matching one is already exact.
+ */
+export function drawPdfRaster(canvas, image, width, height, signal) {
+  return enqueueCanvas(canvas, async () => {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    const pixelWidth = Math.max(1, Math.round(image.width))
+    const pixelHeight = Math.max(1, Math.round(image.height))
+    canvas.width = pixelWidth
+    canvas.height = pixelHeight
+    canvas.style.width = `${width}px`
+    canvas.style.height = `${height}px`
+    const context = canvas.getContext('2d', { alpha: false })
+    if (context === null) throw new Error('Canvas 2D context is unavailable')
+    context.setTransform(1, 0, 0, 1, 0, 0)
+    context.fillStyle = '#ffffff'
+    context.fillRect(0, 0, pixelWidth, pixelHeight)
+    context.drawImage(image, 0, 0)
+    return { width, height }
+  })
 }
 
 /**

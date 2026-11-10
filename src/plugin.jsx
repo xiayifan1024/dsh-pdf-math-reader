@@ -11,7 +11,7 @@ import {
 import { Icon } from './icons'
 import {
   buildPageModel,
-  extractPageModel,
+  drawPdfRaster,
   fileFingerprint,
   findParagraphByAnchor,
   glossaryKey,
@@ -20,14 +20,34 @@ import {
   makeBatches,
   openPdf,
   parseGlossary,
+  pdfPixelRatio,
   renderEquationCrop,
   renderPdfPage,
   renderThumbnail,
   resolveOutline,
+  supportsRasterSnapshot,
 } from './pdf'
 import { overlapRatio } from './equations'
 import { composeReading } from './article'
 import { collectFigureRegions } from './figures'
+import {
+  createPageCaches,
+  disposeCaches,
+  invalidateModel,
+  lookaheadIsUseful,
+  readFigures,
+  readModel,
+  readRaster,
+  readText,
+  rasterFitsBudget,
+  releaseRaster,
+  shareFigureTask,
+  shareTextTask,
+  writeFigures,
+  writeModel,
+  writeRaster,
+  writeText,
+} from './cache'
 import { extractReferences } from './references'
 import { restorePlaceholders } from '../lib/placeholders.js'
 import { createZip, dataUrlToBytes } from './zip'
@@ -68,6 +88,64 @@ function isAbort(error) {
     error?.code === 'TRANSLATION_ABORTED' ||
     error?.code === 'ABORT_ERR'
   )
+}
+
+/** Display scale for a page of `baseWidth` points. */
+function pageDisplayScale(baseWidth, viewerWidth, zoomMode, zoom) {
+  if (!(baseWidth > 0)) return 1
+  if (zoomMode === 'fit') return clamp(Math.max(260, viewerWidth - 56) / baseWidth, 0.4, 3)
+  return clamp(zoom, 0.35, 4)
+}
+
+/** Untransformed page size of a canonical (scale-1) model. */
+function modelBaseSize(model) {
+  const width = Number.isFinite(model?.pageWidth) ? model.pageWidth : model?.viewport?.width
+  const height = Number.isFinite(model?.pageHeight) ? model.pageHeight : model?.viewport?.height
+  return {
+    width: Number.isFinite(width) && width > 0 ? width : 612,
+    height: Number.isFinite(height) && height > 0 ? height : 792,
+  }
+}
+
+/**
+ * Run `callback` in an idle slot. The timeout keeps a busy tab from starving
+ * read-ahead, and the returned function cancels a pending slot.
+ */
+function scheduleIdle(callback, timeoutMs = 1500) {
+  if (typeof window.requestIdleCallback === 'function') {
+    const id = window.requestIdleCallback(callback, { timeout: timeoutMs })
+    return () => window.cancelIdleCallback?.(id)
+  }
+  const id = window.setTimeout(() => callback({ didTimeout: true, timeRemaining: () => 0 }), 250)
+  return () => window.clearTimeout(id)
+}
+
+/** Raw text items for one page, shared by the viewer, chat and export. */
+async function pageTextContent(meta, pageIndex, page) {
+  const cached = readText(meta, pageIndex)
+  if (cached !== undefined) return cached
+  // A page prefetch and a foreground visit share one request, so turning onto a
+  // page being prefetched does not extract its text twice on the same worker.
+  const textContent = await shareTextTask(meta, pageIndex, () =>
+    page.getTextContent({ includeMarkedContent: false }),
+  )
+  return writeText(meta, pageIndex, textContent)
+}
+
+/** Figure regions survive model invalidation: corrections never move artwork. */
+async function pageFigureRegions(meta, pageIndex, page, library, baseViewport) {
+  const cached = readFigures(meta, pageIndex)
+  if (cached !== undefined) return cached
+  let regions = []
+  try {
+    regions = await shareFigureTask(meta, pageIndex, () =>
+      collectFigureRegions(page, library, baseViewport),
+    )
+  } catch (error) {
+    console.warn('pdf-math-reader: figure detection failed', error)
+    regions = []
+  }
+  return writeFigures(meta, pageIndex, regions)
 }
 
 function loadNotes() {
@@ -1504,6 +1582,7 @@ export function PdfReaderPage({ t }) {
   const [pageDraft, setPageDraft] = useState('1')
   const [pageModel, setPageModel] = useState(null)
   const [pageSize, setPageSize] = useState(null)
+  const [pageScale, setPageScale] = useState(1)
   const [renderState, setRenderState] = useState('idle')
   const [renderError, setRenderError] = useState('')
   const [renderNonce, setRenderNonce] = useState(0)
@@ -1561,6 +1640,17 @@ export function PdfReaderPage({ t }) {
   const textLayerRef = useRef(null)
   const textLayerTaskRef = useRef(null)
   const docRef = useRef(null)
+  // Kept in a ref so a raster snapshot taken after an await can prove the viewer
+  // has not moved to another page in the meantime.
+  const pageIndexRef = useRef(0)
+  pageIndexRef.current = pageIndex
+  const pageModelRef = useRef(null)
+  pageModelRef.current = pageModel
+  // Read-ahead state: at most one pending idle slot and one in-flight prefetch.
+  const prefetchRef = useRef({ generation: 0, controller: null, stop: null })
+  // Monotonic capture order for rasters, so an older snapshot of the same page
+  // cannot replace a newer one after a fast page turn.
+  const rasterSeqRef = useRef(0)
   const translationCacheRef = useRef(new Map())
   const translationAbortRef = useRef(null)
   const translationEpochRef = useRef(0)
@@ -1612,7 +1702,9 @@ export function PdfReaderPage({ t }) {
     !hasPageTranslation &&
     pageStatus !== 'loading' &&
     pageStatus !== 'error'
-  const currentScale = pageModel?.viewport?.scale ?? 1
+  // Canonical models are built at scale 1, so every page-point value (line boxes,
+  // equation and figure bboxes) is multiplied by the current display scale here.
+  const currentScale = pageScale
   const activeLines = pageModel?.paragraphs.find((paragraph) => paragraph.id === activeParagraph)?.lines ?? []
   const docFingerprint = doc?.fingerprint ?? ''
   const pageOverrides = useMemo(
@@ -1811,8 +1903,8 @@ export function PdfReaderPage({ t }) {
     ) {
       pendingFocusRef.current = null
     }
-    setPageModel(null)
-    setPageSize(null)
+    // `pageModel` and `pageSize` are decided by the render effect, which swaps a
+    // cached page in synchronously instead of blanking the column first.
     setRenderError('')
     setActiveParagraph(null)
     setActiveEquation(null)
@@ -1832,102 +1924,237 @@ export function PdfReaderPage({ t }) {
 
   useEffect(() => {
     if (!doc) return undefined
+    const meta = doc
     let cancelled = false
     const controller = new AbortController()
-    setRenderState('loading')
+
+    // Resolve the cache hit before any await: a page that is already parsed swaps
+    // in immediately, while `renderState` stays 'loading' until the target page's
+    // pixels are on screen. Highlights are gated on 'ready' for the same reason —
+    // a new page's boxes must never sit on top of the previous page's raster.
+    const cachedModel = readModel(meta, pageIndex)
+    const shownModel = pageModelRef.current
+    const samePage =
+      shownModel !== null &&
+      shownModel !== undefined &&
+      shownModel.documentId === meta.fingerprint &&
+      shownModel.pageIndex === pageIndex
+    if (cachedModel === undefined) {
+      // Rebuilding the page already on screen (a correction, a zoom) keeps its
+      // raster and column; a page turn clears the previous page's content.
+      if (!samePage) {
+        setPageModel(null)
+        setPageSize(null)
+        setRenderState('loading')
+      }
+    } else {
+      const base = modelBaseSize(cachedModel)
+      const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom)
+      setPageModel(cachedModel)
+      setPageSize({ width: base.width * scale, height: base.height * scale })
+      setPageScale(scale)
+      if (!samePage) setRenderState('loading')
+    }
     setRenderError('')
+
+    const paintTextLayer = async (library, textContent, viewport) => {
+      const container = textLayerRef.current
+      if (container === null || typeof library.TextLayer !== 'function') return
+      try {
+        container.replaceChildren()
+        // PDF.js TextLayer positions glyphs with
+        // calc(var(--scale-factor) * <unscaled-pdf-unit>). Without this
+        // variable, font sizes collapse and selection boxes drift away
+        // from the visible glyphs.
+        container.style.setProperty('--scale-factor', String(viewport.scale))
+        container.style.setProperty('--scale-round-x', '1px')
+        container.style.setProperty('--scale-round-y', '1px')
+        const textLayer = new library.TextLayer({
+          textContentSource: textContent,
+          container,
+          viewport,
+        })
+        textLayerTaskRef.current = textLayer
+        await textLayer.render()
+        if (textLayerTaskRef.current === textLayer) textLayerTaskRef.current = null
+        if (cancelled) {
+          textLayer.cancel()
+          container.replaceChildren()
+        }
+      } catch (error) {
+        if (!cancelled && !isAbort(error)) {
+          console.warn('pdf-math-reader: text layer failed', error)
+        }
+      }
+    }
+
+    /**
+     * Write an in-flight snapshot to the cache once the browser finishes copying.
+     *
+     * The copy was started from this page's own queued render, so a page the
+     * reader has already left still belongs in the cache: that is exactly the
+     * raster the next visit needs. Only a different document invalidates it, and
+     * the version keeps an older capture from replacing a newer one.
+     */
+    const rememberRaster = (snapshot, scale, ratio, version) => {
+      if (snapshot === null || snapshot === undefined) return
+      snapshot
+        .then((bitmap) => {
+          if (bitmap === null || bitmap === undefined) return
+          if (docRef.current !== meta) {
+            releaseRaster({ bitmap })
+            return
+          }
+          writeRaster(meta, pageIndex, {
+            bitmap,
+            bytes: bitmap.width * bitmap.height * 4,
+            ratio,
+            scale,
+            version,
+          })
+        })
+        .catch(() => {
+          // Losing a snapshot only costs the next visit a re-render.
+        })
+    }
 
     const run = async () => {
       try {
         const library = await loadPdfJs()
         if (cancelled) return
-        const page = await doc.pdf.getPage(pageIndex + 1)
+        const page = await meta.pdf.getPage(pageIndex + 1)
         if (cancelled) return
         const base = page.getViewport({ scale: 1 })
-        const available = Math.max(260, viewerWidth - 56)
-        const scale =
-          zoomMode === 'fit' ? clamp(available / base.width, 0.4, 3) : clamp(zoom, 0.35, 4)
+        const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom)
+        const viewport = page.getViewport({ scale })
         const canvas = canvasRef.current
         if (canvas === null) return
-        const viewport = await renderPdfPage(page, canvas, scale, controller.signal)
-        if (cancelled) return
         setPageSize({ width: viewport.width, height: viewport.height })
-        // The page must be readable even when text extraction or the text layer
-        // fails; those are separate, non-fatal steps below.
-        setRenderState('ready')
+        setPageScale(scale)
 
-        let textContent
-        let figures = doc.figureCache?.get(pageIndex)
-        if (figures === undefined) {
+        const ratio = pdfPixelRatio()
+        const version = (rasterSeqRef.current += 1)
+        // A raster that cannot be cached is not worth one snapshot copy: the
+        // reader still renders it, it just never enters the cache.
+        const snapshotWanted =
+          supportsRasterSnapshot() &&
+          rasterFitsBudget(
+            Math.floor(viewport.width * ratio),
+            Math.floor(viewport.height * ratio),
+          )
+        const cachedRaster = readRaster(meta, pageIndex)
+        const exactRaster =
+          cachedRaster !== undefined &&
+          Math.abs(cachedRaster.scale - scale) < 1e-3 &&
+          cachedRaster.ratio === ratio
+
+        let painted = 'none'
+        if (cachedRaster !== undefined) {
           try {
-            figures = await collectFigureRegions(page, library, viewport)
+            await drawPdfRaster(
+              canvas,
+              cachedRaster.bitmap,
+              viewport.width,
+              viewport.height,
+              controller.signal,
+            )
             if (cancelled) return
-            doc.figureCache?.set(pageIndex, figures)
+            setRenderState('ready')
+            painted = exactRaster ? 'exact' : 'preview'
           } catch (error) {
-            console.warn('pdf-math-reader: figure detection failed', error)
-            figures = []
+            if (cancelled || controller.signal.aborted || isAbort(error)) return
+            // A released or unreadable raster degrades to a normal render.
+            console.warn('pdf-math-reader: cached raster failed', error)
           }
         }
-        let model = {
-          blocks: [],
-          paragraphs: [],
-          equations: [],
-          figures: [],
-          lines: [],
-          viewport,
-          pageWidth: viewport.width,
-          pageHeight: viewport.height,
-        }
-        try {
-          textContent = await page.getTextContent({ includeMarkedContent: false })
-          if (cancelled) return
-          model = buildPageModel(library, textContent, viewport, {
-            pageIndex,
-            figures,
-            overrides: pageOverridesFor(
-              equationOverridesRef.current,
-              doc.fingerprint,
-              pageIndex,
-            ),
-          })
-        } catch (error) {
-          console.warn('pdf-math-reader: text extraction failed', error)
-        }
-        if (cancelled) return
-        if (docRef.current !== doc) return
-        model.documentId = doc.fingerprint
-        model.pageIndex = pageIndex
-        doc.pageCache?.set(pageIndex, model)
-        setPageModel(model)
-
-        const container = textLayerRef.current
-        if (container !== null && textContent !== undefined && typeof library.TextLayer === 'function') {
-          try {
-            container.replaceChildren()
-            // PDF.js TextLayer positions glyphs with
-            // calc(var(--scale-factor) * <unscaled-pdf-unit>). Without this
-            // variable, font sizes collapse and selection boxes drift away
-            // from the visible glyphs.
-            container.style.setProperty('--scale-factor', String(viewport.scale))
-            container.style.setProperty('--scale-round-x', '1px')
-            container.style.setProperty('--scale-round-y', '1px')
-            const textLayer = new library.TextLayer({
-              textContentSource: textContent,
-              container,
-              viewport,
+        if (painted !== 'exact') {
+          if (painted === 'preview') {
+            // Replace the stretched preview in one blit, so the page does not
+            // flash white between the two rasters. The snapshot comes from the
+            // offscreen canvas, whose pixels nothing else can touch.
+            const offscreen = document.createElement('canvas')
+            const result = await renderPdfPage(page, offscreen, scale, controller.signal, {
+              snapshot: snapshotWanted,
             })
-            textLayerTaskRef.current = textLayer
-            await textLayer.render()
-            if (textLayerTaskRef.current === textLayer) textLayerTaskRef.current = null
-            if (cancelled) {
-              textLayer.cancel()
-              container.replaceChildren()
-            }
-          } catch (error) {
-            if (!cancelled && !isAbort(error)) {
-              console.warn('pdf-math-reader: text layer failed', error)
-            }
+            // Cache the page before any cancellation check: the pixels are this
+            // page's, and a page the reader just left is exactly what the next
+            // visit (backwards) wants to find.
+            rememberRaster(result.snapshot, scale, ratio, version)
+            if (cancelled) return
+            await drawPdfRaster(
+              canvas,
+              offscreen,
+              viewport.width,
+              viewport.height,
+              controller.signal,
+            )
+          } else {
+            const result = await renderPdfPage(page, canvas, scale, controller.signal, {
+              snapshot: snapshotWanted,
+            })
+            rememberRaster(result.snapshot, scale, ratio, version)
           }
+          if (cancelled) return
+          // The page must be readable even when text extraction or the text layer
+          // fails; those are separate, non-fatal steps below.
+          setRenderState('ready')
+        }
+
+        if (cachedModel === undefined) {
+          // Figure detection and text extraction share one worker; running them
+          // together halves the wait before the reading model exists.
+          const figuresPromise = pageFigureRegions(meta, pageIndex, page, library, base)
+          let textContent
+          try {
+            textContent = await pageTextContent(meta, pageIndex, page)
+          } catch (error) {
+            // A page with unreadable text still has to be readable as a picture.
+            console.warn('pdf-math-reader: text extraction failed', error)
+            textContent = undefined
+          }
+          if (cancelled) return
+          // Start the selection layer without waiting for it: on a text-dense page
+          // it creates hundreds of nodes, and the reading column must not queue
+          // behind DOM work it does not depend on.
+          if (textContent !== undefined) void paintTextLayer(library, textContent, viewport)
+          const figures = await figuresPromise
+          if (cancelled) return
+          const model = buildPageModel(
+            library,
+            textContent ?? { items: [] },
+            base,
+            {
+              pageIndex,
+              figures,
+              overrides: pageOverridesFor(
+                equationOverridesRef.current,
+                meta.fingerprint,
+                pageIndex,
+              ),
+            },
+          )
+          if (cancelled) return
+          if (docRef.current !== meta) return
+          model.documentId = meta.fingerprint
+          model.pageIndex = pageIndex
+          // A model built from a failed extraction must not be cached: the next
+          // visit would hit it and keep an empty reading column even though text
+          // extraction may succeed then. A page that legitimately has zero text
+          // items still caches, because its extraction succeeded.
+          if (textContent !== undefined) writeModel(meta, pageIndex, model)
+          // The parse is valid for the page even if the reader has moved on, but it
+          // must not be painted as another page's content.
+          if (pageIndexRef.current === pageIndex) setPageModel(model)
+        } else {
+          let textContent
+          try {
+            textContent = await pageTextContent(meta, pageIndex, page)
+          } catch (error) {
+            console.warn('pdf-math-reader: text extraction failed', error)
+            textContent = undefined
+          }
+          if (cancelled || textContent === undefined) return
+          void paintTextLayer(library, textContent, viewport)
         }
       } catch (error) {
         if (cancelled || controller.signal.aborted || isAbort(error)) return
@@ -1945,6 +2172,189 @@ export function PdfReaderPage({ t }) {
     }
   }, [doc, modelRevision, pageIndex, zoomMode, zoom, viewerWidth, renderNonce])
 
+  const cancelPrefetch = useCallback(() => {
+    const state = prefetchRef.current
+    state.generation += 1
+    state.stop?.()
+    state.stop = null
+    state.controller?.abort()
+    state.controller = null
+  }, [])
+
+  /**
+   * Read ahead one page: build its canonical model and snapshot its raster while
+   * the reader is idle, so turning forward is a blit instead of a parse plus a
+   * rasterization.
+   *
+   * The work is cancellable and always runs after the visible page is ready — a
+   * page turn aborts it, and its results are discarded unless the document and
+   * page are still the ones that asked for them.
+   */
+  const prefetchPage = useCallback(
+    async (targetPage, controller) => {
+      const meta = docRef.current
+      if (meta === null || targetPage < 0 || targetPage >= meta.numPages) return
+      // Forward reading is the priority: read-ahead is only for the page directly
+      // in front. If the reader already moved on, skip the work entirely instead
+      // of spending it on a page they will not turn to next.
+      if (targetPage !== pageIndexRef.current + 1) return
+      const stale = () => controller.signal.aborted || docRef.current !== meta
+      const library = await loadPdfJs()
+      if (stale()) return
+      const page = await meta.pdf.getPage(targetPage + 1)
+      if (stale()) return
+      const base = page.getViewport({ scale: 1 })
+      const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom)
+
+      if (readModel(meta, targetPage) === undefined) {
+        const [textContent, figures] = await Promise.all([
+          pageTextContent(meta, targetPage, page),
+          pageFigureRegions(meta, targetPage, page, library, base),
+        ])
+        if (stale()) return
+        const model = buildPageModel(library, textContent, base, {
+          pageIndex: targetPage,
+          figures,
+          overrides: pageOverridesFor(
+            equationOverridesRef.current,
+            meta.fingerprint,
+            targetPage,
+          ),
+        })
+        if (stale()) return
+        model.documentId = meta.fingerprint
+        model.pageIndex = targetPage
+        writeModel(meta, targetPage, model)
+      }
+
+      const ratio = pdfPixelRatio()
+      const cached = readRaster(meta, targetPage)
+      if (
+        cached !== undefined &&
+        Math.abs(cached.scale - scale) < 1e-3 &&
+        cached.ratio === ratio
+      ) {
+        return
+      }
+      // Decide before allocating: a page too large for the raster budget is drawn
+      // once for the reader, never once more for a cache that would reject it.
+      const viewport = page.getViewport({ scale })
+      if (
+        !supportsRasterSnapshot() ||
+        !rasterFitsBudget(
+          Math.floor(viewport.width * ratio),
+          Math.floor(viewport.height * ratio),
+        )
+      ) {
+        return
+      }
+      // Render into a detached canvas so nothing touches the visible page. The
+      // snapshot is started inside the same queued task, so an aborted prefetch
+      // can never leave a bitmap of some other page in the cache.
+      const canvas = document.createElement('canvas')
+      const version = (rasterSeqRef.current += 1)
+      const { snapshot } = await renderPdfPage(page, canvas, scale, controller.signal, {
+        snapshot: true,
+      })
+      if (snapshot === null) return
+      snapshot
+        .then((bitmap) => {
+          if (bitmap === null || bitmap === undefined) return
+          if (docRef.current !== meta) {
+            releaseRaster({ bitmap })
+            return
+          }
+          // The copy may outlive the turn it was made for: if the reader has gone
+          // back or jumped away, keeping this raster would evict the page they are
+          // about to read next. Drop it instead.
+          if (!lookaheadIsUseful(targetPage, pageIndexRef.current)) {
+            releaseRaster({ bitmap })
+            return
+          }
+          writeRaster(meta, targetPage, {
+            bitmap,
+            bytes: bitmap.width * bitmap.height * 4,
+            ratio,
+            scale,
+            version,
+          })
+        })
+        .catch(() => {
+          // Read-ahead stays an optimization even when the copy fails.
+        })
+    },
+    [viewerWidth, zoom, zoomMode],
+  )
+
+  useEffect(() => {
+    cancelPrefetch()
+    if (doc === null || renderState !== 'ready') return undefined
+    // Only read ahead once the visible page has its model: its text extraction and
+    // figure detection share the worker with anything started here.
+    if (
+      pageModel === null ||
+      pageModel.pageIndex !== pageIndex ||
+      pageModel.documentId !== doc.fingerprint
+    ) {
+      return undefined
+    }
+    // Translation and export already compete for the same PDF.js worker.
+    if (progress?.running === true) return undefined
+    const meta = doc
+    const state = prefetchRef.current
+    const generation = state.generation
+    const controller = new AbortController()
+    state.controller = controller
+
+    const next = pageIndex + 1
+    const following = pageIndex + 2
+    const canPrefetch = next < meta.numPages || following < meta.numPages
+    if (!canPrefetch) return undefined
+
+    state.stop = scheduleIdle(() => {
+      if (generation !== prefetchRef.current.generation) return
+      const run = async () => {
+        if (next < meta.numPages) await prefetchPage(next, controller)
+        if (controller.signal.aborted) return
+        // The page after next only needs its text model, which is cheap and makes
+        // a quick double turn skip the parse step.
+        if (following < meta.numPages && readModel(meta, following) === undefined) {
+          const page = await meta.pdf.getPage(following + 1)
+          if (controller.signal.aborted || docRef.current !== meta) return
+          const library = await loadPdfJs()
+          const base = page.getViewport({ scale: 1 })
+          const [textContent, figures] = await Promise.all([
+            pageTextContent(meta, following, page),
+            pageFigureRegions(meta, following, page, library, base),
+          ])
+          if (controller.signal.aborted || docRef.current !== meta) return
+          const model = buildPageModel(library, textContent, base, {
+            pageIndex: following,
+            figures,
+            overrides: pageOverridesFor(
+              equationOverridesRef.current,
+              meta.fingerprint,
+              following,
+            ),
+          })
+          model.documentId = meta.fingerprint
+          model.pageIndex = following
+          writeModel(meta, following, model)
+        }
+      }
+      run().catch((error) => {
+        if (!isAbort(error) && !controller.signal.aborted) {
+          // Read-ahead is an optimization; never surface its failures.
+          console.warn('pdf-math-reader: page prefetch failed', error)
+        }
+      })
+    })
+
+    return () => {
+      cancelPrefetch()
+    }
+  }, [cancelPrefetch, doc, pageIndex, pageModel, prefetchPage, progress?.running, renderState])
+
   useEffect(() => {
     if (!settingsOpen && !exportOpen) return undefined
     const onKeyDown = (event) => {
@@ -1960,17 +2370,20 @@ export function PdfReaderPage({ t }) {
     return () => {
       openTaskRef.current += 1
       window.clearTimeout(toastTimerRef.current)
+      cancelPrefetch()
       translationAbortRef.current?.abort()
       selectionAbortRef.current?.abort()
       const meta = docRef.current
       docRef.current = null
+      disposeCaches(meta)
       if (meta !== null) meta.pdf.destroy?.().catch?.(() => {})
     }
-  }, [])
+  }, [cancelPrefetch])
 
   const closeDocument = useCallback(() => {
     openTaskRef.current += 1
     translationEpochRef.current += 1
+    cancelPrefetch()
     translationAbortRef.current?.abort()
     translationAbortRef.current = null
     selectionAbortRef.current?.abort()
@@ -1978,6 +2391,8 @@ export function PdfReaderPage({ t }) {
     docRef.current = null
     setDoc(null)
     setPageModel(null)
+    setPageSize(null)
+    setPageScale(1)
     setPageIndex(0)
     setTranslations({})
     setPageTranslationState({})
@@ -1991,8 +2406,9 @@ export function PdfReaderPage({ t }) {
     setEquationRect(null)
     equationImageCacheRef.current.clear()
     setOpenError('')
+    disposeCaches(meta)
     if (meta !== null) meta.pdf.destroy?.().catch?.(() => {})
-  }, [])
+  }, [cancelPrefetch])
 
   const openFile = useCallback(
     async (file) => {
@@ -2004,14 +2420,18 @@ export function PdfReaderPage({ t }) {
       const taskId = openTaskRef.current + 1
       openTaskRef.current = taskId
       translationEpochRef.current += 1
+      cancelPrefetch()
       translationAbortRef.current?.abort()
       translationAbortRef.current = null
       selectionAbortRef.current?.abort()
       const previous = docRef.current
       docRef.current = null
+      disposeCaches(previous)
       if (previous !== null) previous.pdf.destroy?.().catch?.(() => {})
       setDoc(null)
       setPageModel(null)
+      setPageSize(null)
+      setPageScale(1)
       setOpenError('')
       setTranslations({})
       setPageTranslationState({})
@@ -2043,8 +2463,7 @@ export function PdfReaderPage({ t }) {
           fingerprint: fileFingerprint(file),
           numPages: pdf.numPages,
           outline,
-          pageCache: new Map(),
-          figureCache: new Map(),
+          ...createPageCaches(),
         }
         docRef.current = meta
         setDoc(meta)
@@ -2059,7 +2478,7 @@ export function PdfReaderPage({ t }) {
         setRenderState('idle')
       }
     },
-    [notify, tt],
+    [cancelPrefetch, notify, tt],
   )
 
   const pickFile = useCallback(() => {
@@ -2088,6 +2507,17 @@ export function PdfReaderPage({ t }) {
     if (Number.isFinite(parsed)) goToPage(parsed - 1)
     else setPageDraft(String(pageIndex + 1))
   }, [goToPage, pageDraft, pageIndex])
+
+  /** Explicit retry must bypass the raster cache, or it would repaint the failure. */
+  const retryRender = useCallback(() => {
+    const meta = docRef.current
+    const entry = meta === null ? undefined : readRaster(meta, pageIndex)
+    if (entry !== undefined) {
+      releaseRaster(entry)
+      meta.bitmapCache?.delete?.(pageIndex)
+    }
+    setRenderNonce((value) => value + 1)
+  }, [pageIndex])
 
   useEffect(() => {
     if (doc === null) return undefined
@@ -2180,15 +2610,21 @@ export function PdfReaderPage({ t }) {
   }, [clearTextSelection, doc, goToPage, pageIndex])
 
   const lineAtPoint = useCallback(
-    (x, y) =>
-      pageModel?.lines.find(
+    (x, y) => {
+      // `x`/`y` are pointer offsets inside the page box; the canonical model keeps
+      // line boxes in page points, so convert once here.
+      const scale = currentScale > 0 ? currentScale : 1
+      const px = x / scale
+      const py = y / scale
+      return pageModel?.lines.find(
         (line) =>
-          x >= line.x - 2 &&
-          x <= line.x + line.width + 2 &&
-          y >= line.top - 2 &&
-          y <= line.top + line.height + 2,
-      ),
-    [pageModel],
+          px >= line.x - 2 / scale &&
+          px <= line.x + line.width + 2 / scale &&
+          py >= line.top - 2 / scale &&
+          py <= line.top + line.height + 2 / scale,
+      )
+    },
+    [currentScale, pageModel],
   )
 
   const scrollToParagraph = useCallback(
@@ -2202,15 +2638,16 @@ export function PdfReaderPage({ t }) {
       const pageRect = pageElement.getBoundingClientRect()
       const line = paragraph.lines[0]
       if (line === undefined) return
+      const scale = currentScale > 0 ? currentScale : 1
       const target =
         root.scrollTop +
         (pageRect.top - rootRect.top) +
-        line.top +
-        line.height / 2 -
+        line.top * scale +
+        (line.height * scale) / 2 -
         root.clientHeight / 2
       root.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
     },
-    [pageModel],
+    [currentScale, pageModel],
   )
 
   const focusParagraph = useCallback(
@@ -2229,12 +2666,12 @@ export function PdfReaderPage({ t }) {
   )
 
   const scrollToEquation = useCallback(
-    (equation, model = pageModel) => {
+    (equation) => {
       const root = viewerRef.current
       if (root === null) return
       const pageElement = root.querySelector('.pmr-page')
       if (pageElement === null) return
-      const scale = model?.viewport?.scale ?? 1
+      const scale = currentScale > 0 ? currentScale : 1
       const rootRect = root.getBoundingClientRect()
       const pageRect = pageElement.getBoundingClientRect()
       const top = equation.bbox[1] * scale
@@ -2247,7 +2684,7 @@ export function PdfReaderPage({ t }) {
         root.clientHeight / 2
       root.scrollTo({ top: Math.max(0, target), behavior: 'smooth' })
     },
-    [pageModel],
+    [currentScale],
   )
 
   const focusEquation = useCallback(
@@ -2331,7 +2768,10 @@ export function PdfReaderPage({ t }) {
         else next[fingerprint] = nextPages
         return next
       })
-      meta.pageCache?.delete(pageIndex)
+      // A correction changes the model and the crops that point at it, never the
+      // PDF pixels: the text items, the raw figure detection and the page raster
+      // stay valid and are reused when the page is rebuilt.
+      invalidateModel(meta, pageIndex)
       const prefix = `${fingerprint}:${pageIndex}:`
       for (const key of [...equationImageCacheRef.current.keys()]) {
         if (key.startsWith(prefix)) equationImageCacheRef.current.delete(key)
@@ -2446,37 +2886,46 @@ export function PdfReaderPage({ t }) {
     notify(tt('equation.selectHint'))
   }, [clearTextSelection, equationSelectMode, notify, tt])
 
+  /**
+   * Pointer position in page points. The page box is laid out in display pixels
+   * while the canonical model keeps page-point boxes, so the conversion lives in
+   * one place for every pointer-driven selection.
+   */
+  const pagePointFromEvent = useCallback(
+    (event) => {
+      const rect = event.currentTarget.getBoundingClientRect()
+      const scale = currentScale > 0 ? currentScale : 1
+      const width = pageSize !== null ? pageSize.width / scale : 612
+      const height = pageSize !== null ? pageSize.height / scale : 792
+      return {
+        x: clamp((event.clientX - rect.left) / scale, 0, width),
+        y: clamp((event.clientY - rect.top) / scale, 0, height),
+      }
+    },
+    [currentScale, pageSize],
+  )
+
   const onEquationPointerDown = useCallback(
     (event) => {
       if (!equationSelectMode || pageModel === null) return
       if (event.button !== 0) return
       event.preventDefault()
-      const rect = event.currentTarget.getBoundingClientRect()
-      const scale = pageModel.viewport.scale
-      const pageWidth = pageModel.viewport.width / scale
-      const pageHeight = pageModel.viewport.height / scale
-      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
-      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
-      equationDragRef.current = { x0: x, y0: y }
-      setEquationRect({ x0: x, y0: y, x1: x, y1: y })
+      const point = pagePointFromEvent(event)
+      equationDragRef.current = { x0: point.x, y0: point.y }
+      setEquationRect({ x0: point.x, y0: point.y, x1: point.x, y1: point.y })
       event.currentTarget.setPointerCapture?.(event.pointerId)
     },
-    [equationSelectMode, pageModel],
+    [equationSelectMode, pageModel, pagePointFromEvent],
   )
 
   const onEquationPointerMove = useCallback(
     (event) => {
       const drag = equationDragRef.current
       if (drag === null || pageModel === null) return
-      const rect = event.currentTarget.getBoundingClientRect()
-      const scale = pageModel.viewport.scale
-      const pageWidth = pageModel.viewport.width / scale
-      const pageHeight = pageModel.viewport.height / scale
-      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
-      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
-      setEquationRect({ x0: drag.x0, y0: drag.y0, x1: x, y1: y })
+      const point = pagePointFromEvent(event)
+      setEquationRect({ x0: drag.x0, y0: drag.y0, x1: point.x, y1: point.y })
     },
-    [pageModel],
+    [pageModel, pagePointFromEvent],
   )
 
   const onEquationPointerUp = useCallback(
@@ -2484,17 +2933,12 @@ export function PdfReaderPage({ t }) {
       const drag = equationDragRef.current
       if (drag === null || pageModel === null) return
       equationDragRef.current = null
-      const rect = event.currentTarget.getBoundingClientRect()
-      const scale = pageModel.viewport.scale
-      const pageWidth = pageModel.viewport.width / scale
-      const pageHeight = pageModel.viewport.height / scale
-      const x = clamp((event.clientX - rect.left) / scale, 0, pageWidth)
-      const y = clamp((event.clientY - rect.top) / scale, 0, pageHeight)
+      const point = pagePointFromEvent(event)
       const box = [
-        Math.min(drag.x0, x),
-        Math.min(drag.y0, y),
-        Math.max(drag.x0, x),
-        Math.max(drag.y0, y),
+        Math.min(drag.x0, point.x),
+        Math.min(drag.y0, point.y),
+        Math.max(drag.x0, point.x),
+        Math.max(drag.y0, point.y),
       ]
       setEquationRect(null)
       if (box[2] - box[0] < 6 || box[3] - box[1] < 4) {
@@ -2504,7 +2948,7 @@ export function PdfReaderPage({ t }) {
       setEquationSelectMode(false)
       addManualEquation(box)
     },
-    [addManualEquation, notify, pageModel, tt],
+    [addManualEquation, notify, pageModel, pagePointFromEvent, tt],
   )
 
   const handleTextMouseUp = useCallback(
@@ -2575,7 +3019,9 @@ export function PdfReaderPage({ t }) {
       paragraphId: currentParagraph.id,
       source: currentParagraph.text,
       sourceSnippet: currentParagraph.text.replace(/\s+/g, ' ').trim().slice(0, 180),
+      // Canonical page points; older notes carry no unit and stored display pixels.
       anchorTop: currentParagraph.lines[0]?.top ?? null,
+      anchorUnit: 'pt',
       text,
       updatedAt: Date.now(),
     }
@@ -2655,6 +3101,9 @@ export function PdfReaderPage({ t }) {
         paragraphId: note.paragraphId,
         sourceSnippet: note.sourceSnippet ?? note.source ?? '',
         anchorTop: Number.isFinite(note.anchorTop) ? note.anchorTop : null,
+        // Notes saved before the canonical model stored display pixels; newer ones
+        // store page points. The unit decides whether the anchor needs scaling.
+        anchorUnit: note.anchorUnit === 'pt' ? 'pt' : 'px',
         requestId,
       }
       pendingFocusRef.current = request
@@ -2719,13 +3168,19 @@ export function PdfReaderPage({ t }) {
       })
       return
     }
-    if (request.anchorTop !== null) scrollToOffset(request.anchorTop, pageModel)
+    // A page-point anchor needs the display scale; a legacy anchor was already
+    // saved in display pixels and must be used as it is.
+    if (request.anchorTop !== null) {
+      const anchorTop = request.anchorUnit === 'pt' ? request.anchorTop * currentScale : request.anchorTop
+      scrollToOffset(anchorTop, pageModel)
+    }
     if (pendingFocusRef.current?.requestId === request.requestId) {
       pendingFocusRef.current = null
       setFocusRequest(null)
       notify(tt('notes.notFound'), 'error')
     }
   }, [
+    currentScale,
     doc,
     focusRequest,
     notify,
@@ -2991,31 +3446,30 @@ export function PdfReaderPage({ t }) {
   const getPageModel = useCallback(async (targetPage) => {
     const meta = docRef.current
     if (meta === null) return { blocks: [], paragraphs: [] }
-    const cached = meta.pageCache?.get(targetPage)
+    const cached = readModel(meta, targetPage)
     if (cached !== undefined) return cached
     const page = await meta.pdf.getPage(targetPage + 1)
-    const model = await extractPageModel(
-      page,
-      1,
-      {
-        documentId: meta.fingerprint,
-        pageIndex: targetPage,
-      },
-      {
-        figures: meta.figureCache?.get(targetPage),
-        overrides: pageOverridesFor(
-          equationOverridesRef.current,
-          meta.fingerprint,
-          targetPage,
-        ),
-      },
-    )
+    const library = await loadPdfJs()
+    const base = page.getViewport({ scale: 1 })
+    // Same caches as the viewer: a page already parsed for display is reused here,
+    // and a page parsed here is shown without a second extraction.
+    const [textContent, figures] = await Promise.all([
+      pageTextContent(meta, targetPage, page),
+      pageFigureRegions(meta, targetPage, page, library, base),
+    ])
     if (docRef.current !== meta) return { blocks: [], paragraphs: [] }
-    meta.figureCache?.set(
-      targetPage,
-      model.figureRegionsRaw ?? model.figureRegions ?? [],
-    )
-    meta.pageCache?.set(targetPage, model)
+    const model = buildPageModel(library, textContent, base, {
+      pageIndex: targetPage,
+      figures,
+      overrides: pageOverridesFor(
+        equationOverridesRef.current,
+        meta.fingerprint,
+        targetPage,
+      ),
+    })
+    model.documentId = meta.fingerprint
+    model.pageIndex = targetPage
+    writeModel(meta, targetPage, model)
     return model
   }, [])
 
@@ -3163,41 +3617,18 @@ export function PdfReaderPage({ t }) {
   const collectPages = useCallback(async () => {
     const meta = docRef.current
     if (meta === null) return []
-    const cache = meta.pageCache ?? new Map()
     const pages = []
     for (let index = 0; index < meta.numPages; index += 1) {
-      let model = cache.get(index)
-      if (model === undefined) {
-        const page = await meta.pdf.getPage(index + 1)
-        model = await extractPageModel(
-          page,
-          1,
-          {
-            documentId: meta.fingerprint,
-            pageIndex: index,
-          },
-          {
-            figures: meta.figureCache?.get(index),
-            overrides: pageOverridesFor(
-              equationOverridesRef.current,
-              meta.fingerprint,
-              index,
-            ),
-          },
-        )
-        if (docRef.current !== meta) return []
-        meta.figureCache?.set(
-          index,
-          model.figureRegionsRaw ?? model.figureRegions ?? [],
-        )
-        cache.set(index, model)
-      }
+      // One canonical model per page, with the same LRU bound as the viewer, so a
+      // long document cannot pin every page in memory for chat or export.
+      const model = await getPageModel(index)
+      if (docRef.current !== meta) return []
       if ((model.blocks?.length ?? 0) > 0) {
         pages.push({ index, model, blocks: model.blocks, paragraphs: model.paragraphs })
       }
     }
     return pages
-  }, [])
+  }, [getPageModel])
 
   const buildChatContext = useCallback(
     async (scope) => {
@@ -4250,53 +4681,55 @@ ${body}
                 <div
                   className="pmr-page"
                   style={
-                    pageModel !== null
-                      ? { width: pageModel.viewport.width, height: pageModel.viewport.height }
-                      : pageSize !== null
-                        ? { width: pageSize.width, height: pageSize.height }
-                        : { width: 620, height: 800 }
+                    pageSize !== null
+                      ? { width: pageSize.width, height: pageSize.height }
+                      : { width: 620, height: 800 }
                   }
                 >
                   <canvas ref={canvasRef} className="pmr-canvas" />
                   <div className="pmr-highlights" aria-hidden="true">
-                    {noteLines.map((line, index) => (
-                      <div
-                        key={`note-${line.id}-${index}`}
-                        className="pmr-hl pmr-note-hl"
-                        style={{
-                          left: line.x,
-                          top: line.top,
-                          width: line.width,
-                          height: line.height,
-                        }}
-                      />
-                    ))}
-                    {activeLines.map((line) => (
-                      <div
-                        key={line.id}
-                        className="pmr-hl"
-                        style={{
-                          left: line.x,
-                          top: line.top,
-                          width: line.width,
-                          height: line.height,
-                        }}
-                      />
-                    ))}
-                    {activeOverlayBlock !== undefined && (
-                      <div
-                        className="pmr-hl pmr-eq-hl"
-                        style={{
-                          left: activeOverlayBlock.bbox[0] * currentScale,
-                          top: activeOverlayBlock.bbox[1] * currentScale,
-                          width:
-                            (activeOverlayBlock.bbox[2] - activeOverlayBlock.bbox[0]) *
-                            currentScale,
-                          height:
-                            (activeOverlayBlock.bbox[3] - activeOverlayBlock.bbox[1]) *
-                            currentScale,
-                        }}
-                      />
+                    {renderState !== 'ready' ? null : (
+                      <>
+                        {noteLines.map((line, index) => (
+                          <div
+                            key={`note-${line.id}-${index}`}
+                            className="pmr-hl pmr-note-hl"
+                            style={{
+                              left: line.x * currentScale,
+                              top: line.top * currentScale,
+                              width: line.width * currentScale,
+                              height: line.height * currentScale,
+                            }}
+                          />
+                        ))}
+                        {activeLines.map((line) => (
+                          <div
+                            key={line.id}
+                            className="pmr-hl"
+                            style={{
+                              left: line.x * currentScale,
+                              top: line.top * currentScale,
+                              width: line.width * currentScale,
+                              height: line.height * currentScale,
+                            }}
+                          />
+                        ))}
+                        {activeOverlayBlock !== undefined && (
+                          <div
+                            className="pmr-hl pmr-eq-hl"
+                            style={{
+                              left: activeOverlayBlock.bbox[0] * currentScale,
+                              top: activeOverlayBlock.bbox[1] * currentScale,
+                              width:
+                                (activeOverlayBlock.bbox[2] - activeOverlayBlock.bbox[0]) *
+                                currentScale,
+                              height:
+                                (activeOverlayBlock.bbox[3] - activeOverlayBlock.bbox[1]) *
+                                currentScale,
+                            }}
+                          />
+                        )}
+                      </>
                     )}
                   </div>
                   <div
@@ -4353,7 +4786,7 @@ ${body}
                           type="button"
                           className="pmr-btn pmr-btn-ghost"
                           style={{ marginTop: 10 }}
-                          onClick={() => setRenderNonce((value) => value + 1)}
+                          onClick={retryRender}
                         >
                           {tt('action.retry')}
                         </button>

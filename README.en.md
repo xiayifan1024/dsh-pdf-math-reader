@@ -333,7 +333,7 @@ Implementation notes:
   stay in the body flow. Attributed text is neither an equation candidate nor a paragraph.
 - Figure `bbox` values also use scale-1 page coordinates, with a separate crop rect and a figure
   number taken from the nearest caption. Detected regions are cached per document and page, so zoom
-  and sidebar resizing do not re-parse the operator list.
+  and sidebar resizing do not re-parse the operator list; a cached page model skips detection entirely.
 - Equation `bbox` values are stored in scale-1 PDF page coordinates; highlighting and cropping
   convert through the viewport, so they stay consistent across zoom, sidebar resizing and reopening
   the document.
@@ -349,8 +349,33 @@ Implementation notes:
   underscores, uppercase abbreviations, or known function names) are merged into the equation.
 - Changing an equation region increments the translation epoch, cancels in-flight translations and
   clears loading state, so an old request cannot write results back under pre-rebuild paragraph ids.
-- Each document has its own page-model cache; async work from a previously opened document cannot
-  write into the new one.
+- Each document owns its page caches (`src/cache.js`): page model, text items, figure regions and page
+  rasters each have their own bound, and the viewer, translation, chat and export read one canonical
+  model per page. Models are built at scale 1, so zoom and sidebar resizing repaint without re-parsing;
+  line, equation and figure boxes are multiplied by the current scale only when drawn. Bounds are 12
+  models, 12 text entries, 3 rasters plus a 48 MB byte budget, evicted least-recently-used, with
+  `ImageBitmap.close()` on raster eviction; a raster that alone exceeds the budget stays on screen but
+  is never stored, and it does not clear the pages already cached. A correction invalidates only that
+  page's model and crops;
+  its text items, raw figure detection and raster are reused. Async work from a previously opened
+  document cannot write into the new one.
+- Revisiting a page no longer re-rasterizes it: the render task *starts* a snapshot inside the same canvas
+  queue but does not wait for it, so the page becomes ready and the next page may start drawing while the
+  copy finishes; the snapshot is written to the cache afterwards, and re-entered pages are drawn with
+  `drawImage`. When zoom or pixel ratio changed, the old snapshot is shown as a preview first, then an
+  offscreen render replaces it in a single blit, so the page never flashes white. A cached model swaps the
+  reading column immediately, while the canvas only leaves its loading state once the target page's pixels
+  are actually on screen; highlights follow that state, so fast paging cannot draw the new page's boxes
+  over the old raster.
+- While reading, the next page is prefetched: once the current page's model is ready and the browser is
+  idle, the following page is rendered into a detached canvas and snapshotted, and the page after that
+  only gets its model built. If the target pixels would exceed the raster budget, or the browser cannot
+  produce a snapshot, only the model is prefetched — the page is never drawn once for a cache that would
+  reject it. When the raster budget is short, the **next page wins**: older pages are evicted, so going
+  back several pages may re-render. A snapshot that resolves after the reader has moved away is dropped
+  rather than evicting the page they are about to read. A page turn, a document change or a
+  whole-document translation cancels the read-ahead; its failures are logged and never affect the
+  visible page, and its entries obey the same bounds and least-recently-used eviction as everything else.
 - Opening a file carries a task id; consecutive opens destroy stale tasks so an old file cannot
   overwrite a new one.
 - Translation and chat requests are bound to client-disconnect signals; stopping cancels model

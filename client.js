@@ -1639,13 +1639,24 @@ var PdfMathReaderPlugin = (() => {
       pumpThumbnailQueue();
     });
   }
-  function renderPdfPage(page, canvas, scale, signal) {
+  function pdfPixelRatio() {
+    return Math.min(window.devicePixelRatio || 1, 2);
+  }
+  function enqueueCanvas(canvas, task) {
     const previous = renderQueues.get(canvas) ?? Promise.resolve();
     const job = previous.catch(() => {
-    }).then(async () => {
+    }).then(task);
+    renderQueues.set(canvas, job);
+    return job;
+  }
+  function supportsRasterSnapshot() {
+    return typeof createImageBitmap === "function";
+  }
+  function renderPdfPage(page, canvas, scale, signal, options = {}) {
+    return enqueueCanvas(canvas, async () => {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const viewport = page.getViewport({ scale });
-      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const ratio = pdfPixelRatio();
       canvas.width = Math.max(1, Math.floor(viewport.width * ratio));
       canvas.height = Math.max(1, Math.floor(viewport.height * ratio));
       canvas.style.width = `${viewport.width}px`;
@@ -1665,10 +1676,37 @@ var PdfMathReaderPlugin = (() => {
       } finally {
         signal?.removeEventListener?.("abort", cancel);
       }
-      return viewport;
+      return {
+        viewport,
+        snapshot: options.snapshot === true ? copyCanvas(canvas) : null
+      };
     });
-    renderQueues.set(canvas, job);
-    return job;
+  }
+  async function copyCanvas(canvas) {
+    if (typeof createImageBitmap !== "function") return null;
+    try {
+      return await createImageBitmap(canvas);
+    } catch {
+      return null;
+    }
+  }
+  function drawPdfRaster(canvas, image, width, height, signal) {
+    return enqueueCanvas(canvas, async () => {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const pixelWidth = Math.max(1, Math.round(image.width));
+      const pixelHeight = Math.max(1, Math.round(image.height));
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const context = canvas.getContext("2d", { alpha: false });
+      if (context === null) throw new Error("Canvas 2D context is unavailable");
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, pixelWidth, pixelHeight);
+      context.drawImage(image, 0, 0);
+      return { width, height };
+    });
   }
   async function renderEquationCrop(page, bbox, options = {}, signal) {
     const metrics = cropMetrics(bbox, options);
@@ -2093,27 +2131,6 @@ var PdfMathReaderPlugin = (() => {
       height: line.height,
       lines: [line]
     };
-  }
-  async function extractPageModel(page, scale = 1, identity = void 0, options = {}) {
-    const library = await loadPdfJs();
-    const viewport = page.getViewport({ scale });
-    const textContent = await page.getTextContent({ includeMarkedContent: false });
-    let figures = options.figures;
-    if (figures === void 0 && options.detectFigures !== false) {
-      figures = await collectFigureRegions(page, library, viewport, options.figureOptions);
-    }
-    const model = buildPageModel(library, textContent, viewport, {
-      ...options,
-      figures,
-      pageIndex: identity?.pageIndex ?? options.pageIndex ?? 0
-    });
-    if (identity !== void 0) {
-      model.documentId = identity.documentId;
-      model.pageIndex = identity.pageIndex;
-    } else if (Number.isInteger(options.pageIndex)) {
-      model.pageIndex = options.pageIndex;
-    }
-    return model;
   }
   async function resolveOutline(document2, outline) {
     if (!Array.isArray(outline) || outline.length === 0) return [];
@@ -2995,6 +3012,148 @@ var PdfMathReaderPlugin = (() => {
       }
     }
     return { blocks, units, bodySize, frontMatter: composed };
+  }
+
+  // src/cache.js
+  var MODEL_CACHE_PAGES = 12;
+  var TEXT_CACHE_PAGES = 12;
+  var RASTER_CACHE_PAGES = 3;
+  var RASTER_CACHE_BYTES = 48 * 1024 * 1024;
+  function createPageCaches() {
+    return {
+      pageCache: /* @__PURE__ */ new Map(),
+      textCache: /* @__PURE__ */ new Map(),
+      figureCache: /* @__PURE__ */ new Map(),
+      bitmapCache: /* @__PURE__ */ new Map(),
+      // In-flight extraction, so a page prefetch and a foreground visit share one
+      // request instead of starting the same work twice on the same worker.
+      textTasks: /* @__PURE__ */ new Map(),
+      figureTasks: /* @__PURE__ */ new Map()
+    };
+  }
+  function shareTask(store, key, factory) {
+    if (store === void 0) return Promise.resolve().then(factory);
+    const pending = store.get(key);
+    if (pending !== void 0) return pending;
+    const task = Promise.resolve().then(factory);
+    store.set(key, task);
+    const clear = () => {
+      if (store.get(key) === task) store.delete(key);
+    };
+    task.then(clear, clear);
+    return task;
+  }
+  function shareTextTask(meta, pageIndex, factory) {
+    return shareTask(meta?.textTasks, pageIndex, factory);
+  }
+  function shareFigureTask(meta, pageIndex, factory) {
+    return shareTask(meta?.figureTasks, pageIndex, factory);
+  }
+  function readCached(map, key) {
+    const value = map?.get(key);
+    if (value === void 0) return void 0;
+    map.delete(key);
+    map.set(key, value);
+    return value;
+  }
+  function writeCached(map, key, value, limit) {
+    if (map === void 0) return value;
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > limit) {
+      const oldest = map.keys().next().value;
+      if (oldest === void 0) break;
+      map.delete(oldest);
+    }
+    return value;
+  }
+  function readModel(meta, pageIndex) {
+    return readCached(meta?.pageCache, pageIndex);
+  }
+  function writeModel(meta, pageIndex, model) {
+    return writeCached(meta?.pageCache, pageIndex, model, MODEL_CACHE_PAGES);
+  }
+  function invalidateModel(meta, pageIndex) {
+    meta?.pageCache?.delete(pageIndex);
+  }
+  function readText(meta, pageIndex) {
+    return readCached(meta?.textCache, pageIndex);
+  }
+  function writeText(meta, pageIndex, textContent) {
+    return writeCached(meta?.textCache, pageIndex, textContent, TEXT_CACHE_PAGES);
+  }
+  function readFigures(meta, pageIndex) {
+    return readCached(meta?.figureCache, pageIndex);
+  }
+  function writeFigures(meta, pageIndex, regions) {
+    return writeCached(meta?.figureCache, pageIndex, regions, MODEL_CACHE_PAGES);
+  }
+  function releaseRaster(entry) {
+    try {
+      entry?.bitmap?.close?.();
+    } catch {
+    }
+  }
+  function rasterBytes(store) {
+    let bytes = 0;
+    for (const entry of store.values()) bytes += entry.bytes;
+    return bytes;
+  }
+  function readRaster(meta, pageIndex) {
+    return readCached(meta?.bitmapCache, pageIndex);
+  }
+  function lookaheadIsUseful(targetPage, currentPage) {
+    return targetPage === currentPage || targetPage === currentPage + 1;
+  }
+  function rasterFitsBudget(pixelWidth, pixelHeight) {
+    if (!(pixelWidth > 0) || !(pixelHeight > 0)) return false;
+    return pixelWidth * pixelHeight * 4 <= RASTER_CACHE_BYTES;
+  }
+  function writeRaster(meta, pageIndex, entry) {
+    const store = meta?.bitmapCache;
+    if (store === void 0) return void 0;
+    const sized = {
+      ...entry,
+      bytes: entry.bytes ?? (entry.bitmap?.width ?? 0) * (entry.bitmap?.height ?? 0) * 4
+    };
+    const previous = store.get(pageIndex);
+    if (previous !== void 0 && previous.version !== void 0 && sized.version !== void 0 && previous.version > sized.version) {
+      releaseRaster(sized);
+      return previous;
+    }
+    if (sized.bytes > RASTER_CACHE_BYTES) {
+      releaseRaster(sized);
+      return previous;
+    }
+    if (previous !== void 0 && previous !== sized) releaseRaster(previous);
+    store.delete(pageIndex);
+    store.set(pageIndex, sized);
+    while (store.size > RASTER_CACHE_PAGES) {
+      const oldest = store.keys().next().value;
+      if (oldest === void 0 || oldest === pageIndex) break;
+      releaseRaster(store.get(oldest));
+      store.delete(oldest);
+    }
+    while (store.size > 1 && rasterBytes(store) > RASTER_CACHE_BYTES) {
+      const oldest = store.keys().next().value;
+      if (oldest === void 0 || oldest === pageIndex) break;
+      releaseRaster(store.get(oldest));
+      store.delete(oldest);
+    }
+    return sized;
+  }
+  function disposeCaches(meta) {
+    if (meta === null || meta === void 0) return;
+    const store = meta.bitmapCache;
+    if (store !== void 0) {
+      for (const entry of store.values()) releaseRaster(entry);
+      store.clear();
+    }
+    meta.pageCache?.clear?.();
+    meta.textCache?.clear?.();
+    meta.figureCache?.clear?.();
+    meta.textTasks?.clear?.();
+    meta.figureTasks?.clear?.();
   }
 
   // src/references.js
@@ -5239,6 +5398,53 @@ var PdfMathReaderPlugin = (() => {
   function isAbort(error) {
     return error?.name === "AbortError" || error?.name === "RenderingCancelledException" || error?.name === "AbortException" || error?.code === "TRANSLATION_ABORTED" || error?.code === "ABORT_ERR";
   }
+  function pageDisplayScale(baseWidth, viewerWidth, zoomMode, zoom) {
+    if (!(baseWidth > 0)) return 1;
+    if (zoomMode === "fit") return clamp2(Math.max(260, viewerWidth - 56) / baseWidth, 0.4, 3);
+    return clamp2(zoom, 0.35, 4);
+  }
+  function modelBaseSize(model) {
+    const width = Number.isFinite(model?.pageWidth) ? model.pageWidth : model?.viewport?.width;
+    const height = Number.isFinite(model?.pageHeight) ? model.pageHeight : model?.viewport?.height;
+    return {
+      width: Number.isFinite(width) && width > 0 ? width : 612,
+      height: Number.isFinite(height) && height > 0 ? height : 792
+    };
+  }
+  function scheduleIdle(callback, timeoutMs = 1500) {
+    if (typeof window.requestIdleCallback === "function") {
+      const id2 = window.requestIdleCallback(callback, { timeout: timeoutMs });
+      return () => window.cancelIdleCallback?.(id2);
+    }
+    const id = window.setTimeout(() => callback({ didTimeout: true, timeRemaining: () => 0 }), 250);
+    return () => window.clearTimeout(id);
+  }
+  async function pageTextContent(meta, pageIndex, page) {
+    const cached = readText(meta, pageIndex);
+    if (cached !== void 0) return cached;
+    const textContent = await shareTextTask(
+      meta,
+      pageIndex,
+      () => page.getTextContent({ includeMarkedContent: false })
+    );
+    return writeText(meta, pageIndex, textContent);
+  }
+  async function pageFigureRegions(meta, pageIndex, page, library, baseViewport) {
+    const cached = readFigures(meta, pageIndex);
+    if (cached !== void 0) return cached;
+    let regions = [];
+    try {
+      regions = await shareFigureTask(
+        meta,
+        pageIndex,
+        () => collectFigureRegions(page, library, baseViewport)
+      );
+    } catch (error) {
+      console.warn("pdf-math-reader: figure detection failed", error);
+      regions = [];
+    }
+    return writeFigures(meta, pageIndex, regions);
+  }
   function loadNotes() {
     try {
       const raw = window.localStorage?.getItem(NOTES_KEY);
@@ -6457,6 +6663,7 @@ $$`),
     const [pageDraft, setPageDraft] = (0, import_react2.useState)("1");
     const [pageModel, setPageModel] = (0, import_react2.useState)(null);
     const [pageSize, setPageSize] = (0, import_react2.useState)(null);
+    const [pageScale, setPageScale] = (0, import_react2.useState)(1);
     const [renderState, setRenderState] = (0, import_react2.useState)("idle");
     const [renderError, setRenderError] = (0, import_react2.useState)("");
     const [renderNonce, setRenderNonce] = (0, import_react2.useState)(0);
@@ -6513,6 +6720,12 @@ $$`),
     const textLayerRef = (0, import_react2.useRef)(null);
     const textLayerTaskRef = (0, import_react2.useRef)(null);
     const docRef = (0, import_react2.useRef)(null);
+    const pageIndexRef = (0, import_react2.useRef)(0);
+    pageIndexRef.current = pageIndex;
+    const pageModelRef = (0, import_react2.useRef)(null);
+    pageModelRef.current = pageModel;
+    const prefetchRef = (0, import_react2.useRef)({ generation: 0, controller: null, stop: null });
+    const rasterSeqRef = (0, import_react2.useRef)(0);
     const translationCacheRef = (0, import_react2.useRef)(/* @__PURE__ */ new Map());
     const translationAbortRef = (0, import_react2.useRef)(null);
     const translationEpochRef = (0, import_react2.useRef)(0);
@@ -6558,7 +6771,7 @@ $$`),
     const pageBusy = Boolean(busyPages[pageIndex]) || Boolean(progress?.running);
     const hasPageTranslation = readingUnits.some((unit) => Boolean(pageTranslation[unit.id]?.text));
     const waitingForTranslation = viewMode !== "source" && readingUnits.length > 0 && !hasPageTranslation && pageStatus !== "loading" && pageStatus !== "error";
-    const currentScale = pageModel?.viewport?.scale ?? 1;
+    const currentScale = pageScale;
     const activeLines = pageModel?.paragraphs.find((paragraph) => paragraph.id === activeParagraph)?.lines ?? [];
     const docFingerprint = doc?.fingerprint ?? "";
     const pageOverrides = (0, import_react2.useMemo)(
@@ -6716,8 +6929,6 @@ $$`),
       if (pending !== null && (pending.documentId !== doc.fingerprint || pending.pageIndex !== pageIndex)) {
         pendingFocusRef.current = null;
       }
-      setPageModel(null);
-      setPageSize(null);
       setRenderError("");
       setActiveParagraph(null);
       setActiveEquation(null);
@@ -6735,92 +6946,177 @@ $$`),
     }, [pageIndex]);
     (0, import_react2.useEffect)(() => {
       if (!doc) return void 0;
+      const meta = doc;
       let cancelled = false;
       const controller = new AbortController();
-      setRenderState("loading");
+      const cachedModel = readModel(meta, pageIndex);
+      const shownModel = pageModelRef.current;
+      const samePage = shownModel !== null && shownModel !== void 0 && shownModel.documentId === meta.fingerprint && shownModel.pageIndex === pageIndex;
+      if (cachedModel === void 0) {
+        if (!samePage) {
+          setPageModel(null);
+          setPageSize(null);
+          setRenderState("loading");
+        }
+      } else {
+        const base = modelBaseSize(cachedModel);
+        const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom);
+        setPageModel(cachedModel);
+        setPageSize({ width: base.width * scale, height: base.height * scale });
+        setPageScale(scale);
+        if (!samePage) setRenderState("loading");
+      }
       setRenderError("");
+      const paintTextLayer = async (library, textContent, viewport) => {
+        const container = textLayerRef.current;
+        if (container === null || typeof library.TextLayer !== "function") return;
+        try {
+          container.replaceChildren();
+          container.style.setProperty("--scale-factor", String(viewport.scale));
+          container.style.setProperty("--scale-round-x", "1px");
+          container.style.setProperty("--scale-round-y", "1px");
+          const textLayer = new library.TextLayer({
+            textContentSource: textContent,
+            container,
+            viewport
+          });
+          textLayerTaskRef.current = textLayer;
+          await textLayer.render();
+          if (textLayerTaskRef.current === textLayer) textLayerTaskRef.current = null;
+          if (cancelled) {
+            textLayer.cancel();
+            container.replaceChildren();
+          }
+        } catch (error) {
+          if (!cancelled && !isAbort(error)) {
+            console.warn("pdf-math-reader: text layer failed", error);
+          }
+        }
+      };
+      const rememberRaster = (snapshot, scale, ratio, version) => {
+        if (snapshot === null || snapshot === void 0) return;
+        snapshot.then((bitmap) => {
+          if (bitmap === null || bitmap === void 0) return;
+          if (docRef.current !== meta) {
+            releaseRaster({ bitmap });
+            return;
+          }
+          writeRaster(meta, pageIndex, {
+            bitmap,
+            bytes: bitmap.width * bitmap.height * 4,
+            ratio,
+            scale,
+            version
+          });
+        }).catch(() => {
+        });
+      };
       const run = async () => {
         try {
           const library = await loadPdfJs();
           if (cancelled) return;
-          const page = await doc.pdf.getPage(pageIndex + 1);
+          const page = await meta.pdf.getPage(pageIndex + 1);
           if (cancelled) return;
           const base = page.getViewport({ scale: 1 });
-          const available = Math.max(260, viewerWidth - 56);
-          const scale = zoomMode === "fit" ? clamp2(available / base.width, 0.4, 3) : clamp2(zoom, 0.35, 4);
+          const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom);
+          const viewport = page.getViewport({ scale });
           const canvas = canvasRef.current;
           if (canvas === null) return;
-          const viewport = await renderPdfPage(page, canvas, scale, controller.signal);
-          if (cancelled) return;
           setPageSize({ width: viewport.width, height: viewport.height });
-          setRenderState("ready");
-          let textContent;
-          let figures2 = doc.figureCache?.get(pageIndex);
-          if (figures2 === void 0) {
+          setPageScale(scale);
+          const ratio = pdfPixelRatio();
+          const version = rasterSeqRef.current += 1;
+          const snapshotWanted = supportsRasterSnapshot() && rasterFitsBudget(
+            Math.floor(viewport.width * ratio),
+            Math.floor(viewport.height * ratio)
+          );
+          const cachedRaster = readRaster(meta, pageIndex);
+          const exactRaster = cachedRaster !== void 0 && Math.abs(cachedRaster.scale - scale) < 1e-3 && cachedRaster.ratio === ratio;
+          let painted = "none";
+          if (cachedRaster !== void 0) {
             try {
-              figures2 = await collectFigureRegions(page, library, viewport);
+              await drawPdfRaster(
+                canvas,
+                cachedRaster.bitmap,
+                viewport.width,
+                viewport.height,
+                controller.signal
+              );
               if (cancelled) return;
-              doc.figureCache?.set(pageIndex, figures2);
+              setRenderState("ready");
+              painted = exactRaster ? "exact" : "preview";
             } catch (error) {
-              console.warn("pdf-math-reader: figure detection failed", error);
-              figures2 = [];
+              if (cancelled || controller.signal.aborted || isAbort(error)) return;
+              console.warn("pdf-math-reader: cached raster failed", error);
             }
           }
-          let model = {
-            blocks: [],
-            paragraphs: [],
-            equations: [],
-            figures: [],
-            lines: [],
-            viewport,
-            pageWidth: viewport.width,
-            pageHeight: viewport.height
-          };
-          try {
-            textContent = await page.getTextContent({ includeMarkedContent: false });
-            if (cancelled) return;
-            model = buildPageModel(library, textContent, viewport, {
-              pageIndex,
-              figures: figures2,
-              overrides: pageOverridesFor(
-                equationOverridesRef.current,
-                doc.fingerprint,
-                pageIndex
-              )
-            });
-          } catch (error) {
-            console.warn("pdf-math-reader: text extraction failed", error);
-          }
-          if (cancelled) return;
-          if (docRef.current !== doc) return;
-          model.documentId = doc.fingerprint;
-          model.pageIndex = pageIndex;
-          doc.pageCache?.set(pageIndex, model);
-          setPageModel(model);
-          const container = textLayerRef.current;
-          if (container !== null && textContent !== void 0 && typeof library.TextLayer === "function") {
-            try {
-              container.replaceChildren();
-              container.style.setProperty("--scale-factor", String(viewport.scale));
-              container.style.setProperty("--scale-round-x", "1px");
-              container.style.setProperty("--scale-round-y", "1px");
-              const textLayer = new library.TextLayer({
-                textContentSource: textContent,
-                container,
-                viewport
+          if (painted !== "exact") {
+            if (painted === "preview") {
+              const offscreen = document.createElement("canvas");
+              const result = await renderPdfPage(page, offscreen, scale, controller.signal, {
+                snapshot: snapshotWanted
               });
-              textLayerTaskRef.current = textLayer;
-              await textLayer.render();
-              if (textLayerTaskRef.current === textLayer) textLayerTaskRef.current = null;
-              if (cancelled) {
-                textLayer.cancel();
-                container.replaceChildren();
-              }
-            } catch (error) {
-              if (!cancelled && !isAbort(error)) {
-                console.warn("pdf-math-reader: text layer failed", error);
-              }
+              rememberRaster(result.snapshot, scale, ratio, version);
+              if (cancelled) return;
+              await drawPdfRaster(
+                canvas,
+                offscreen,
+                viewport.width,
+                viewport.height,
+                controller.signal
+              );
+            } else {
+              const result = await renderPdfPage(page, canvas, scale, controller.signal, {
+                snapshot: snapshotWanted
+              });
+              rememberRaster(result.snapshot, scale, ratio, version);
             }
+            if (cancelled) return;
+            setRenderState("ready");
+          }
+          if (cachedModel === void 0) {
+            const figuresPromise = pageFigureRegions(meta, pageIndex, page, library, base);
+            let textContent;
+            try {
+              textContent = await pageTextContent(meta, pageIndex, page);
+            } catch (error) {
+              console.warn("pdf-math-reader: text extraction failed", error);
+              textContent = void 0;
+            }
+            if (cancelled) return;
+            if (textContent !== void 0) void paintTextLayer(library, textContent, viewport);
+            const figures2 = await figuresPromise;
+            if (cancelled) return;
+            const model = buildPageModel(
+              library,
+              textContent ?? { items: [] },
+              base,
+              {
+                pageIndex,
+                figures: figures2,
+                overrides: pageOverridesFor(
+                  equationOverridesRef.current,
+                  meta.fingerprint,
+                  pageIndex
+                )
+              }
+            );
+            if (cancelled) return;
+            if (docRef.current !== meta) return;
+            model.documentId = meta.fingerprint;
+            model.pageIndex = pageIndex;
+            if (textContent !== void 0) writeModel(meta, pageIndex, model);
+            if (pageIndexRef.current === pageIndex) setPageModel(model);
+          } else {
+            let textContent;
+            try {
+              textContent = await pageTextContent(meta, pageIndex, page);
+            } catch (error) {
+              console.warn("pdf-math-reader: text extraction failed", error);
+              textContent = void 0;
+            }
+            if (cancelled || textContent === void 0) return;
+            void paintTextLayer(library, textContent, viewport);
           }
         } catch (error) {
           if (cancelled || controller.signal.aborted || isAbort(error)) return;
@@ -6836,6 +7132,141 @@ $$`),
         textLayerTaskRef.current = null;
       };
     }, [doc, modelRevision, pageIndex, zoomMode, zoom, viewerWidth, renderNonce]);
+    const cancelPrefetch = (0, import_react2.useCallback)(() => {
+      const state = prefetchRef.current;
+      state.generation += 1;
+      state.stop?.();
+      state.stop = null;
+      state.controller?.abort();
+      state.controller = null;
+    }, []);
+    const prefetchPage = (0, import_react2.useCallback)(
+      async (targetPage, controller) => {
+        const meta = docRef.current;
+        if (meta === null || targetPage < 0 || targetPage >= meta.numPages) return;
+        if (targetPage !== pageIndexRef.current + 1) return;
+        const stale = () => controller.signal.aborted || docRef.current !== meta;
+        const library = await loadPdfJs();
+        if (stale()) return;
+        const page = await meta.pdf.getPage(targetPage + 1);
+        if (stale()) return;
+        const base = page.getViewport({ scale: 1 });
+        const scale = pageDisplayScale(base.width, viewerWidth, zoomMode, zoom);
+        if (readModel(meta, targetPage) === void 0) {
+          const [textContent, figures2] = await Promise.all([
+            pageTextContent(meta, targetPage, page),
+            pageFigureRegions(meta, targetPage, page, library, base)
+          ]);
+          if (stale()) return;
+          const model = buildPageModel(library, textContent, base, {
+            pageIndex: targetPage,
+            figures: figures2,
+            overrides: pageOverridesFor(
+              equationOverridesRef.current,
+              meta.fingerprint,
+              targetPage
+            )
+          });
+          if (stale()) return;
+          model.documentId = meta.fingerprint;
+          model.pageIndex = targetPage;
+          writeModel(meta, targetPage, model);
+        }
+        const ratio = pdfPixelRatio();
+        const cached = readRaster(meta, targetPage);
+        if (cached !== void 0 && Math.abs(cached.scale - scale) < 1e-3 && cached.ratio === ratio) {
+          return;
+        }
+        const viewport = page.getViewport({ scale });
+        if (!supportsRasterSnapshot() || !rasterFitsBudget(
+          Math.floor(viewport.width * ratio),
+          Math.floor(viewport.height * ratio)
+        )) {
+          return;
+        }
+        const canvas = document.createElement("canvas");
+        const version = rasterSeqRef.current += 1;
+        const { snapshot } = await renderPdfPage(page, canvas, scale, controller.signal, {
+          snapshot: true
+        });
+        if (snapshot === null) return;
+        snapshot.then((bitmap) => {
+          if (bitmap === null || bitmap === void 0) return;
+          if (docRef.current !== meta) {
+            releaseRaster({ bitmap });
+            return;
+          }
+          if (!lookaheadIsUseful(targetPage, pageIndexRef.current)) {
+            releaseRaster({ bitmap });
+            return;
+          }
+          writeRaster(meta, targetPage, {
+            bitmap,
+            bytes: bitmap.width * bitmap.height * 4,
+            ratio,
+            scale,
+            version
+          });
+        }).catch(() => {
+        });
+      },
+      [viewerWidth, zoom, zoomMode]
+    );
+    (0, import_react2.useEffect)(() => {
+      cancelPrefetch();
+      if (doc === null || renderState !== "ready") return void 0;
+      if (pageModel === null || pageModel.pageIndex !== pageIndex || pageModel.documentId !== doc.fingerprint) {
+        return void 0;
+      }
+      if (progress?.running === true) return void 0;
+      const meta = doc;
+      const state = prefetchRef.current;
+      const generation = state.generation;
+      const controller = new AbortController();
+      state.controller = controller;
+      const next = pageIndex + 1;
+      const following = pageIndex + 2;
+      const canPrefetch = next < meta.numPages || following < meta.numPages;
+      if (!canPrefetch) return void 0;
+      state.stop = scheduleIdle(() => {
+        if (generation !== prefetchRef.current.generation) return;
+        const run = async () => {
+          if (next < meta.numPages) await prefetchPage(next, controller);
+          if (controller.signal.aborted) return;
+          if (following < meta.numPages && readModel(meta, following) === void 0) {
+            const page = await meta.pdf.getPage(following + 1);
+            if (controller.signal.aborted || docRef.current !== meta) return;
+            const library = await loadPdfJs();
+            const base = page.getViewport({ scale: 1 });
+            const [textContent, figures2] = await Promise.all([
+              pageTextContent(meta, following, page),
+              pageFigureRegions(meta, following, page, library, base)
+            ]);
+            if (controller.signal.aborted || docRef.current !== meta) return;
+            const model = buildPageModel(library, textContent, base, {
+              pageIndex: following,
+              figures: figures2,
+              overrides: pageOverridesFor(
+                equationOverridesRef.current,
+                meta.fingerprint,
+                following
+              )
+            });
+            model.documentId = meta.fingerprint;
+            model.pageIndex = following;
+            writeModel(meta, following, model);
+          }
+        };
+        run().catch((error) => {
+          if (!isAbort(error) && !controller.signal.aborted) {
+            console.warn("pdf-math-reader: page prefetch failed", error);
+          }
+        });
+      });
+      return () => {
+        cancelPrefetch();
+      };
+    }, [cancelPrefetch, doc, pageIndex, pageModel, prefetchPage, progress?.running, renderState]);
     (0, import_react2.useEffect)(() => {
       if (!settingsOpen && !exportOpen) return void 0;
       const onKeyDown = (event) => {
@@ -6850,17 +7281,20 @@ $$`),
       return () => {
         openTaskRef.current += 1;
         window.clearTimeout(toastTimerRef.current);
+        cancelPrefetch();
         translationAbortRef.current?.abort();
         selectionAbortRef.current?.abort();
         const meta = docRef.current;
         docRef.current = null;
+        disposeCaches(meta);
         if (meta !== null) meta.pdf.destroy?.().catch?.(() => {
         });
       };
-    }, []);
+    }, [cancelPrefetch]);
     const closeDocument = (0, import_react2.useCallback)(() => {
       openTaskRef.current += 1;
       translationEpochRef.current += 1;
+      cancelPrefetch();
       translationAbortRef.current?.abort();
       translationAbortRef.current = null;
       selectionAbortRef.current?.abort();
@@ -6868,6 +7302,8 @@ $$`),
       docRef.current = null;
       setDoc(null);
       setPageModel(null);
+      setPageSize(null);
+      setPageScale(1);
       setPageIndex(0);
       setTranslations({});
       setPageTranslationState({});
@@ -6881,9 +7317,10 @@ $$`),
       setEquationRect(null);
       equationImageCacheRef.current.clear();
       setOpenError("");
+      disposeCaches(meta);
       if (meta !== null) meta.pdf.destroy?.().catch?.(() => {
       });
-    }, []);
+    }, [cancelPrefetch]);
     const openFile = (0, import_react2.useCallback)(
       async (file) => {
         if (file === null || file === void 0) return;
@@ -6894,15 +7331,19 @@ $$`),
         const taskId = openTaskRef.current + 1;
         openTaskRef.current = taskId;
         translationEpochRef.current += 1;
+        cancelPrefetch();
         translationAbortRef.current?.abort();
         translationAbortRef.current = null;
         selectionAbortRef.current?.abort();
         const previous = docRef.current;
         docRef.current = null;
+        disposeCaches(previous);
         if (previous !== null) previous.pdf.destroy?.().catch?.(() => {
         });
         setDoc(null);
         setPageModel(null);
+        setPageSize(null);
+        setPageScale(1);
         setOpenError("");
         setTranslations({});
         setPageTranslationState({});
@@ -6936,8 +7377,7 @@ $$`),
             fingerprint: fileFingerprint(file),
             numPages: pdf.numPages,
             outline,
-            pageCache: /* @__PURE__ */ new Map(),
-            figureCache: /* @__PURE__ */ new Map()
+            ...createPageCaches()
           };
           docRef.current = meta;
           setDoc(meta);
@@ -6952,7 +7392,7 @@ $$`),
           setRenderState("idle");
         }
       },
-      [notify, tt]
+      [cancelPrefetch, notify, tt]
     );
     const pickFile = (0, import_react2.useCallback)(() => {
       fileInputRef.current?.click();
@@ -6977,6 +7417,15 @@ $$`),
       if (Number.isFinite(parsed)) goToPage(parsed - 1);
       else setPageDraft(String(pageIndex + 1));
     }, [goToPage, pageDraft, pageIndex]);
+    const retryRender = (0, import_react2.useCallback)(() => {
+      const meta = docRef.current;
+      const entry = meta === null ? void 0 : readRaster(meta, pageIndex);
+      if (entry !== void 0) {
+        releaseRaster(entry);
+        meta.bitmapCache?.delete?.(pageIndex);
+      }
+      setRenderNonce((value) => value + 1);
+    }, [pageIndex]);
     (0, import_react2.useEffect)(() => {
       if (doc === null) return void 0;
       const element = viewerRef.current;
@@ -7058,10 +7507,15 @@ $$`),
       return () => window.removeEventListener("keydown", onKeyDown);
     }, [clearTextSelection, doc, goToPage, pageIndex]);
     const lineAtPoint = (0, import_react2.useCallback)(
-      (x, y) => pageModel?.lines.find(
-        (line) => x >= line.x - 2 && x <= line.x + line.width + 2 && y >= line.top - 2 && y <= line.top + line.height + 2
-      ),
-      [pageModel]
+      (x, y) => {
+        const scale = currentScale > 0 ? currentScale : 1;
+        const px = x / scale;
+        const py = y / scale;
+        return pageModel?.lines.find(
+          (line) => px >= line.x - 2 / scale && px <= line.x + line.width + 2 / scale && py >= line.top - 2 / scale && py <= line.top + line.height + 2 / scale
+        );
+      },
+      [currentScale, pageModel]
     );
     const scrollToParagraph = (0, import_react2.useCallback)(
       (paragraphId, model = pageModel) => {
@@ -7074,10 +7528,11 @@ $$`),
         const pageRect = pageElement.getBoundingClientRect();
         const line = paragraph.lines[0];
         if (line === void 0) return;
-        const target = root.scrollTop + (pageRect.top - rootRect.top) + line.top + line.height / 2 - root.clientHeight / 2;
+        const scale = currentScale > 0 ? currentScale : 1;
+        const target = root.scrollTop + (pageRect.top - rootRect.top) + line.top * scale + line.height * scale / 2 - root.clientHeight / 2;
         root.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
       },
-      [pageModel]
+      [currentScale, pageModel]
     );
     const focusParagraph = (0, import_react2.useCallback)(
       (paragraphId) => {
@@ -7094,12 +7549,12 @@ $$`),
       [activeParagraph, clearTextSelection, scrollToParagraph]
     );
     const scrollToEquation = (0, import_react2.useCallback)(
-      (equation, model = pageModel) => {
+      (equation) => {
         const root = viewerRef.current;
         if (root === null) return;
         const pageElement = root.querySelector(".pmr-page");
         if (pageElement === null) return;
-        const scale = model?.viewport?.scale ?? 1;
+        const scale = currentScale > 0 ? currentScale : 1;
         const rootRect = root.getBoundingClientRect();
         const pageRect = pageElement.getBoundingClientRect();
         const top = equation.bbox[1] * scale;
@@ -7107,7 +7562,7 @@ $$`),
         const target = root.scrollTop + (pageRect.top - rootRect.top) + top + height / 2 - root.clientHeight / 2;
         root.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
       },
-      [pageModel]
+      [currentScale]
     );
     const focusEquation = (0, import_react2.useCallback)(
       (equation) => {
@@ -7170,7 +7625,7 @@ $$`),
           else next[fingerprint] = nextPages;
           return next;
         });
-        meta.pageCache?.delete(pageIndex);
+        invalidateModel(meta, pageIndex);
         const prefix = `${fingerprint}:${pageIndex}:`;
         for (const key of [...equationImageCacheRef.current.keys()]) {
           if (key.startsWith(prefix)) equationImageCacheRef.current.delete(key);
@@ -7279,53 +7734,51 @@ $$`),
       clearTextSelection();
       notify(tt("equation.selectHint"));
     }, [clearTextSelection, equationSelectMode, notify, tt]);
+    const pagePointFromEvent = (0, import_react2.useCallback)(
+      (event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const scale = currentScale > 0 ? currentScale : 1;
+        const width = pageSize !== null ? pageSize.width / scale : 612;
+        const height = pageSize !== null ? pageSize.height / scale : 792;
+        return {
+          x: clamp2((event.clientX - rect.left) / scale, 0, width),
+          y: clamp2((event.clientY - rect.top) / scale, 0, height)
+        };
+      },
+      [currentScale, pageSize]
+    );
     const onEquationPointerDown = (0, import_react2.useCallback)(
       (event) => {
         if (!equationSelectMode || pageModel === null) return;
         if (event.button !== 0) return;
         event.preventDefault();
-        const rect = event.currentTarget.getBoundingClientRect();
-        const scale = pageModel.viewport.scale;
-        const pageWidth = pageModel.viewport.width / scale;
-        const pageHeight = pageModel.viewport.height / scale;
-        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
-        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
-        equationDragRef.current = { x0: x, y0: y };
-        setEquationRect({ x0: x, y0: y, x1: x, y1: y });
+        const point = pagePointFromEvent(event);
+        equationDragRef.current = { x0: point.x, y0: point.y };
+        setEquationRect({ x0: point.x, y0: point.y, x1: point.x, y1: point.y });
         event.currentTarget.setPointerCapture?.(event.pointerId);
       },
-      [equationSelectMode, pageModel]
+      [equationSelectMode, pageModel, pagePointFromEvent]
     );
     const onEquationPointerMove = (0, import_react2.useCallback)(
       (event) => {
         const drag = equationDragRef.current;
         if (drag === null || pageModel === null) return;
-        const rect = event.currentTarget.getBoundingClientRect();
-        const scale = pageModel.viewport.scale;
-        const pageWidth = pageModel.viewport.width / scale;
-        const pageHeight = pageModel.viewport.height / scale;
-        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
-        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
-        setEquationRect({ x0: drag.x0, y0: drag.y0, x1: x, y1: y });
+        const point = pagePointFromEvent(event);
+        setEquationRect({ x0: drag.x0, y0: drag.y0, x1: point.x, y1: point.y });
       },
-      [pageModel]
+      [pageModel, pagePointFromEvent]
     );
     const onEquationPointerUp = (0, import_react2.useCallback)(
       (event) => {
         const drag = equationDragRef.current;
         if (drag === null || pageModel === null) return;
         equationDragRef.current = null;
-        const rect = event.currentTarget.getBoundingClientRect();
-        const scale = pageModel.viewport.scale;
-        const pageWidth = pageModel.viewport.width / scale;
-        const pageHeight = pageModel.viewport.height / scale;
-        const x = clamp2((event.clientX - rect.left) / scale, 0, pageWidth);
-        const y = clamp2((event.clientY - rect.top) / scale, 0, pageHeight);
+        const point = pagePointFromEvent(event);
         const box = [
-          Math.min(drag.x0, x),
-          Math.min(drag.y0, y),
-          Math.max(drag.x0, x),
-          Math.max(drag.y0, y)
+          Math.min(drag.x0, point.x),
+          Math.min(drag.y0, point.y),
+          Math.max(drag.x0, point.x),
+          Math.max(drag.y0, point.y)
         ];
         setEquationRect(null);
         if (box[2] - box[0] < 6 || box[3] - box[1] < 4) {
@@ -7335,7 +7788,7 @@ $$`),
         setEquationSelectMode(false);
         addManualEquation(box);
       },
-      [addManualEquation, notify, pageModel, tt]
+      [addManualEquation, notify, pageModel, pagePointFromEvent, tt]
     );
     const handleTextMouseUp = (0, import_react2.useCallback)(
       (event) => {
@@ -7403,7 +7856,9 @@ $$`),
         paragraphId: currentParagraph.id,
         source: currentParagraph.text,
         sourceSnippet: currentParagraph.text.replace(/\s+/g, " ").trim().slice(0, 180),
+        // Canonical page points; older notes carry no unit and stored display pixels.
         anchorTop: currentParagraph.lines[0]?.top ?? null,
+        anchorUnit: "pt",
         text,
         updatedAt: Date.now()
       };
@@ -7478,6 +7933,9 @@ $$`),
           paragraphId: note.paragraphId,
           sourceSnippet: note.sourceSnippet ?? note.source ?? "",
           anchorTop: Number.isFinite(note.anchorTop) ? note.anchorTop : null,
+          // Notes saved before the canonical model stored display pixels; newer ones
+          // store page points. The unit decides whether the anchor needs scaling.
+          anchorUnit: note.anchorUnit === "pt" ? "pt" : "px",
           requestId
         };
         pendingFocusRef.current = request;
@@ -7534,13 +7992,17 @@ $$`),
         });
         return;
       }
-      if (request.anchorTop !== null) scrollToOffset(request.anchorTop, pageModel);
+      if (request.anchorTop !== null) {
+        const anchorTop = request.anchorUnit === "pt" ? request.anchorTop * currentScale : request.anchorTop;
+        scrollToOffset(anchorTop, pageModel);
+      }
       if (pendingFocusRef.current?.requestId === request.requestId) {
         pendingFocusRef.current = null;
         setFocusRequest(null);
         notify(tt("notes.notFound"), "error");
       }
     }, [
+      currentScale,
       doc,
       focusRequest,
       notify,
@@ -7786,31 +8248,28 @@ $$`),
     const getPageModel = (0, import_react2.useCallback)(async (targetPage) => {
       const meta = docRef.current;
       if (meta === null) return { blocks: [], paragraphs: [] };
-      const cached = meta.pageCache?.get(targetPage);
+      const cached = readModel(meta, targetPage);
       if (cached !== void 0) return cached;
       const page = await meta.pdf.getPage(targetPage + 1);
-      const model = await extractPageModel(
-        page,
-        1,
-        {
-          documentId: meta.fingerprint,
-          pageIndex: targetPage
-        },
-        {
-          figures: meta.figureCache?.get(targetPage),
-          overrides: pageOverridesFor(
-            equationOverridesRef.current,
-            meta.fingerprint,
-            targetPage
-          )
-        }
-      );
+      const library = await loadPdfJs();
+      const base = page.getViewport({ scale: 1 });
+      const [textContent, figures2] = await Promise.all([
+        pageTextContent(meta, targetPage, page),
+        pageFigureRegions(meta, targetPage, page, library, base)
+      ]);
       if (docRef.current !== meta) return { blocks: [], paragraphs: [] };
-      meta.figureCache?.set(
-        targetPage,
-        model.figureRegionsRaw ?? model.figureRegions ?? []
-      );
-      meta.pageCache?.set(targetPage, model);
+      const model = buildPageModel(library, textContent, base, {
+        pageIndex: targetPage,
+        figures: figures2,
+        overrides: pageOverridesFor(
+          equationOverridesRef.current,
+          meta.fingerprint,
+          targetPage
+        )
+      });
+      model.documentId = meta.fingerprint;
+      model.pageIndex = targetPage;
+      writeModel(meta, targetPage, model);
       return model;
     }, []);
     const stopTranslation = (0, import_react2.useCallback)(() => {
@@ -7940,41 +8399,16 @@ $$`),
     const collectPages = (0, import_react2.useCallback)(async () => {
       const meta = docRef.current;
       if (meta === null) return [];
-      const cache = meta.pageCache ?? /* @__PURE__ */ new Map();
       const pages = [];
       for (let index = 0; index < meta.numPages; index += 1) {
-        let model = cache.get(index);
-        if (model === void 0) {
-          const page = await meta.pdf.getPage(index + 1);
-          model = await extractPageModel(
-            page,
-            1,
-            {
-              documentId: meta.fingerprint,
-              pageIndex: index
-            },
-            {
-              figures: meta.figureCache?.get(index),
-              overrides: pageOverridesFor(
-                equationOverridesRef.current,
-                meta.fingerprint,
-                index
-              )
-            }
-          );
-          if (docRef.current !== meta) return [];
-          meta.figureCache?.set(
-            index,
-            model.figureRegionsRaw ?? model.figureRegions ?? []
-          );
-          cache.set(index, model);
-        }
+        const model = await getPageModel(index);
+        if (docRef.current !== meta) return [];
         if ((model.blocks?.length ?? 0) > 0) {
           pages.push({ index, model, blocks: model.blocks, paragraphs: model.paragraphs });
         }
       }
       return pages;
-    }, []);
+    }, [getPageModel]);
     const buildChatContext = (0, import_react2.useCallback)(
       async (scope) => {
         const meta = docRef.current;
@@ -8928,19 +9362,19 @@ ${body}
                 "div",
                 {
                   className: "pmr-page",
-                  style: pageModel !== null ? { width: pageModel.viewport.width, height: pageModel.viewport.height } : pageSize !== null ? { width: pageSize.width, height: pageSize.height } : { width: 620, height: 800 },
+                  style: pageSize !== null ? { width: pageSize.width, height: pageSize.height } : { width: 620, height: 800 },
                   children: [
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("canvas", { ref: canvasRef, className: "pmr-canvas" }),
-                    /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-highlights", "aria-hidden": "true", children: [
+                    /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-highlights", "aria-hidden": "true", children: renderState !== "ready" ? null : /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
                       noteLines.map((line, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                         "div",
                         {
                           className: "pmr-hl pmr-note-hl",
                           style: {
-                            left: line.x,
-                            top: line.top,
-                            width: line.width,
-                            height: line.height
+                            left: line.x * currentScale,
+                            top: line.top * currentScale,
+                            width: line.width * currentScale,
+                            height: line.height * currentScale
                           }
                         },
                         `note-${line.id}-${index}`
@@ -8950,10 +9384,10 @@ ${body}
                         {
                           className: "pmr-hl",
                           style: {
-                            left: line.x,
-                            top: line.top,
-                            width: line.width,
-                            height: line.height
+                            left: line.x * currentScale,
+                            top: line.top * currentScale,
+                            width: line.width * currentScale,
+                            height: line.height * currentScale
                           }
                         },
                         line.id
@@ -8970,7 +9404,7 @@ ${body}
                           }
                         }
                       )
-                    ] }),
+                    ] }) }),
                     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                       "div",
                       {
@@ -9019,7 +9453,7 @@ ${body}
                           type: "button",
                           className: "pmr-btn pmr-btn-ghost",
                           style: { marginTop: 10 },
-                          onClick: () => setRenderNonce((value) => value + 1),
+                          onClick: retryRender,
                           children: tt("action.retry")
                         }
                       )
