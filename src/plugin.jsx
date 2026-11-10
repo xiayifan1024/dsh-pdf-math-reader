@@ -10,6 +10,7 @@ import {
 } from './api'
 import { Icon } from './icons'
 import {
+  buildAtoms,
   buildPageModel,
   drawPdfRaster,
   fileFingerprint,
@@ -49,6 +50,13 @@ import {
   writeText,
 } from './cache'
 import { extractReferences } from './references'
+import { scanSearchPages, searchScrollLeft } from './search'
+import {
+  clearReadingPositions,
+  loadReadingPositions,
+  readingPositionFor,
+  updateReadingPosition,
+} from './reading-position'
 import { restorePlaceholders } from '../lib/placeholders.js'
 import { createZip, dataUrlToBytes } from './zip'
 import { en, translate, zh } from './locales'
@@ -59,6 +67,24 @@ const NOTES_KEY = 'pdf-math-reader.notes.v1'
 const EQUATIONS_KEY = 'pdf-math-reader.equations.v1'
 const PANEL_ID = 'pdf-math-reader'
 const EMPTY_OVERRIDES = { added: [], removed: [], figures: [] }
+const EMPTY_SEARCH = {
+  status: 'idle',
+  query: '',
+  pages: [],
+  total: 0,
+  done: 0,
+  pageCount: 0,
+  truncated: false,
+  failedPages: 0,
+  error: '',
+}
+// Result rows shown per page; every stored hit is still highlighted on the page
+// after a jump, so a common word does not produce an endless list.
+const SEARCH_ROWS_PER_PAGE = 5
+// Keep in sync with the `max-width: 980px` media query in styles.js: below this
+// width the reader hides its rail and search moves into a floating panel.
+const NARROW_LAYOUT_QUERY = '(max-width: 980px)'
+const NARROW_LAYOUT_WIDTH = 980
 // Sidebar tile: a small raster served by the Host under /pdf-reader/assets/.
 const PANEL_ICON = '/pdf-reader/assets/icon-128.png'
 
@@ -326,6 +352,51 @@ function useT(t) {
   return useCallback((key, values) => translate(t, key, values), [t])
 }
 
+function isEditableTarget(target) {
+  if (typeof HTMLElement === 'undefined' || !(target instanceof HTMLElement)) return false
+  return (
+    target.tagName === 'INPUT' ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'SELECT' ||
+    target.isContentEditable
+  )
+}
+
+function readNarrowLayout() {
+  if (typeof window === 'undefined') return false
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia(NARROW_LAYOUT_QUERY).matches
+  }
+  return Number(window.innerWidth) <= NARROW_LAYOUT_WIDTH
+}
+
+/** Whether the reader is in its narrow layout (the rail is hidden by CSS). */
+function useNarrowLayout() {
+  const [narrow, setNarrow] = useState(readNarrowLayout)
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    if (typeof window.matchMedia === 'function') {
+      const media = window.matchMedia(NARROW_LAYOUT_QUERY)
+      const update = () => setNarrow(media.matches)
+      update()
+      if (typeof media.addEventListener === 'function') {
+        media.addEventListener('change', update)
+        return () => media.removeEventListener('change', update)
+      }
+      if (typeof media.addListener === 'function') {
+        media.addListener(update)
+        return () => media.removeListener(update)
+      }
+      return undefined
+    }
+    const update = () => setNarrow(Number(window.innerWidth) <= NARROW_LAYOUT_WIDTH)
+    update()
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [])
+  return narrow
+}
+
 function EmptyState({ tt, onPick, error, opening }) {
   return (
     <div className="pmr-empty">
@@ -380,7 +451,7 @@ function EmptyState({ tt, onPick, error, opening }) {
   )
 }
 
-function SettingsPanel({ tt, settings, onChange, onClose, onClearCache, health }) {
+function SettingsPanel({ tt, settings, onChange, onClose, onClearCache, onClearPositions, health }) {
   const [draft, setDraft] = useState(settings.glossaryText)
   useEffect(() => setDraft(settings.glossaryText), [settings.glossaryText])
   const commitGlossary = () => onChange({ glossaryText: draft })
@@ -456,6 +527,18 @@ function SettingsPanel({ tt, settings, onChange, onClose, onClearCache, health }
         </div>
         <div className="pmr-help">{tt('settings.modelHint')}</div>
       </div>
+      <div className="pmr-field">
+        <span className="pmr-label">{tt('settings.readingPosition')}</span>
+        <div className="pmr-help">{tt('settings.readingPositionHint')}</div>
+        <button
+          type="button"
+          className="pmr-btn pmr-btn-ghost"
+          style={{ marginTop: 6 }}
+          onClick={onClearPositions}
+        >
+          {tt('settings.clearPositions')}
+        </button>
+      </div>
       <div className="pmr-settings-footer">
         <span>{tt('settings.saved')}</span>
         <span style={{ display: 'inline-flex', gap: 6 }}>
@@ -472,6 +555,137 @@ function SettingsPanel({ tt, settings, onChange, onClose, onClearCache, health }
         <br />
         {tt('settings.source')}
       </div>
+    </div>
+  )
+}
+
+function SearchPanel({ tt, query, inputRef, state, onChange, onSubmit, onClear, onJump, onClose }) {
+  const trimmed = query.trim()
+  const pending = trimmed !== state.query
+  const searching = state.status === 'searching'
+  const handleInputChange = (event) => {
+    const value = event.target.value
+    // Do not tear down a half-composed IME query; only act on a real empty value.
+    if (event.nativeEvent.isComposing) {
+      onChange(value)
+      return
+    }
+    if (value.trim() === '') {
+      onClear()
+      return
+    }
+    onChange(value)
+  }
+  let status
+  if (trimmed === '') {
+    status = tt('search.hint')
+  } else if (searching) {
+    status = tt('search.progress', { done: state.done, total: state.pageCount })
+  } else if (state.status === 'error') {
+    status = state.error ? `${tt('search.failed')}: ${state.error}` : tt('search.allUnreadable')
+  } else if (state.status === 'done' && !pending) {
+    status =
+      state.total === 0
+        ? tt('search.empty')
+        : tt('search.results', { count: state.total, pages: state.pages.length })
+  } else {
+    status = tt('search.pending')
+  }
+  return (
+    <div className="pmr-search">
+      <div className="pmr-search-bar">
+        {searching ? <span className="pmr-spinner" /> : <Icon name="search" size={13} />}
+        <input
+          ref={inputRef}
+          className="pmr-search-input"
+          value={query}
+          placeholder={tt('search.placeholder')}
+          aria-label={tt('search.placeholder')}
+          onChange={handleInputChange}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return
+            if (event.key === 'Enter') {
+              event.preventDefault()
+              onSubmit()
+            } else if (event.key === 'Escape') {
+              event.preventDefault()
+              if (query.trim() === '' && onClose) onClose()
+              else onClear()
+            }
+          }}
+        />
+        {(query !== '' || state.pages.length > 0) && (
+          <button
+            type="button"
+            className="pmr-iconbtn"
+            style={{ width: 20, height: 20 }}
+            onClick={onClear}
+            title={tt('search.clear')}
+            aria-label={tt('search.clear')}
+          >
+            <Icon name="close" size={11} />
+          </button>
+        )}
+        {onClose && (
+          <button
+            type="button"
+            className="pmr-iconbtn"
+            style={{ width: 20, height: 20 }}
+            onClick={onClose}
+            title={tt('search.close')}
+            aria-label={tt('search.close')}
+          >
+            <Icon name="close" size={11} />
+          </button>
+        )}
+      </div>
+      <div
+        className={`pmr-search-meta ${state.status === 'error' ? 'is-error' : ''}`}
+        role="status"
+        aria-live="polite"
+      >
+        <span>{status}
+          {state.status === 'done' && state.failedPages > 0 && (
+            <> {tt('search.incomplete', { count: state.failedPages })}</>
+          )}
+        </span>
+        {searching && <span className="pmr-search-progress">{state.done}/{state.pageCount}</span>}
+      </div>
+      {state.pages.length > 0 && (
+        <div className="pmr-search-results">
+          {state.pages.map((page) => {
+            const rows = page.hits.slice(0, SEARCH_ROWS_PER_PAGE)
+            return (
+              <div className="pmr-search-group" key={page.pageIndex}>
+                {rows.map((hit, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    className="pmr-search-hit"
+                    title={`${hit.snippet.before}${hit.snippet.match}${hit.snippet.after}`}
+                    onClick={() => onJump(page, index)}
+                  >
+                    <span className="pmr-search-pageno">
+                      {index === 0 ? page.pageIndex + 1 : ''}
+                    </span>
+                    <span className="pmr-search-snippet">
+                      {hit.snippet.before}
+                      <mark>{hit.snippet.match}</mark>
+                      {hit.snippet.after}
+                    </span>
+                  </button>
+                ))}
+                {page.count > rows.length && (
+                  <div className="pmr-search-more">
+                    {tt('search.moreHits', { count: page.count - rows.length })}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {state.truncated && <div className="pmr-search-more">{tt('search.truncated', { count: state.total })}</div>}
     </div>
   )
 }
@@ -1633,6 +1847,13 @@ export function PdfReaderPage({ t }) {
   const [equationSelectMode, setEquationSelectMode] = useState(false)
   const [equationRect, setEquationRect] = useState(null)
   const [translationErrors, setTranslationErrors] = useState({})
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchState, setSearchState] = useState(EMPTY_SEARCH)
+  const [searchHighlight, setSearchHighlight] = useState(null)
+  const [searchOverlayOpen, setSearchOverlayOpen] = useState(false)
+  const [searchFocusRequest, setSearchFocusRequest] = useState(0)
+  const narrowLayout = useNarrowLayout()
+  const previousNarrowRef = useRef(narrowLayout)
 
   const fileInputRef = useRef(null)
   const viewerRef = useRef(null)
@@ -1671,6 +1892,10 @@ export function PdfReaderPage({ t }) {
   equationOverridesRef.current = equationOverrides
   const equationImageCacheRef = useRef(new Map())
   const equationDragRef = useRef(null)
+  const searchInputRef = useRef(null)
+  const searchAbortRef = useRef(null)
+  const searchSeqRef = useRef(0)
+  const pendingSearchScrollRef = useRef(null)
   const ttRef = useRef(tt)
   ttRef.current = tt
 
@@ -1791,6 +2016,13 @@ export function PdfReaderPage({ t }) {
     }
   }, [equationOverrides])
 
+  // The reading position is keyed by document fingerprint, so reopening the
+  // same paper after a reload returns to the page it was left on.
+  useEffect(() => {
+    if (docFingerprint === '' || pageCount === 0) return
+    updateReadingPosition(docFingerprint, pageIndex)
+  }, [docFingerprint, pageCount, pageIndex])
+
   useEffect(() => {
     setNoteText(existingNote?.text ?? '')
   }, [existingNote])
@@ -1805,6 +2037,49 @@ export function PdfReaderPage({ t }) {
     setChatStatus('')
     chatContextCacheRef.current.clear()
   }, [docFingerprint])
+
+  // Results belong to the document that produced them: never show one paper's
+  // hits after another paper has been opened.
+  useEffect(() => {
+    searchAbortRef.current?.abort()
+    searchAbortRef.current = null
+    searchSeqRef.current += 1
+    pendingSearchScrollRef.current = null
+    setSearchQuery('')
+    setSearchState(EMPTY_SEARCH)
+    setSearchHighlight(null)
+    setSearchOverlayOpen(false)
+  }, [docFingerprint])
+
+  // Focus the search field after its surface has mounted. A request counter is
+  // used instead of the open flags so pressing Ctrl/Cmd+F twice refocuses even
+  // when the panel was already open.
+  useEffect(() => {
+    if (searchFocusRequest === 0) return undefined
+    const frame = window.requestAnimationFrame(() => searchInputRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [searchFocusRequest])
+
+  // On a layout breakpoint change, move search between the rail and the
+  // floating panel instead of silently hiding it.
+  useEffect(() => {
+    const wasNarrow = previousNarrowRef.current
+    previousNarrowRef.current = narrowLayout
+    if (wasNarrow === narrowLayout) return
+    if (narrowLayout) {
+      if (leftOpen && railTab === 'search') {
+        setSearchOverlayOpen(true)
+        setSearchFocusRequest((value) => value + 1)
+      }
+      return
+    }
+    if (searchOverlayOpen) {
+      setSearchOverlayOpen(false)
+      setRailTab('search')
+      setLeftOpen(true)
+      setSearchFocusRequest((value) => value + 1)
+    }
+  }, [narrowLayout, leftOpen, railTab, searchOverlayOpen])
 
   useEffect(() => {
     if (doc === null) {
@@ -2373,6 +2648,7 @@ export function PdfReaderPage({ t }) {
       cancelPrefetch()
       translationAbortRef.current?.abort()
       selectionAbortRef.current?.abort()
+      searchAbortRef.current?.abort()
       const meta = docRef.current
       docRef.current = null
       disposeCaches(meta)
@@ -2387,6 +2663,9 @@ export function PdfReaderPage({ t }) {
     translationAbortRef.current?.abort()
     translationAbortRef.current = null
     selectionAbortRef.current?.abort()
+    searchAbortRef.current?.abort()
+    searchAbortRef.current = null
+    searchSeqRef.current += 1
     const meta = docRef.current
     docRef.current = null
     setDoc(null)
@@ -2465,12 +2744,21 @@ export function PdfReaderPage({ t }) {
           outline,
           ...createPageCaches(),
         }
+        const restored = readingPositionFor(
+          loadReadingPositions(),
+          meta.fingerprint,
+          meta.numPages,
+        )
         docRef.current = meta
         setDoc(meta)
-        setPageIndex(0)
+        setPageIndex(restored ?? 0)
         setOpening(false)
         setRenderState('loading')
-        notify(tt('toast.opened', { name: file.name }))
+        notify(
+          restored !== null && restored > 0
+            ? tt('toast.resumed', { page: restored + 1 })
+            : tt('toast.opened', { name: file.name }),
+        )
       } catch (error) {
         if (taskId !== openTaskRef.current) return
         setOpening(false)
@@ -2519,6 +2807,79 @@ export function PdfReaderPage({ t }) {
     setRenderNonce((value) => value + 1)
   }, [pageIndex])
 
+  const openSearch = useCallback(() => {
+    if (narrowLayout) {
+      setSearchOverlayOpen(true)
+    } else {
+      setSearchOverlayOpen(false)
+      setLeftOpen(true)
+      setRailTab('search')
+    }
+    setSearchFocusRequest((value) => value + 1)
+  }, [narrowLayout])
+
+  /**
+   * Search every page sequentially and publish hits as they are found.
+   *
+   * Text extraction is the expensive part and runs on the PDF.js worker; a new
+   * query aborts the previous pass through the epoch token so late pages cannot
+   * append results to a newer search.
+   */
+  const runSearch = useCallback(async (rawQuery) => {
+    const meta = docRef.current
+    const query = String(rawQuery ?? '').trim()
+    searchAbortRef.current?.abort()
+    searchAbortRef.current = null
+    searchSeqRef.current += 1
+    const token = searchSeqRef.current
+    pendingSearchScrollRef.current = null
+    setSearchHighlight(null)
+    if (meta === null) return
+    if (query === '') {
+      setSearchState(EMPTY_SEARCH)
+      return
+    }
+    const controller = new AbortController()
+    searchAbortRef.current = controller
+    const totalPages = meta.numPages
+    setSearchState({ ...EMPTY_SEARCH, status: 'searching', query, pageCount: totalPages })
+    const report = (changes) => {
+      setSearchState((previous) =>
+        previous.query === query && token === searchSeqRef.current
+          ? { ...previous, ...changes }
+          : previous,
+      )
+    }
+    try {
+      const library = await loadPdfJs()
+      const result = await scanSearchPages({
+        pageCount: totalPages,
+        query,
+        signal: controller.signal,
+        onProgress: report,
+        readAtoms: async (index) => {
+          const page = await meta.pdf.getPage(index + 1)
+          const text = await pageTextContent(meta, index, page)
+          return buildAtoms(library, text, page.getViewport({ scale: 1 }))
+        },
+      })
+      if (result && !controller.signal.aborted) report(result)
+    } catch (error) {
+      if (controller.signal.aborted || token !== searchSeqRef.current) return
+      console.warn('pdf-math-reader: search failed', error)
+      report({ status: 'error', error: error?.message ?? String(error) })
+    } finally {
+      if (searchAbortRef.current === controller) searchAbortRef.current = null
+    }
+  }, [])
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery('')
+    setSearchHighlight(null)
+    pendingSearchScrollRef.current = null
+    runSearch('')
+  }, [runSearch])
+
   useEffect(() => {
     if (doc === null) return undefined
     const element = viewerRef.current
@@ -2555,16 +2916,7 @@ export function PdfReaderPage({ t }) {
     if (doc === null) return undefined
     const onKeyDown = (event) => {
       if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return
-      const target = event.target
-      if (
-        target instanceof HTMLElement &&
-        (target.tagName === 'INPUT' ||
-          target.tagName === 'TEXTAREA' ||
-          target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
-        return
-      }
+      if (isEditableTarget(event.target)) return
       const key = event.key.toLowerCase()
       if (event.key === 'Escape') {
         setActiveParagraph(null)
@@ -2608,6 +2960,22 @@ export function PdfReaderPage({ t }) {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [clearTextSelection, doc, goToPage, pageIndex])
+
+  // Ctrl/Cmd+F belongs to the open document rather than the browser page, but
+  // not while the user is typing in a note, the glossary, or another editor.
+  useEffect(() => {
+    if (doc === null) return undefined
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented) return
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
+      if (String(event.key).toLowerCase() !== 'f') return
+      if (isEditableTarget(event.target)) return
+      event.preventDefault()
+      openSearch()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [doc, openSearch])
 
   const lineAtPoint = useCallback(
     (x, y) => {
@@ -3082,6 +3450,70 @@ export function PdfReaderPage({ t }) {
     },
     [pageModel],
   )
+
+  /** Center one search rectangle (page points) in the viewer. */
+  const scrollToPageRect = useCallback(
+    (rect) => {
+      const root = viewerRef.current
+      if (root === null || rect === null || rect === undefined) return
+      const pageElement = root.querySelector('.pmr-page')
+      if (pageElement === null) return
+      const rootRect = root.getBoundingClientRect()
+      const pageRect = pageElement.getBoundingClientRect()
+      const scale = currentScale > 0 ? currentScale : 1
+      const target =
+        root.scrollTop +
+        (pageRect.top - rootRect.top) +
+        rect.top * scale +
+        (rect.height * scale) / 2 -
+        root.clientHeight / 2
+      const hitLeft = root.scrollLeft + pageRect.left - rootRect.left - root.clientLeft + rect.x * scale
+      const left = searchScrollLeft(root.scrollLeft, root.clientWidth, hitLeft, rect.width * scale)
+      root.scrollTo({ top: Math.max(0, target), left, behavior: 'smooth' })
+    },
+    [currentScale],
+  )
+
+  const jumpToSearchHit = useCallback(
+    (page, hitIndex) => {
+      const hit = page?.hits?.[hitIndex] ?? page?.hits?.[0]
+      if (hit === undefined) return
+      const highlightRects = Array.isArray(page.highlightRects)
+        ? page.highlightRects
+        : page.hits.map((entry) => entry.rects)
+      setSearchHighlight({ pageIndex: page.pageIndex, focus: hitIndex, rects: highlightRects })
+      const rect = hit.rects[0] ?? null
+      if (page.pageIndex === pageIndex) {
+        if (rect !== null) window.requestAnimationFrame(() => scrollToPageRect(rect))
+        return
+      }
+      pendingSearchScrollRef.current = { pageIndex: page.pageIndex, rect }
+      setPageIndex(page.pageIndex)
+    },
+    [pageIndex, scrollToPageRect],
+  )
+
+  // Landing on the target page is asynchronous (cached model or fresh render),
+  // so the jump is completed once that page's model is on screen.
+  useEffect(() => {
+    const pending = pendingSearchScrollRef.current
+    if (pending === null) return
+    if (pageModel === null || pageModel.pageIndex !== pageIndex) return
+    if (pending.pageIndex !== pageIndex) {
+      pendingSearchScrollRef.current = null
+      return
+    }
+    pendingSearchScrollRef.current = null
+    if (pending.rect !== null) window.requestAnimationFrame(() => scrollToPageRect(pending.rect))
+  }, [pageIndex, pageModel, scrollToPageRect])
+
+  const clearReadingHistory = useCallback(async () => {
+    const cleared = await clearReadingPositions()
+    notify(
+      cleared ? tt('settings.positionsCleared') : tt('settings.positionsClearFailed'),
+      cleared ? 'info' : 'error',
+    )
+  }, [notify, tt])
 
   const focusNote = useCallback(
     (note) => {
@@ -4367,6 +4799,19 @@ ${body}
               >
                 <Icon name="folder" size={16} />
               </button>
+              <button
+                type="button"
+                className={`pmr-iconbtn ${
+                  searchOverlayOpen || (!narrowLayout && railTab === 'search' && leftOpen)
+                    ? 'is-active'
+                    : ''
+                }`}
+                onClick={openSearch}
+                title={tt('search.open')}
+                aria-label={tt('search.open')}
+              >
+                <Icon name="search" size={16} />
+              </button>
               <div className="pmr-group">
                 <button
                   type="button"
@@ -4566,6 +5011,14 @@ ${body}
                 >
                   {tt('rail.pages')}
                 </button>
+                <button
+                  type="button"
+                  className={`pmr-tabbtn ${railTab === 'search' ? 'is-active' : ''}`}
+                  onClick={openSearch}
+                  title={tt('search.open')}
+                >
+                  {tt('rail.search')}
+                </button>
                 {references.entries.length > 0 && (
                   <button
                     type="button"
@@ -4590,7 +5043,20 @@ ${body}
                 </button>
               </div>
               <div className="pmr-rail-scroll">
-                {railTab === 'outline' ? (
+                {railTab === 'search' ? (
+                  narrowLayout || searchOverlayOpen ? null : (
+                    <SearchPanel
+                      tt={tt}
+                      query={searchQuery}
+                      inputRef={searchInputRef}
+                      state={searchState}
+                      onChange={setSearchQuery}
+                      onSubmit={() => runSearch(searchQuery)}
+                      onClear={clearSearch}
+                      onJump={jumpToSearchHit}
+                    />
+                  )
+                ) : railTab === 'outline' ? (
                   doc.outline.length > 0 ? (
                     doc.outline.map((entry) => (
                       <button
@@ -4714,6 +5180,24 @@ ${body}
                             }}
                           />
                         ))}
+                        {searchHighlight !== null &&
+                          searchHighlight.pageIndex === pageIndex &&
+                          searchHighlight.rects.flatMap((rects, hitIndex) =>
+                            rects.map((rect, rectIndex) => (
+                              <div
+                                key={`search-${hitIndex}-${rectIndex}`}
+                                className={`pmr-hl pmr-search-hl ${
+                                  hitIndex === searchHighlight.focus ? 'is-current' : ''
+                                }`}
+                                style={{
+                                  left: rect.x * currentScale,
+                                  top: rect.top * currentScale,
+                                  width: rect.width * currentScale,
+                                  height: rect.height * currentScale,
+                                }}
+                              />
+                            )),
+                          )}
                         {activeOverlayBlock !== undefined && (
                           <div
                             className="pmr-hl pmr-eq-hl"
@@ -5483,6 +5967,31 @@ ${body}
         </div>
       )}
 
+      {doc !== null && narrowLayout && searchOverlayOpen && (
+        <div
+          className="pmr-search-overlay"
+          role="dialog"
+          aria-label={tt('search.open')}
+        >
+          <SearchPanel
+            tt={tt}
+            query={searchQuery}
+            inputRef={searchInputRef}
+            state={searchState}
+            onChange={setSearchQuery}
+            onSubmit={() => runSearch(searchQuery)}
+            onClear={clearSearch}
+            onJump={(page, hitIndex) => {
+              jumpToSearchHit(page, hitIndex)
+              // The floating panel covers most of a narrow reader; get out of
+              // the way once the target is selected.
+              setSearchOverlayOpen(false)
+            }}
+            onClose={() => setSearchOverlayOpen(false)}
+          />
+        </div>
+      )}
+
       {doc === null && (
         <EmptyState tt={tt} onPick={pickFile} error={openError} opening={opening} />
       )}
@@ -5529,6 +6038,7 @@ ${body}
             onChange={updateSettings}
             onClose={() => setSettingsOpen(false)}
             onClearCache={clearCache}
+            onClearPositions={clearReadingHistory}
           />
         </>
       )}

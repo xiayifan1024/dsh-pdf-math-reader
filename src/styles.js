@@ -113,12 +113,14 @@ export const CSS = String.raw`
 .pmr-rail-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
   padding: 8px;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
 }
 .pmr-tabbtn { height: 26px; padding: 0 9px; font-size: 11px; color: var(--dsw-alias-label-secondary); }
 .pmr-tabbtn.is-active { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font-weight: 600; }
+.pmr-iconbtn.is-active { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-brand-primary); }
 .pmr-rail-scroll { flex: 1 1 auto; overflow: auto; padding: 6px; }
 .pmr-outline-row {
   display: flex;
@@ -200,6 +202,107 @@ export const CSS = String.raw`
   min-width: 0;
   overflow-wrap: anywhere;
 }
+.pmr-search { display: flex; flex-direction: column; gap: 6px; }
+.pmr-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-secondary);
+}
+.pmr-search-bar:focus-within { border-color: var(--dsw-alias-brand-primary); }
+.pmr-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 11.5px;
+}
+.pmr-search-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 3px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.pmr-search-meta.is-error { color: var(--dsw-alias-state-error-primary); }
+.pmr-search-progress { font-variant-numeric: tabular-nums; opacity: .8; }
+.pmr-search-results { display: flex; flex-direction: column; gap: 1px; }
+.pmr-search-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.pmr-search-group:last-child { border-bottom: 0; }
+.pmr-search-hit {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  text-align: left;
+  cursor: pointer;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.pmr-search-hit:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-search-pageno {
+  flex: 0 0 20px;
+  text-align: right;
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  opacity: .75;
+}
+.pmr-search-snippet { min-width: 0; overflow-wrap: anywhere; }
+.pmr-search-snippet mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
+  color: var(--dsw-alias-label-primary);
+}
+.pmr-search-more {
+  padding: 2px 26px 3px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 9.5px;
+  line-height: 1.45;
+  opacity: .8;
+}
+.pmr-search-overlay {
+  position: absolute;
+  z-index: 18;
+  top: 62px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  width: min(420px, calc(100% - 24px));
+  max-height: calc(100% - 76px);
+  padding: 8px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 18px 50px rgba(0,0,0,.22);
+}
+.pmr-search-overlay .pmr-search { flex: 1 1 auto; min-height: 0; }
+.pmr-search-overlay .pmr-search-results { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .pmr-thumbs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .pmr-thumb {
   display: flex;
@@ -280,6 +383,14 @@ export const CSS = String.raw`
 .pmr-hl.pmr-note-hl {
   background: rgba(250,204,21,.24);
   box-shadow: inset 0 0 0 1px rgba(202,138,4,.32);
+}
+.pmr-hl.pmr-search-hl {
+  background: rgba(37,99,235,.17);
+  box-shadow: inset 0 0 0 1px rgba(37,99,235,.32);
+}
+.pmr-hl.pmr-search-hl.is-current {
+  background: rgba(250,204,21,.42);
+  box-shadow: inset 0 0 0 1.5px rgba(202,138,4,.7);
 }
 .pmr-textlayer {
   position: absolute;

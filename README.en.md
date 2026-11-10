@@ -62,6 +62,13 @@ same panel.
 - When the document has a reference section, the left rail shows a **References** tab: it detects
   References / Bibliography headings, splits numbered entries, and handles two-column and hanging
   indent layouts. The list is read-only, with selectable text and a copy-all action.
+- The **Search** tab in the left rail searches the whole document. Multiple keywords are separated
+  by spaces and must all appear; results are grouped by page with matching snippets. Clicking a
+  result jumps to its page, highlights every hit on that page in blue and the selected hit in
+  amber. The toolbar search button and `Ctrl` / `Cmd` + `F` open it directly; when the window is
+  narrow and the rail is hidden, search appears as a floating panel.
+- Reading position is stored per document fingerprint: reopening the same PDF, even after a page
+  reload, returns to the page you last read. Settings offers **Clear reading positions**.
 - `←` / `→` turn pages and `↑` / `↓` scroll the current page; `A` / `D` also turn pages.
 - The mouse wheel scrolls within a page; scrolling past the top or bottom turns to the previous or
   next page (with a 1-second cooldown).
@@ -230,6 +237,7 @@ to confirm the model service, provider, model and request limits.
 |---|---|
 | Previous / next page | `←` / `→`, or `A` / `D` |
 | Scroll the current page up / down | `↑` / `↓` |
+| Open document search | `Ctrl` / `Cmd` + `F` |
 | Wheel paging | Keep scrolling after reaching the top / bottom; 1-second cooldown |
 | Clear paragraph highlight, selection and equation box | `Esc` |
 | Typing in an input field | Does not trigger the shortcuts above |
@@ -279,9 +287,9 @@ without that patch the code fallbacks are `6` and `4200`.
   traversal.
 - **Prompt constraints**: document paragraphs are passed as data, the model is asked to preserve
   equations and citations, and AI answers are restricted to the supplied excerpts.
-- **Local data**: the glossary, notes, panel widths and equation corrections live in the browser's
-  `localStorage`; the translation cache exists only for the current page session. Saving notes to a
-  file writes a local Markdown file through the Host and never uploads it.
+- **Local data**: the glossary, notes, panel widths, reading positions and equation corrections live
+  in the browser's `localStorage`; the translation cache exists only for the current page session.
+  Saving notes to a file writes a local Markdown file through the Host and never uploads it.
 
 ## Architecture
 
@@ -441,6 +449,8 @@ src/pdf.js               PDF.js loading, text reconstruction, equation crops, th
 src/equations.js         Equation region detection, bbox/crop sizing, manual correction merging
 src/figures.js           Figure region detection (images/vector paths), label attribution, captions
 src/references.js        Reference-section lookup, numbered entry splitting and continuation joining
+src/search.js            Full-text keyword matching, snippets and hit-rectangle mapping
+src/reading-position.js  Per-document last-read-page storage and restoration
 src/zip.js               Dependency-free ZIP (store) writer
 src/api.js               Same-origin HTTP API client
 src/locales.js           Chinese and English UI strings
@@ -477,6 +487,10 @@ Test coverage:
 - References: locating the References section in the real Attention PDF, splitting its 40 numbered
   entries, joining cross-paragraph continuations, reading the left column before the right,
   repeated headers, author-year lists, and showing the rail tab only when present.
+- Keyword search: all-keyword AND matching, phrase preference, case insensitivity, complete words
+  across line-end hyphenation and compound-word hyphens, every-hit highlighting, snippets, wrapped
+  hit rectangles and RTL fragment spacing; reading positions: per-fingerprint isolation, out-of-range
+  rejection and ageing out old records.
 - Client module-loader wrapper and slot registration.
 - Joining adjacent text fragments and two-column paragraph boundaries.
 

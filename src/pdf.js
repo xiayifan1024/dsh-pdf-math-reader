@@ -359,6 +359,7 @@ export function buildAtoms(library, textContent, viewport) {
     atoms.push({
       index,
       sourceIndex: index,
+      dir: item.dir,
       text: item.str,
       x,
       y: baseline,
