@@ -186,6 +186,9 @@ var PdfMathReaderPlugin = (() => {
     search: ["M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z", "M16 16l4.5 4.5"],
     quote: ["M7 7h4v4H7z", "M13 7h4v4h-4z", "M7 11v4a2 2 0 0 0 2 2", "M13 11v4a2 2 0 0 0 2 2"],
     crop: ["M4 4h5", "M15 4h5", "M4 20h5", "M15 20h5", "M4 9v6", "M20 9v6"],
+    table: ["M4 5h16v14H4z", "M4 10h16", "M10 10v9", "M15 10v9"],
+    rotateLeft: ["M20 12a8 8 0 1 1-2.3-5.7", "M20 4v5h-5"],
+    rotateRight: ["M4 12a8 8 0 1 0 2.3-5.7", "M4 4v5h5"],
     expand: ["M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5"],
     columns: ["M4 4h16v16H4z", "M12 4v16"]
   };
@@ -209,6 +212,12 @@ var PdfMathReaderPlugin = (() => {
         children: paths.map((d, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d }, index))
       }
     );
+  }
+
+  // lib/chat-settings.js
+  var CHAT_TOKEN_STEPS = [2048, 4096, 8192, 16384, 32768, 65536];
+  function normalizeChatTokens(value, fallback = 8192) {
+    return CHAT_TOKEN_STEPS.includes(Number(value)) ? Number(value) : fallback;
   }
 
   // src/equations.js
@@ -1027,7 +1036,16 @@ var PdfMathReaderPlugin = (() => {
   }
 
   // src/figures.js
-  var FIGURE_CAPTION_RE = /^(?:figure|fig\.)\s*([0-9]{1,3}[a-z]?)\b/i;
+  var FIGURE_CAPTION_RE = /^(?:figure|fig\.|图)\s*([0-9]{1,3}[a-z]?)\b/i;
+  var TABLE_CAPTION_RE = /^(?:table|tab\.|表)\s*([0-9]{1,3}[a-z]?)\b/i;
+  function captionOf(text) {
+    const value = String(text ?? "").trim();
+    const table = value.match(TABLE_CAPTION_RE);
+    if (table !== null) return { kind: "table", number: table[1], text: value };
+    const figure = value.match(FIGURE_CAPTION_RE);
+    if (figure !== null) return { kind: "figure", number: figure[1], text: value };
+    return null;
+  }
   var SOLID_MIN_SIDE = 2;
   var DEFAULT_LIMITS = {
     // A page with an enormous operator list is usually generated artwork; skip
@@ -1261,11 +1279,11 @@ var PdfMathReaderPlugin = (() => {
     clusters.sort((left, right) => boxArea(right.bbox) - boxArea(left.bbox));
     return clusters;
   }
-  function looksLikeTableRuling(cluster) {
+  function tableRuleStats(cluster) {
     const [x0, y0, x1, y1] = cluster.bbox;
     const width = x1 - x0;
     const height = y1 - y0;
-    if (width <= 0 || height <= 0) return false;
+    if (width <= 0 || height <= 0) return { horizontal: 0, vertical: 0, gridLike: false };
     let horizontal = 0;
     let vertical = 0;
     for (const box of cluster.boxes) {
@@ -1274,8 +1292,12 @@ var PdfMathReaderPlugin = (() => {
       if (boxHeight <= SOLID_MIN_SIDE && boxWidth >= width * 0.5) horizontal += 1;
       else if (boxWidth <= SOLID_MIN_SIDE && boxHeight >= height * 0.5) vertical += 1;
     }
-    if (horizontal < 3 || vertical < 3) return false;
-    return cluster.solidCount < Math.max(3, cluster.count * 0.3);
+    const ruled = horizontal >= 3 && vertical >= 3;
+    return {
+      horizontal,
+      vertical,
+      gridLike: ruled && cluster.solidCount < Math.max(3, cluster.count * 0.3)
+    };
   }
   function regionFromBox(box, source, extra = {}) {
     return {
@@ -1301,15 +1323,21 @@ var PdfMathReaderPlugin = (() => {
             0,
             Math.max(first.bbox[1], second.bbox[1]) - Math.min(first.bbox[3], second.bbox[3])
           );
-          const overlapping = overlapRatio(first.bbox, second.bbox) >= 0.5;
-          if (!overlapping && (dx > 2 || dy > 2)) continue;
+          const overlapping = first.ruleOnly === true || second.ruleOnly === true ? first.ruleOnly === true && second.ruleOnly === true : true;
+          if (!overlapping) continue;
+          const overlappingBox = overlapRatio(first.bbox, second.bbox) >= 0.5;
+          if (!overlappingBox && (dx > 2 || dy > 2)) continue;
           const bbox = unionBox([first.bbox, second.bbox]);
           const hasImage = first.imageBox !== void 0 || second.imageBox !== void 0;
           remaining[left] = {
             bbox,
             source: first.source === second.source ? first.source : "mixed",
             imageBox: hasImage ? [...bbox] : void 0,
-            pathCount: (first.pathCount ?? 0) + (second.pathCount ?? 0)
+            pathCount: (first.pathCount ?? 0) + (second.pathCount ?? 0),
+            tableCandidate: first.tableCandidate === true || second.tableCandidate === true,
+            ruleOnly: first.ruleOnly === true && second.ruleOnly === true,
+            horizontalRules: (first.horizontalRules ?? 0) + (second.horizontalRules ?? 0),
+            verticalRules: (first.verticalRules ?? 0) + (second.verticalRules ?? 0)
           };
           remaining.splice(right, 1);
           merged = true;
@@ -1318,6 +1346,40 @@ var PdfMathReaderPlugin = (() => {
       }
     }
     return remaining;
+  }
+  function wideRuleTableCandidates(paths, pageWidth, pageHeight) {
+    const rules = paths.filter(
+      (box) => box[3] - box[1] <= SOLID_MIN_SIDE && box[2] - box[0] >= pageWidth * 0.3
+    );
+    if (rules.length < 3) return [];
+    rules.sort((left, right) => left[1] - right[1]);
+    const groups = [];
+    for (const rule of rules) {
+      let target;
+      for (const group of groups) {
+        const overlap = Math.min(group.bbox[2], rule[2]) - Math.max(group.bbox[0], rule[0]);
+        const width = Math.min(group.bbox[2] - group.bbox[0], rule[2] - rule[0]);
+        if (overlap < width * 0.6) continue;
+        if (rule[1] - group.bbox[3] > pageHeight * 0.32) continue;
+        target = group;
+        break;
+      }
+      if (target === void 0) {
+        groups.push({ bbox: [...rule], count: 1 });
+      } else {
+        target.bbox = unionBox([target.bbox, rule]);
+        target.count += 1;
+      }
+    }
+    return groups.filter((group) => group.count >= 3 && group.bbox[3] - group.bbox[1] >= 30).map(
+      (group) => regionFromBox(group.bbox, "vector", {
+        pathCount: group.count,
+        tableCandidate: true,
+        ruleOnly: true,
+        horizontalRules: group.count,
+        verticalRules: 0
+      })
+    );
   }
   function detectFigureRegions(artwork, options = {}) {
     const limits = { ...DEFAULT_LIMITS, ...options };
@@ -1344,21 +1406,351 @@ var PdfMathReaderPlugin = (() => {
       if (width < limits.minVectorWidth || height < limits.minVectorHeight) continue;
       if (area < pageArea * limits.minVectorAreaRatio) continue;
       if (area > pageArea * 0.85) continue;
-      if (cluster.count < limits.minVectorPaths) continue;
-      if (cluster.solidCount < limits.minVectorSolid) continue;
-      if (looksLikeTableRuling(cluster)) continue;
+      const rules = tableRuleStats(cluster);
+      const tableCandidate = rules.gridLike;
+      if (tableCandidate) {
+        if (cluster.count < 3) continue;
+      } else {
+        if (cluster.count < limits.minVectorPaths) continue;
+        if (cluster.solidCount < limits.minVectorSolid) continue;
+      }
       vectorRegions.push(
-        regionFromBox(cluster.bbox, "vector", { pathCount: cluster.count })
+        regionFromBox(cluster.bbox, "vector", {
+          pathCount: cluster.count,
+          tableCandidate,
+          horizontalRules: rules.horizontal,
+          verticalRules: rules.vertical
+        })
       );
     }
-    return mergeRegions([...imageRegions, ...vectorRegions]).sort(
+    const ruleTables = wideRuleTableCandidates(paths, pageWidth, pageHeight).filter(
+      (candidate) => !vectorRegions.some(
+        (region) => region.tableCandidate === true && overlapRatio(region.bbox, candidate.bbox) > 0.5
+      )
+    );
+    return mergeRegions([...imageRegions, ...vectorRegions, ...ruleTables]).sort(
       (left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]
     );
   }
-  function captionInfo(text) {
-    const match = String(text ?? "").trim().match(FIGURE_CAPTION_RE);
-    if (match === null) return null;
-    return { number: match[1], text: String(text).trim() };
+  function captionRowsOf(rows, bodySize) {
+    const ordered = [...rows].sort((left, right) => left.top - right.top);
+    const set = /* @__PURE__ */ new Set();
+    for (let index = 0; index < ordered.length; index += 1) {
+      if (captionOf(ordered[index].text) === null) continue;
+      set.add(ordered[index]);
+      let previous = ordered[index];
+      for (let next = index + 1; next < ordered.length; next += 1) {
+        const row = ordered[next];
+        const gap = row.top - previous.bottom;
+        if (gap < -1 || gap > bodySize * 1.4) break;
+        if (captionOf(row.text) !== null) {
+          set.add(row);
+          previous = row;
+          continue;
+        }
+        if (/[.!?。！？:：]$/.test(previous.text.trim())) break;
+        set.add(row);
+        previous = row;
+      }
+    }
+    return set;
+  }
+  function rowBox(row) {
+    return [row.x, row.top, row.right, row.bottom];
+  }
+  function rowHorizontalOverlap(box, row) {
+    const overlap = Math.min(box[2], row.right) - Math.max(box[0], row.x);
+    return overlap / Math.max(1, row.right - row.x);
+  }
+  function isTableRow(row, bodySize) {
+    const items = Array.isArray(row?.items) ? row.items.filter(
+      (atom) => atom !== null && typeof atom === "object" && String(atom.text ?? "").trim() !== ""
+    ) : [];
+    if (items.length === 0) return false;
+    const text = String(row.text ?? "");
+    if (text.length > 240) return false;
+    const gapFloor = Math.max(7, bodySize * 1.1);
+    let wideGaps = 0;
+    for (let index = 1; index < items.length; index += 1) {
+      if (items[index].x - items[index - 1].endX >= gapFloor) wideGaps += 1;
+    }
+    if (wideGaps >= 2) return true;
+    return wideGaps >= 1 && /[0-9]/.test(text);
+  }
+  function findCaptionRow(rows, box, regex, maxDistance = 70) {
+    const candidates = [];
+    for (const row of rows) {
+      const overlap = Math.min(row.right, box[2]) - Math.max(row.x, box[0]);
+      if (overlap <= 0) continue;
+      const distance = captionDistance(box, [row.x, row.top, row.right, row.bottom]);
+      if (distance > maxDistance) continue;
+      const match = String(row.text ?? "").trim().match(regex);
+      if (match === null) continue;
+      candidates.push({
+        distance,
+        number: match[1],
+        text: String(row.text).trim(),
+        bbox: [row.x, row.top, row.right, row.bottom],
+        kind: regex === TABLE_CAPTION_RE ? "table" : "figure"
+      });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((left, right) => left.distance - right.distance);
+    const { number, text, bbox, kind } = candidates[0];
+    return { number, text, bbox, kind };
+  }
+  function captionDistance(box, captionBox) {
+    return Math.max(0, captionBox[1] - box[3], box[1] - captionBox[3]);
+  }
+  function growTableBox(rows, region, options = {}) {
+    const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
+    const pageWidth = Number.isFinite(options.pageWidth) ? options.pageWidth : 612;
+    const pageHeight = Number.isFinite(options.pageHeight) ? options.pageHeight : 792;
+    const barriers = Array.isArray(options.barriers) ? options.barriers : [];
+    const box = [...region.bbox];
+    const maxGap = Math.max(6, bodySize * 2.6);
+    const limit = Math.min(pageHeight, region.bbox[1] + Math.max(180, pageHeight * 0.7));
+    let guard = 0;
+    while (guard < 400) {
+      guard += 1;
+      let next;
+      for (const row of rows) {
+        if (row.top < box[3] - 0.8) continue;
+        if (row.top - box[3] > maxGap) continue;
+        if (rowHorizontalOverlap(box, row) < 0.45) continue;
+        if (captionOf(row.text) !== null) continue;
+        if (next === void 0 || row.top < next.top) next = row;
+      }
+      if (next === void 0) break;
+      if (next.bottom > limit) break;
+      if (!isTableRow(next, bodySize)) break;
+      const candidate = rowBox(next);
+      if (barriers.some((barrier) => overlapRatio(candidate, barrier) > 0.3)) break;
+      box[0] = Math.max(0, Math.min(box[0], next.x - 1));
+      box[1] = Math.max(0, Math.min(box[1], next.top - 1));
+      box[2] = Math.min(pageWidth, Math.max(box[2], next.right + 1));
+      box[3] = Math.max(box[3], next.bottom + 1);
+    }
+    return box;
+  }
+  function visualRowsFromAtoms(atoms, bodySize) {
+    const list = (Array.isArray(atoms) ? atoms : []).filter(
+      (atom) => atom !== null && typeof atom === "object" && typeof atom.text === "string" && atom.text.trim() !== "" && Number.isFinite(atom.x) && Number.isFinite(atom.y)
+    );
+    const tolerance = Math.max(1.4, bodySize * 0.45);
+    const rows = [];
+    for (const atom of [...list].sort((left, right) => left.y - right.y)) {
+      let row = rows[rows.length - 1];
+      if (row === void 0 || Math.abs(row.baseline - atom.y) > tolerance) {
+        row = { baseline: atom.y, items: [] };
+        rows.push(row);
+      }
+      row.items.push(atom);
+    }
+    for (const row of rows) {
+      row.items.sort((left, right) => left.x - right.x);
+      let text = "";
+      let previous;
+      for (const atom of row.items) {
+        const value = atom.text.replace(/\s+/g, " ").trim();
+        if (value === "") continue;
+        if (previous === void 0) {
+          text = value;
+        } else {
+          const gap = atom.x - previous.endX;
+          text = gap > Math.max(1.2, Math.max(atom.height, previous.height) * 0.18) ? `${text} ${value}` : `${text}${value}`;
+        }
+        previous = atom;
+      }
+      row.text = text;
+      row.x = Math.min(...row.items.map((atom) => atom.x));
+      row.right = Math.max(...row.items.map((atom) => atom.endX));
+      row.top = Math.min(...row.items.map((atom) => atom.top));
+      row.bottom = Math.max(...row.items.map((atom) => atom.bottom));
+      row.height = Math.max(1, row.bottom - row.top);
+    }
+    return rows.filter((row) => row.text !== "");
+  }
+  function detectTextTables(rows, options = {}) {
+    const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
+    const pageWidth = Number.isFinite(options.pageWidth) ? options.pageWidth : 612;
+    const maxGap = Math.max(6, bodySize * 2.6);
+    const ordered = [...rows].sort((left, right) => left.top - right.top);
+    const tables = [];
+    const collect = (captionIndex, direction) => {
+      const captionRow = ordered[captionIndex];
+      const candidates = ordered.filter((row, index) => {
+        if (index === captionIndex) return false;
+        return direction > 0 ? row.top >= captionRow.bottom - 1 : row.bottom <= captionRow.top + 1;
+      });
+      if (direction < 0) candidates.reverse();
+      const run = [];
+      const pendingHeaders = [];
+      let tabular = 0;
+      let cursor = direction > 0 ? captionRow.bottom : captionRow.top;
+      let runBox = rowBox(captionRow);
+      for (const row of candidates) {
+        const gap = direction > 0 ? row.top - cursor : cursor - row.bottom;
+        if (gap < -1) continue;
+        const limit = run.length === 0 ? Math.max(bodySize * 10, 48) : maxGap;
+        if (gap > limit) break;
+        if (captionOf(row.text) !== null) break;
+        if (row.height > bodySize * 1.6) break;
+        if (!isTableRow(row, bodySize)) {
+          if (run.length === 0 && gap <= bodySize * 2.5) {
+            pendingHeaders.push(row);
+            cursor = direction > 0 ? row.bottom : row.top;
+            continue;
+          }
+          if (run.length === 0 && row.text.length <= 160 && !/[.!?。！？]$/.test(row.text.trim())) {
+            pendingHeaders.push(row);
+            cursor = direction > 0 ? row.bottom : row.top;
+            continue;
+          }
+          if (run.length > 0 && row.text.length <= 40) {
+            runBox = unionBox([runBox, rowBox(row)]);
+            run.push(row);
+            cursor = direction > 0 ? row.bottom : row.top;
+            continue;
+          }
+          break;
+        }
+        if (run.length > 0 && rowHorizontalOverlap(runBox, row) < 0.5 && gap > bodySize * 0.5) break;
+        if (run.length === 0) runBox = rowBox(row);
+        else runBox = unionBox([runBox, rowBox(row)]);
+        run.push(row);
+        tabular += 1;
+        cursor = direction > 0 ? row.bottom : row.top;
+      }
+      if (tabular >= 3) {
+        for (const header of pendingHeaders) {
+          const hasColumnGap = header.items.some(
+            (item, index) => index > 0 && item.x - header.items[index - 1].endX >= Math.max(7, bodySize * 1.1)
+          );
+          if (hasColumnGap && rowHorizontalOverlap(runBox, header) >= 0.5) {
+            run.push(header);
+          }
+        }
+      }
+      return { run, tabular };
+    };
+    for (let index = 0; index < ordered.length; index += 1) {
+      const caption = ordered[index].text.trim().match(TABLE_CAPTION_RE);
+      if (caption === null) continue;
+      const below = collect(index, 1);
+      const above = collect(index, -1);
+      const pick = below.tabular >= above.tabular ? below : above;
+      const run = pick.run;
+      if (pick.tabular < 3) continue;
+      if (run.length === 0) continue;
+      const box = unionBox(run.map(rowBox));
+      if (box[2] - box[0] < pageWidth * 0.22) continue;
+      if (!run.some((row) => /[0-9]/.test(row.text))) continue;
+      const columnKeys = /* @__PURE__ */ new Map();
+      for (const row of run) {
+        const seen = /* @__PURE__ */ new Set();
+        for (const atom of row.items) {
+          const key = Math.round(atom.x / Math.max(4, bodySize * 1.5));
+          if (seen.has(key)) continue;
+          seen.add(key);
+          columnKeys.set(key, (columnKeys.get(key) ?? 0) + 1);
+        }
+      }
+      const sharedColumns = [...columnKeys.values()].filter((count) => count >= 2).length;
+      if (sharedColumns < 2) continue;
+      const padded = [
+        Math.max(0, box[0] - 2),
+        Math.max(0, box[1] - 2),
+        Math.min(pageWidth, box[2] + 2),
+        box[3] + 2
+      ];
+      tables.push({
+        bbox: padded,
+        imageBox: padded,
+        source: "text",
+        tableCandidate: true,
+        kind: "table",
+        caption: {
+          kind: "table",
+          number: caption[1],
+          text: ordered[index].text.trim(),
+          bbox: [ordered[index].x, ordered[index].top, ordered[index].right, ordered[index].bottom]
+        }
+      });
+    }
+    return tables;
+  }
+  function classifyRegions(atoms, regions, options = {}) {
+    const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
+    const pageWidth = Number.isFinite(options.pageWidth) ? options.pageWidth : 612;
+    const pageHeight = Number.isFinite(options.pageHeight) ? options.pageHeight : 792;
+    const rows = buildTextRows(Array.isArray(atoms) ? atoms : [], { bodySize });
+    const visualRows = visualRowsFromAtoms(atoms, bodySize);
+    const list = (Array.isArray(regions) ? regions : []).filter(
+      (region) => Array.isArray(region?.bbox) && region.bbox.length === 4
+    );
+    const removed = Array.isArray(options.removed) ? options.removed : [];
+    for (const found of detectTextTables(visualRows, { bodySize, pageWidth, pageHeight })) {
+      if (removed.some((box) => overlapRatio(box, found.bbox) > 0.3)) continue;
+      const existing = list.find(
+        (region) => overlapRatio(region.bbox, found.bbox) > 0.5 || region.source === "manual" && (overlapRatio(region.bbox, found.bbox) > 0.3 || Array.isArray(region.replaces) && overlapRatio(region.replaces, found.bbox) > 0.3)
+      );
+      if (existing !== void 0) {
+        if (existing.source === "manual") continue;
+        existing.tableCandidate = true;
+        if (existing.caption === void 0) existing.caption = found.caption;
+        continue;
+      }
+      list.push(found);
+    }
+    const boxes = list.map((region) => region.bbox);
+    const classified = list.map((region, index) => {
+      const figureCaption = findCaptionRow(rows, region.bbox, FIGURE_CAPTION_RE);
+      const tableCaption = findCaptionRow(rows, region.bbox, TABLE_CAPTION_RE);
+      const tableish = region.tableCandidate === true || region.kind === "table" || tableCaption !== null && (figureCaption === null || captionDistance(region.bbox, tableCaption.bbox) < captionDistance(region.bbox, figureCaption.bbox));
+      if (!tableish) {
+        return {
+          ...region,
+          kind: "figure",
+          caption: region.caption ?? figureCaption
+        };
+      }
+      const caption = tableCaption ?? region.caption ?? null;
+      if (region.ruleOnly === true && caption === null) {
+        const tabularRows = visualRows.filter(
+          (row) => row.top >= region.bbox[1] - 2 && row.bottom <= region.bbox[3] + 2 && rowHorizontalOverlap(region.bbox, row) >= 0.35 && isTableRow(row, bodySize)
+        ).length;
+        if (tabularRows < 3) return null;
+      }
+      const fixed = region.source === "manual" || region.source === "text";
+      const expanded = fixed ? region.bbox : growTableBox(visualRows, region, {
+        bodySize,
+        pageWidth,
+        pageHeight,
+        barriers: boxes.filter((_, other) => other !== index)
+      });
+      return {
+        ...region,
+        bbox: expanded,
+        imageBox: fixed ? region.imageBox ?? expanded : expanded,
+        kind: "table",
+        caption
+      };
+    }).filter((region) => region !== null);
+    const tables = classified.filter((region) => region.kind === "table");
+    const keptTables = tables.filter(
+      (table) => !tables.some(
+        (other) => other !== table && overlapRatio(other.bbox, table.bbox) > 0.8 && boxArea(other.bbox) > boxArea(table.bbox)
+      )
+    );
+    const figures = classified.filter((region) => region.kind !== "table").filter(
+      (figure) => !keptTables.some(
+        (table) => overlapRatio(table.bbox, figure.bbox) > 0.5 && boxArea(table.bbox) > boxArea(figure.bbox)
+      )
+    );
+    return [...keptTables, ...figures].sort(
+      (left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]
+    );
   }
   function assignFigureLabels(atoms, regions, options = {}) {
     const bodySize = Number.isFinite(options.bodySize) ? options.bodySize : 10;
@@ -1373,13 +1765,14 @@ var PdfMathReaderPlugin = (() => {
     );
     if (areas.length === 0) return { figures, atomIds };
     const rows = buildTextRows(list, { bodySize });
+    const captionRows = captionRowsOf(rows, bodySize);
     const owners = areas.map(() => []);
     for (const textRow of rows) {
       const items = textRow.items.filter(
         (atom) => atom !== null && typeof atom === "object" && String(atom.text ?? "").trim() !== ""
       );
       if (items.length === 0) continue;
-      if (captionInfo(textRow.text) !== null) continue;
+      if (captionRows.has(textRow) || captionOf(textRow.text) !== null) continue;
       let best = -1;
       let bestRatio = 0;
       for (let index = 0; index < areas.length; index += 1) {
@@ -1414,14 +1807,17 @@ var PdfMathReaderPlugin = (() => {
     }
     for (let index = 0; index < areas.length; index += 1) {
       const region = areas[index];
+      const kind = region.kind === "table" ? "table" : "figure";
       const labels = labelLines(owners[index], bodySize);
-      const kept = labels.filter((line) => captionInfo(line.text) === null);
+      const kept = labels.filter((line) => captionOf(line.text) === null);
       const bbox = unionBox([region.bbox, ...kept.map((line) => line.bbox)]);
-      const caption = findCaption(rows, bbox);
+      const caption = region.caption ?? findCaption(rows, bbox, kind === "table" ? TABLE_CAPTION_RE : FIGURE_CAPTION_RE);
       figures.push({
         bbox,
         imageBbox: region.imageBox ?? region.bbox,
         source: region.source ?? "vector",
+        manualId: region.manualId ?? null,
+        kind,
         labels: kept,
         caption,
         number: caption?.number ?? null,
@@ -1470,20 +1866,20 @@ var PdfMathReaderPlugin = (() => {
     flush();
     return lines.sort((left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]);
   }
-  function findCaption(rows, figureBox) {
+  function findCaption(rows, figureBox, regex = FIGURE_CAPTION_RE) {
     if (!Array.isArray(rows) || rows.length === 0) return null;
     const candidates = [];
     for (const row of rows) {
-      if (row.bottom < figureBox[1] - 2) continue;
-      if (row.top > figureBox[3] + 60) continue;
+      const distance = captionDistance(figureBox, [row.x, row.top, row.right, row.bottom]);
+      if (distance > 70) continue;
       const overlap = Math.min(row.right, figureBox[2]) - Math.max(row.x, figureBox[0]);
       if (overlap <= 0) continue;
-      const info = captionInfo(row.text);
+      const info = String(row.text ?? "").trim().match(regex);
       if (info === null) continue;
       candidates.push({
-        distance: Math.abs(row.top - figureBox[3]),
-        number: info.number,
-        text: info.text,
+        distance,
+        number: info[1],
+        text: String(row.text).trim(),
         bbox: [row.x, row.top, row.right, row.bottom]
       });
     }
@@ -1708,8 +2104,34 @@ var PdfMathReaderPlugin = (() => {
       return { width, height };
     });
   }
+  function rotateRegionBox(page, bbox, rotationDelta = 0) {
+    const delta = (Math.round(rotationDelta / 90) * 90 % 360 + 360) % 360;
+    if (delta === 0 || typeof page?.getViewport !== "function") {
+      return { box: [bbox[0], bbox[1], bbox[2], bbox[3]], rotation: void 0 };
+    }
+    const intrinsic = Number.isFinite(page?.rotate) ? page.rotate : 0;
+    const targetRotation = ((intrinsic + delta) % 360 + 360) % 360;
+    const base = page.getViewport({ scale: 1 });
+    const rotated = page.getViewport({ scale: 1, rotation: targetRotation });
+    const corners = [
+      [bbox[0], bbox[1]],
+      [bbox[2], bbox[1]],
+      [bbox[0], bbox[3]],
+      [bbox[2], bbox[3]]
+    ];
+    const points = corners.map(
+      ([x, y]) => rotated.convertToViewportPoint(base.convertToPdfPoint(x, y))
+    );
+    const xs = points.map((point) => point[0]);
+    const ys = points.map((point) => point[1]);
+    return {
+      box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+      rotation: targetRotation
+    };
+  }
   async function renderEquationCrop(page, bbox, options = {}, signal) {
-    const metrics = cropMetrics(bbox, options);
+    const target = rotateRegionBox(page, bbox, options.rotation);
+    const metrics = cropMetrics(target.box, options);
     const canvas = document.createElement("canvas");
     canvas.width = metrics.pixelWidth;
     canvas.height = metrics.pixelHeight;
@@ -1717,11 +2139,13 @@ var PdfMathReaderPlugin = (() => {
     if (context === null) throw new Error("Canvas 2D context is unavailable");
     context.fillStyle = "#ffffff";
     context.fillRect(0, 0, canvas.width, canvas.height);
-    const viewport = page.getViewport({
+    const viewportOptions = {
       scale: metrics.renderScale,
-      offsetX: -bbox[0] * metrics.renderScale,
-      offsetY: -bbox[1] * metrics.renderScale
-    });
+      offsetX: -target.box[0] * metrics.renderScale,
+      offsetY: -target.box[1] * metrics.renderScale
+    };
+    if (target.rotation !== void 0) viewportOptions.rotation = target.rotation;
+    const viewport = page.getViewport(viewportOptions);
     const task = page.render({ canvasContext: context, viewport });
     const cancel = () => task.cancel();
     if (signal !== void 0) {
@@ -1810,7 +2234,12 @@ var PdfMathReaderPlugin = (() => {
     const bodyFont = options.bodyFont ?? dominantFont(atoms);
     const bodySize = options.bodySize ?? bodyFontSize(atoms);
     const resolvedFigures = resolveFigureRegions(options, pageWidth, pageHeight);
-    const figureRegions = resolvedFigures.regions;
+    const figureRegions = classifyRegions(atoms, resolvedFigures.regions, {
+      bodySize,
+      pageWidth,
+      pageHeight,
+      removed: options.overrides?.figures
+    });
     const figureInfo = assignFigureLabels(atoms, figureRegions, { bodySize });
     const contentAtoms = atoms.filter((atom) => !figureInfo.atomIds.has(atom.index));
     const analysis = analyzeEquations(contentAtoms, {
@@ -2059,16 +2488,19 @@ var PdfMathReaderPlugin = (() => {
       figureBlocks.push({
         id: `${pageKey}-figure${index + 1}`,
         type: "figure",
+        kind: figure.kind ?? "figure",
         pageIndex,
         bbox: figure.bbox,
         imageBbox: figure.imageBbox,
-        figureNumber: figure.number,
+        figureNumber: figure.kind === "table" ? null : figure.number,
+        tableNumber: figure.kind === "table" ? figure.number : null,
         caption: figure.caption?.text ?? null,
         captionBbox: figure.caption?.bbox ?? null,
         labels: figure.labels.map((line) => ({ text: line.text, bbox: line.bbox })),
         labelCount: figure.labels.length,
         source: figure.source,
-        detectionSource: "automatic",
+        manualId: figure.manualId ?? null,
+        detectionSource: figure.source === "manual" ? "manual" : "automatic",
         text: figure.labels.map((line) => line.text).join(" ") || figure.caption?.text || "",
         order
       });
@@ -2115,9 +2547,27 @@ var PdfMathReaderPlugin = (() => {
     }
     const detected = regions;
     const removed = Array.isArray(options.overrides?.figures) ? options.overrides.figures : [];
-    const filtered = removed.length === 0 ? detected : detected.filter(
+    let filtered = removed.length === 0 ? [...detected] : detected.filter(
       (region) => !removed.some((box) => Array.isArray(box) && overlapRatio(box, region.bbox) > 0.3)
     );
+    const manual = Array.isArray(options.overrides?.manualFigures) ? options.overrides.manualFigures : [];
+    for (const entry of manual) {
+      if (!Array.isArray(entry?.bbox) || entry.bbox.length !== 4) continue;
+      const bbox = entry.bbox.map(Number);
+      if (!bbox.every(Number.isFinite)) continue;
+      if (Array.isArray(entry.replaces)) {
+        filtered = filtered.filter(
+          (region) => overlapRatio(entry.replaces, region.bbox) <= 0.3
+        );
+      }
+      filtered.push({
+        bbox,
+        source: "manual",
+        manualId: typeof entry.id === "string" ? entry.id : null,
+        replaces: Array.isArray(entry.replaces) ? entry.replaces : null
+      });
+    }
+    filtered.sort((left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0]);
     return { regions: filtered, raw: detected };
   }
   function createParagraph(line) {
@@ -4265,6 +4715,38 @@ var PdfMathReaderPlugin = (() => {
     "figure.labelsHint": "\u8FD9\u4E9B\u6587\u5B57\u5C5E\u4E8E\u56FE\u5185\u6807\u6CE8\uFF0C\u968F\u56FE\u4FDD\u7559\uFF0C\u4E0D\u518D\u4F5C\u4E3A\u6B63\u6587\u6BB5\u843D\u7FFB\u8BD1\u3002",
     "figure.labelsInline": "\u56FE\u5185\u6587\u5B57\uFF1A",
     "figure.context": "\u56FE\u8868 {number}",
+    "figure.select": "\u6846\u9009\u56FE\u8868",
+    "figure.selectHint": "\u5728\u9875\u9762\u4E0A\u62D6\u62FD\u6846\u9009\u5B8C\u6574\u56FE\u8868\u6216\u8868\u683C\uFF1BEsc \u53D6\u6D88\u3002",
+    "figure.selected": "\u5DF2\u6DFB\u52A0\u56FE\u8868\u533A\u57DF",
+    "figure.tooSmall": "\u6846\u9009\u533A\u57DF\u592A\u5C0F\uFF0C\u8BF7\u62D6\u62FD\u51FA\u5B8C\u6574\u56FE\u8868\u3002",
+    "figure.adjust": "\u8C03\u6574\u8303\u56F4",
+    "figure.adjustHint": "\u62D6\u52A8\u8FB9\u6846\u8C03\u6574\u8303\u56F4\uFF0C\u9760\u8FD1\u6587\u5B57\u8FB9\u7F18\u4F1A\u81EA\u52A8\u5438\u9644\uFF1BEnter \u4FDD\u5B58\uFF0CEsc \u53D6\u6D88\u3002",
+    "figure.save": "\u4FDD\u5B58\u8303\u56F4",
+    "figure.cancel": "\u53D6\u6D88",
+    "figure.saved": "\u5DF2\u66F4\u65B0\u56FE\u8868\u8303\u56F4",
+    "figure.manual": "\u624B\u52A8\u6846\u9009",
+    "figure.table": "\u8868\u683C",
+    "figure.tableHint": "\u8868\u683C\u6309\u539F\u56FE\u4FDD\u7559\uFF0C\u8868\u9898\u4E0E\u8868\u6CE8\u4ECD\u4F1A\u7FFB\u8BD1\u3002",
+    "table.numbered": "\u8868 {number}",
+    "table.unnumbered": "\u8868\u683C",
+    "table.label": "\u8868\u683C",
+    "table.context": "\u8868\u683C {number}",
+    "table.labels": "\u8868\u683C\u6587\u5B57 {count} \u6761",
+    "table.labelsHint": "\u8FD9\u4E9B\u6587\u5B57\u5C5E\u4E8E\u8868\u683C\u5355\u5143\u683C\uFF0C\u968F\u56FE\u4FDD\u7559\uFF0C\u4E0D\u518D\u4F5C\u4E3A\u6B63\u6587\u6BB5\u843D\u7FFB\u8BD1\u3002",
+    "table.labelsInline": "\u8868\u683C\u6587\u5B57\uFF1A",
+    "table.notTable": "\u4E0D\u662F\u8868\u683C",
+    "table.removed": "\u5DF2\u53D6\u6D88\u8868\u683C\u6807\u8BB0\uFF0C\u8868\u683C\u6587\u5B57\u4F1A\u56DE\u5230\u6B63\u6587",
+    "viewer.fit": "\u5B8C\u6574\u663E\u793A",
+    "viewer.width": "\u9002\u5408\u5BBD\u5EA6",
+    "viewer.reset": "\u6062\u590D\u521D\u59CB\u89C6\u56FE",
+    "viewer.rotateLeft": "\u5411\u5DE6\u65CB\u8F6C 90\xB0",
+    "viewer.rotateRight": "\u5411\u53F3\u65CB\u8F6C 90\xB0",
+    "viewer.zoomIn": "\u653E\u5927",
+    "viewer.zoomOut": "\u7F29\u5C0F",
+    "viewer.zoomReset": "\u7F29\u653E\u56DE 100%",
+    "viewer.hint": "\u6EDA\u8F6E\u7F29\u653E \xB7 \u62D6\u52A8\u5E73\u79FB \xB7 R \u65CB\u8F6C \xB7 Esc \u5173\u95ED",
+    "viewer.loading": "\u6B63\u5728\u751F\u6210\u9AD8\u6E05\u56FE\u2026",
+    "viewer.failed": "\u9AD8\u6E05\u56FE\u751F\u6210\u5931\u8D25\uFF0C\u5DF2\u663E\u793A\u9884\u89C8\u56FE\u3002",
     "tab.translation": "\u8BD1\u6587",
     "tab.notes": "\u7B14\u8BB0",
     "tab.reading": "AI \u9605\u8BFB",
@@ -4299,6 +4781,17 @@ var PdfMathReaderPlugin = (() => {
     "reading.reading": "\u6B63\u5728\u8BFB\u53D6\u6587\u6863\u4E0A\u4E0B\u6587\u2026",
     "reading.thinking": "\u6B63\u5728\u7EC4\u7EC7\u56DE\u7B54\u2026",
     "reading.failed": "AI \u9605\u8BFB\u5931\u8D25",
+    "reading.continue": "\u7EE7\u7EED\u751F\u6210",
+    "reading.continuePrompt": "\u8BF7\u4ECE\u4E0A\u4E00\u6761\u56DE\u7B54\u4E2D\u65AD\u7684\u4F4D\u7F6E\u7EE7\u7EED\uFF0C\u4E0D\u8981\u91CD\u590D\u5DF2\u7ECF\u8F93\u51FA\u7684\u5185\u5BB9\u3002",
+    "settings.chatTokens": "AI \u8F85\u52A9\u9605\u8BFB \xB7 \u56DE\u7B54\u957F\u5EA6\u4E0A\u9650",
+    "settings.chatTokens.2048": "\u7B80\u77ED\u95EE\u7B54",
+    "settings.chatTokens.4096": "\u5E38\u89C4\u89E3\u91CA",
+    "settings.chatTokens.8192": "\u8BE6\u7EC6\u89E3\u8BFB\uFF08\u9ED8\u8BA4\uFF09",
+    "settings.chatTokens.16384": "\u591A\u9879\u6574\u7406\u3001\u65B9\u6CD5\u5BF9\u6BD4",
+    "settings.chatTokens.32768": "\u957F\u7BC7\u5206\u6790",
+    "settings.chatTokens.65536": "\u6574\u7BC7\u7CBE\u8BFB\uFF08\u8017\u65F6\u6700\u957F\uFF09",
+    "settings.chatTokensHint": "\u8FD9\u662F\u6700\u5927\u8F93\u51FA\u989D\u5EA6\uFF0C\u5B9E\u9645\u56DE\u7B54\u53EF\u80FD\u66F4\u77ED\uFF1B\u8F83\u9AD8\u4E0A\u9650\u53EF\u80FD\u589E\u52A0\u7B49\u5F85\u65F6\u95F4\u548C\u7528\u91CF\uFF0C\u9009\u62E9\u8F83\u5927\u989D\u5EA6\u65F6\u4F1A\u81EA\u52A8\u653E\u5BBD\u7B49\u5F85\u65F6\u95F4\u3002\u5B9E\u9645\u53EF\u7528\u989D\u5EA6\u53D6\u51B3\u4E8E\u6A21\u578B\uFF0C\u5F53\u524D\u670D\u52A1\u672A\u63D0\u4F9B\u6A21\u578B\u4E0A\u9650\u4FE1\u606F\u3002",
+    "reading.truncated": "\u56DE\u7B54\u5DF2\u8FBE\u5230\u8F93\u51FA\u957F\u5EA6\u4E0A\u9650\uFF0C\u5185\u5BB9\u5C1A\u672A\u5B8C\u6210\u3002\u53EF\u53D1\u9001\u201C\u8BF7\u4ECE\u4E0A\u6B21\u4E2D\u65AD\u5904\u7EE7\u7EED\u201D\uFF0C\u6216\u5206\u9879\u63D0\u95EE\u3002",
     "reading.noContext": "\u5F53\u524D PDF \u6CA1\u6709\u53EF\u7528\u7684\u6587\u672C\u4E0A\u4E0B\u6587\u3002",
     "reading.stopped": "\u5DF2\u505C\u6B62",
     "reading.context": "\u4E0A\u4E0B\u6587\uFF1A{scope}",
@@ -4499,6 +4992,38 @@ var PdfMathReaderPlugin = (() => {
     "figure.labelsHint": "These labels belong to the figure and stay with it; they are not translated as body paragraphs.",
     "figure.labelsInline": "Labels inside the figure:",
     "figure.context": "Figure {number}",
+    "figure.select": "Select figure",
+    "figure.selectHint": "Drag a box around a complete figure or table; press Esc to cancel.",
+    "figure.selected": "Figure region added",
+    "figure.tooSmall": "The selected box is too small. Drag around the whole figure.",
+    "figure.adjust": "Adjust bounds",
+    "figure.adjustHint": "Drag an edge to adjust the crop; edges snap to text lines. Enter saves, Esc cancels.",
+    "figure.save": "Save bounds",
+    "figure.cancel": "Cancel",
+    "figure.saved": "Figure bounds updated",
+    "figure.manual": "Manual box",
+    "figure.table": "Table",
+    "figure.tableHint": "The table stays as an image; its caption and notes are still translated.",
+    "table.numbered": "Table {number}",
+    "table.unnumbered": "Table",
+    "table.label": "Table",
+    "table.context": "Table {number}",
+    "table.labels": "{count} table cells",
+    "table.labelsHint": "These strings are table cells; they stay with the table image and are not translated as body paragraphs.",
+    "table.labelsInline": "Table text:",
+    "table.notTable": "Not a table",
+    "table.removed": "Table mark removed; its text returns to the body flow",
+    "viewer.fit": "Fit whole",
+    "viewer.width": "Fit width",
+    "viewer.reset": "Reset view",
+    "viewer.rotateLeft": "Rotate left 90\xB0",
+    "viewer.rotateRight": "Rotate right 90\xB0",
+    "viewer.zoomIn": "Zoom in",
+    "viewer.zoomOut": "Zoom out",
+    "viewer.zoomReset": "Reset zoom to 100%",
+    "viewer.hint": "Scroll to zoom \xB7 drag to pan \xB7 R rotates \xB7 Esc closes",
+    "viewer.loading": "Rendering a high-resolution view\u2026",
+    "viewer.failed": "High-resolution render failed; showing the preview.",
     "tab.translation": "Translation",
     "tab.notes": "Notes",
     "tab.reading": "AI reading",
@@ -4533,6 +5058,17 @@ var PdfMathReaderPlugin = (() => {
     "reading.reading": "Reading document context\u2026",
     "reading.thinking": "Composing an answer\u2026",
     "reading.failed": "AI reading failed",
+    "reading.continue": "Continue generating",
+    "reading.continuePrompt": "Continue from where your previous answer stopped. Do not repeat content already provided.",
+    "settings.chatTokens": "AI reading \xB7 Answer length limit",
+    "settings.chatTokens.2048": "Brief questions",
+    "settings.chatTokens.4096": "Standard explanations",
+    "settings.chatTokens.8192": "Detailed reading (default)",
+    "settings.chatTokens.16384": "Summaries and comparisons",
+    "settings.chatTokens.32768": "Extended analysis",
+    "settings.chatTokens.65536": "Full-paper deep read (slowest)",
+    "settings.chatTokensHint": "This is a maximum budget; answers may be shorter. Higher limits may increase waiting time and usage, and a larger budget also widens the wait limit automatically. Available output depends on the model; this service does not advertise model output limits.",
+    "reading.truncated": "The answer reached the output limit and is incomplete. Ask \u201CContinue from where you stopped\u201D or split your question into smaller parts.",
     "reading.noContext": "This PDF has no available text context.",
     "reading.stopped": "Stopped",
     "reading.context": "Context: {scope}",
@@ -5664,6 +6200,164 @@ var PdfMathReaderPlugin = (() => {
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
   pointer-events: none;
 }
+.pmr-fig-editor {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+.pmr-fig-editor-box {
+  position: absolute;
+  border: 1.5px solid var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);
+  box-shadow: 0 0 0 9999px rgba(15, 23, 42, .22);
+  cursor: move;
+  touch-action: none;
+  pointer-events: auto;
+}
+.pmr-fig-editor-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 1.5px solid var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: #fff;
+  pointer-events: auto;
+  touch-action: none;
+}
+.pmr-fig-editor-actions {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, .22);
+  pointer-events: auto;
+  white-space: nowrap;
+}
+.pmr-fig-editor-actions .pmr-btn { height: 24px; padding: 0 9px; font-size: 10.5px; }
+.pmr-fig-editor-hint { color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-figure-viewer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(15, 23, 42, .7);
+}
+.pmr-viewer-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(96vw, 1520px);
+  height: min(93vh, 1040px);
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .4);
+}
+.pmr-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.pmr-viewer-title { flex: 0 0 auto; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+.pmr-viewer-caption {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+}
+.pmr-viewer-tools {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-left: auto;
+}
+.pmr-viewer-tools button {
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.pmr-viewer-tools button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-viewer-tools button.is-active {
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+.pmr-viewer-tools .pmr-viewer-percent {
+  min-width: 48px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.pmr-viewer-stage {
+  position: relative;
+  flex: 1 1 auto;
+  overflow: hidden;
+  background: #fff;
+  cursor: grab;
+  touch-action: none;
+}
+.pmr-viewer-stage.is-panning { cursor: grabbing; }
+.pmr-viewer-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+.pmr-viewer-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  color: #64748b;
+  font-size: 11px;
+  pointer-events: none;
+}
+.pmr-viewer-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+}
+.pmr-viewer-angle { font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) {
+  .pmr-figure-viewer-overlay { padding: 0; }
+  .pmr-viewer-panel { width: 100vw; height: 100vh; border-radius: 0; }
+  .pmr-viewer-caption { display: none; }
+  .pmr-fig-editor-hint { display: none; }
+}
 .pmr-eq-modal {
   position: fixed;
   inset: 0;
@@ -5935,7 +6629,7 @@ var PdfMathReaderPlugin = (() => {
   var NOTES_KEY = "pdf-math-reader.notes.v1";
   var EQUATIONS_KEY = "pdf-math-reader.equations.v1";
   var PANEL_ID = "pdf-math-reader";
-  var EMPTY_OVERRIDES = { added: [], removed: [], figures: [] };
+  var EMPTY_OVERRIDES = { added: [], removed: [], figures: [], manualFigures: [] };
   var EMPTY_SEARCH = {
     status: "idle",
     query: "",
@@ -6059,7 +6753,8 @@ var PdfMathReaderPlugin = (() => {
       viewMode: "bilingual",
       readingFontSize: 16,
       translationSelection: null,
-      chatSelection: null
+      chatSelection: null,
+      chatMaxTokens: 8192
     };
     try {
       const raw = window.localStorage?.getItem(SETTINGS_KEY);
@@ -6078,7 +6773,8 @@ var PdfMathReaderPlugin = (() => {
         viewMode: ["bilingual", "translation", "source"].includes(parsed?.viewMode) ? parsed.viewMode : fallback.viewMode,
         readingFontSize: width(parsed?.readingFontSize, 13, 22, fallback.readingFontSize),
         translationSelection: normalizeModelSelection(parsed?.translationSelection),
-        chatSelection: normalizeModelSelection(parsed?.chatSelection)
+        chatSelection: normalizeModelSelection(parsed?.chatSelection),
+        chatMaxTokens: normalizeChatTokens(parsed?.chatMaxTokens)
       };
     } catch {
       return fallback;
@@ -6113,8 +6809,20 @@ var PdfMathReaderPlugin = (() => {
           const added = Array.isArray(entry?.added) ? entry.added.map((item) => normalizeBox(item?.bbox)).filter((box) => box !== null).map((box) => ({ bbox: box })).slice(0, 200) : [];
           const removed = Array.isArray(entry?.removed) ? entry.removed.map(normalizeBox).filter((box) => box !== null).slice(0, 200) : [];
           const figures = Array.isArray(entry?.figures) ? entry.figures.map(normalizeBox).filter((box) => box !== null).slice(0, 200) : [];
-          if (added.length === 0 && removed.length === 0 && figures.length === 0) continue;
-          pageMap[index] = { added, removed, figures };
+          const manualFigures = Array.isArray(entry?.manualFigures) ? entry.manualFigures.map((item) => {
+            const bbox = normalizeBox(item?.bbox);
+            if (bbox === null) return null;
+            const replaces = normalizeBox(item?.replaces);
+            return {
+              id: typeof item?.id === "string" ? item.id.slice(0, 64) : "",
+              bbox,
+              ...replaces === null ? {} : { replaces }
+            };
+          }).filter((item) => item !== null).slice(0, 200) : [];
+          if (added.length === 0 && removed.length === 0 && figures.length === 0 && manualFigures.length === 0) {
+            continue;
+          }
+          pageMap[index] = { v: 2, added, removed, figures, manualFigures };
         }
         if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap;
       }
@@ -6130,7 +6838,8 @@ var PdfMathReaderPlugin = (() => {
     return {
       added: Array.isArray(entry.added) ? entry.added : [],
       removed: Array.isArray(entry.removed) ? entry.removed : [],
-      figures: Array.isArray(entry.figures) ? entry.figures : []
+      figures: Array.isArray(entry.figures) ? entry.figures : [],
+      manualFigures: Array.isArray(entry.manualFigures) ? entry.manualFigures : []
     };
   }
   function baseName(name) {
@@ -6297,6 +7006,29 @@ var PdfMathReaderPlugin = (() => {
           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { style: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }, children: modelText })
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-help", children: tt("settings.modelHint") })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-field", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("label", { className: "pmr-label", htmlFor: "pmr-chat-tokens", children: tt("settings.chatTokens") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "input",
+          {
+            id: "pmr-chat-tokens",
+            type: "range",
+            min: "0",
+            max: CHAT_TOKEN_STEPS.length - 1,
+            step: "1",
+            value: CHAT_TOKEN_STEPS.indexOf(settings.chatMaxTokens),
+            "aria-valuetext": `${settings.chatMaxTokens} tokens`,
+            onChange: (event) => onChange({ chatMaxTokens: CHAT_TOKEN_STEPS[Number(event.target.value)] }),
+            style: { width: "100%" }
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-help", children: [
+          settings.chatMaxTokens,
+          " tokens \xB7 ",
+          tt(`settings.chatTokens.${settings.chatMaxTokens}`)
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-help", children: tt("settings.chatTokensHint") })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-field", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-label", children: tt("settings.readingPosition") }),
@@ -7008,6 +7740,529 @@ var PdfMathReaderPlugin = (() => {
     }, [cache, cacheKey, cropBbox, displayWidth, dpr, pageIndex, pdf, cacheVersion]);
     return image;
   }
+  function clampNumber(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+  function nearestSnap(value, targets, threshold) {
+    let best = value;
+    let bestDistance = threshold;
+    for (const target of targets) {
+      const distance = Math.abs(target - value);
+      if (distance < bestDistance) {
+        best = target;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+  function useElementSize(ref) {
+    const [size, setSize] = (0, import_react2.useState)({ width: 0, height: 0 });
+    (0, import_react2.useEffect)(() => {
+      const element = ref.current;
+      if (element === null) return void 0;
+      const update = () => {
+        const rect = element.getBoundingClientRect();
+        setSize((previous) => {
+          const next = { width: Math.round(rect.width), height: Math.round(rect.height) };
+          return previous.width === next.width && previous.height === next.height ? previous : next;
+        });
+      };
+      update();
+      if (typeof ResizeObserver !== "function") {
+        window.addEventListener("resize", update);
+        return () => window.removeEventListener("resize", update);
+      }
+      const observer = new ResizeObserver(update);
+      observer.observe(element);
+      return () => observer.disconnect();
+    }, [ref]);
+    return size;
+  }
+  function RegionViewer({ tt, pdf, pageIndex, bbox, label, caption, preview, onClose }) {
+    const stageRef = (0, import_react2.useRef)(null);
+    const closeRef = (0, import_react2.useRef)(null);
+    const dragRef = (0, import_react2.useRef)(null);
+    const lastRenderKeyRef = (0, import_react2.useRef)("");
+    const closeHandlerRef = (0, import_react2.useRef)(onClose);
+    closeHandlerRef.current = onClose;
+    const [rotation, setRotation] = (0, import_react2.useState)(0);
+    const [mode, setMode] = (0, import_react2.useState)("contain");
+    const [zoom, setZoom] = (0, import_react2.useState)(1);
+    const [pan, setPan] = (0, import_react2.useState)({ x: 0, y: 0 });
+    const [panning, setPanning] = (0, import_react2.useState)(false);
+    const [image, setImage] = (0, import_react2.useState)(
+      typeof preview === "string" && preview !== "" ? { status: "preview", dataUrl: preview } : { status: "loading" }
+    );
+    const stage = useElementSize(stageRef);
+    const quarterTurn = rotation % 180 !== 0;
+    const naturalWidth = Math.max(1, quarterTurn ? bbox[3] - bbox[1] : bbox[2] - bbox[0]);
+    const naturalHeight = Math.max(1, quarterTurn ? bbox[2] - bbox[0] : bbox[3] - bbox[1]);
+    const availableWidth = Math.max(120, stage.width - 36);
+    const availableHeight = Math.max(120, stage.height - 36);
+    const containScale = Math.min(
+      availableWidth / naturalWidth,
+      availableHeight / naturalHeight
+    );
+    const fitWidth = mode === "width" ? availableWidth : naturalWidth * containScale;
+    const fitHeight = mode === "width" ? availableWidth * naturalHeight / naturalWidth : naturalHeight * containScale;
+    const displayWidth = Math.max(32, fitWidth * zoom);
+    const displayHeight = Math.max(32, fitHeight * zoom);
+    const maxPanX = Math.max(0, (displayWidth - availableWidth) / 2) + 48;
+    const maxPanY = Math.max(0, (displayHeight - availableHeight) / 2) + 48;
+    const offsetX = clampNumber(pan.x, -maxPanX, maxPanX);
+    const offsetY = clampNumber(pan.y, -maxPanY, maxPanY);
+    const quality = zoom <= 1.5 ? 2 : zoom <= 3 ? 3 : 4;
+    const renderWidth = Math.max(240, Math.min(4096, Math.round(fitWidth * quality)));
+    const renderKey = `${pageIndex}:${bbox.join(",")}:${rotation}:${renderWidth}`;
+    (0, import_react2.useEffect)(() => {
+      if (stage.width === 0 || fitWidth <= 0) return void 0;
+      if (lastRenderKeyRef.current === renderKey) return void 0;
+      lastRenderKeyRef.current = renderKey;
+      let cancelled = false;
+      const timer = window.setTimeout(() => {
+        pdf.getPage(pageIndex + 1).then(
+          (page) => renderEquationCrop(page, bbox, {
+            rotation,
+            displayWidth: renderWidth,
+            devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+            maxPixels: 16e6,
+            maxScale: 10
+          })
+        ).then((result) => {
+          if (!cancelled) setImage({ status: "ready", ...result });
+        }).catch(() => {
+          if (!cancelled) {
+            setImage(
+              (previous) => previous.status === "ready" || previous.status === "preview" ? previous : { status: "error" }
+            );
+          }
+        });
+      }, 80);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+        if (lastRenderKeyRef.current === renderKey) lastRenderKeyRef.current = "";
+      };
+    }, [bbox, fitWidth, pageIndex, pdf, renderKey, renderWidth, rotation, stage.width]);
+    const rotateBy = (0, import_react2.useCallback)((delta) => {
+      setRotation((value) => ((value + delta) % 360 + 360) % 360);
+      setPan({ x: 0, y: 0 });
+      setZoom(1);
+      setImage({ status: "loading" });
+    }, []);
+    const resetView = (0, import_react2.useCallback)(() => {
+      setRotation(0);
+      setMode("contain");
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      if (rotation !== 0) setImage({ status: "loading" });
+    }, [rotation]);
+    const resetViewRef = (0, import_react2.useRef)(resetView);
+    resetViewRef.current = resetView;
+    (0, import_react2.useEffect)(() => {
+      const previousFocus = document.activeElement;
+      const previousOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+      closeRef.current?.focus?.();
+      const onKeyDown = (event) => {
+        event.stopPropagation();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeHandlerRef.current();
+          return;
+        }
+        if (event.key === "+" || event.key === "=") {
+          event.preventDefault();
+          setZoom((value) => clampNumber(value * 1.2, 0.4, 6));
+          return;
+        }
+        if (event.key === "-") {
+          event.preventDefault();
+          setZoom((value) => clampNumber(value / 1.2, 0.4, 6));
+          return;
+        }
+        if (event.key === "0") {
+          event.preventDefault();
+          resetViewRef.current();
+          return;
+        }
+        if (event.key === "r" || event.key === "R") {
+          event.preventDefault();
+          rotateBy(event.shiftKey ? -90 : 90);
+          return;
+        }
+        const step = event.shiftKey ? 60 : 24;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          setPan((value) => ({ ...value, x: value.x + step }));
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          setPan((value) => ({ ...value, x: value.x - step }));
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setPan((value) => ({ ...value, y: value.y + step }));
+        } else if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setPan((value) => ({ ...value, y: value.y - step }));
+        }
+      };
+      window.addEventListener("keydown", onKeyDown, true);
+      return () => {
+        window.removeEventListener("keydown", onKeyDown, true);
+        document.body.style.overflow = previousOverflow;
+        if (previousFocus instanceof HTMLElement) previousFocus.focus?.();
+      };
+    }, [rotateBy]);
+    (0, import_react2.useEffect)(() => {
+      const element = stageRef.current;
+      if (element === null) return void 0;
+      const onWheel = (event) => {
+        event.preventDefault();
+        const factor = Math.exp(-event.deltaY * 15e-4);
+        setZoom((value) => clampNumber(value * factor, 0.4, 6));
+      };
+      element.addEventListener("wheel", onWheel, { passive: false });
+      return () => element.removeEventListener("wheel", onWheel);
+    }, []);
+    const onPointerDown = (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      dragRef.current = {
+        x: event.clientX,
+        y: event.clientY,
+        panX: offsetX,
+        panY: offsetY
+      };
+      setPanning(true);
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    };
+    const onPointerMove = (event) => {
+      const drag = dragRef.current;
+      if (drag === null) return;
+      setPan({
+        x: drag.panX + (event.clientX - drag.x),
+        y: drag.panY + (event.clientY - drag.y)
+      });
+    };
+    const onPointerUp = (event) => {
+      dragRef.current = null;
+      setPanning(false);
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    };
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+      "div",
+      {
+        className: "pmr-figure-viewer-overlay",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": label,
+        onMouseDown: (event) => {
+          if (event.target === event.currentTarget) onClose();
+        },
+        children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-viewer-panel", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-viewer-head", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-viewer-title", children: label }),
+            typeof caption === "string" && caption !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-viewer-caption", title: caption, children: caption }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-viewer-tools", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => rotateBy(-90),
+                  title: tt("viewer.rotateLeft"),
+                  "aria-label": tt("viewer.rotateLeft"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "rotateLeft", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => rotateBy(90),
+                  title: tt("viewer.rotateRight"),
+                  "aria-label": tt("viewer.rotateRight"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "rotateRight", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => setZoom((value) => clampNumber(value / 1.2, 0.4, 6)),
+                  title: tt("viewer.zoomOut"),
+                  "aria-label": tt("viewer.zoomOut"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "minus", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                "button",
+                {
+                  type: "button",
+                  className: "pmr-viewer-percent",
+                  onClick: () => setZoom(1),
+                  title: tt("viewer.zoomReset"),
+                  children: [
+                    Math.round(zoom * 100),
+                    "%"
+                  ]
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => setZoom((value) => clampNumber(value * 1.2, 0.4, 6)),
+                  title: tt("viewer.zoomIn"),
+                  "aria-label": tt("viewer.zoomIn"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "plus", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  className: mode === "contain" ? "is-active" : "",
+                  onClick: () => {
+                    setMode("contain");
+                    setZoom(1);
+                    setPan({ x: 0, y: 0 });
+                  },
+                  title: tt("viewer.fit"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "fit", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  className: mode === "width" ? "is-active" : "",
+                  onClick: () => {
+                    setMode("width");
+                    setZoom(1);
+                    setPan({ x: 0, y: 0 });
+                  },
+                  title: tt("viewer.width"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "columns", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  type: "button",
+                  onClick: resetView,
+                  title: tt("viewer.reset"),
+                  "aria-label": tt("viewer.reset"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "refresh", size: 14 })
+                }
+              ),
+              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                "button",
+                {
+                  ref: closeRef,
+                  type: "button",
+                  onClick: onClose,
+                  title: tt("action.close"),
+                  "aria-label": tt("action.close"),
+                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 14 })
+                }
+              )
+            ] })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+            "div",
+            {
+              className: `pmr-viewer-stage ${panning ? "is-panning" : ""}`,
+              ref: stageRef,
+              onPointerDown,
+              onPointerMove,
+              onPointerUp,
+              onPointerCancel: onPointerUp,
+              onDoubleClick: () => setZoom((value) => value > 1.05 ? 1 : 2),
+              children: [
+                (image.status === "ready" || image.status === "preview") && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                  "img",
+                  {
+                    className: "pmr-viewer-image",
+                    src: image.dataUrl,
+                    alt: caption ?? label,
+                    draggable: false,
+                    style: {
+                      width: displayWidth,
+                      height: displayHeight,
+                      transform: `translate(-50%, -50%) translate(${offsetX}px, ${offsetY}px)`
+                    }
+                  }
+                ),
+                image.status === "loading" && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-viewer-loading", children: [
+                  /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
+                  tt("viewer.loading")
+                ] }),
+                image.status === "error" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-viewer-loading", children: tt("viewer.failed") })
+              ]
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-viewer-foot", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("viewer.hint") }),
+            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "pmr-viewer-angle", children: [
+              rotation,
+              "\xB0"
+            ] })
+          ] })
+        ] })
+      }
+    );
+  }
+  var FIGURE_HANDLES = [
+    ["nw", 0, 0],
+    ["n", 50, 0],
+    ["ne", 100, 0],
+    ["w", 0, 50],
+    ["e", 100, 50],
+    ["sw", 0, 100],
+    ["s", 50, 100],
+    ["se", 100, 100]
+  ];
+  function figureCursor(handle) {
+    if (handle === "n" || handle === "s") return "ns-resize";
+    if (handle === "e" || handle === "w") return "ew-resize";
+    if (handle === "nw" || handle === "se") return "nwse-resize";
+    return "nesw-resize";
+  }
+  function FigureBoundsEditor({
+    tt,
+    box,
+    scale,
+    pageWidth,
+    pageHeight,
+    targets,
+    viewerRef,
+    onSave,
+    onCancel
+  }) {
+    const [draft, setDraft] = (0, import_react2.useState)(box);
+    const dragRef = (0, import_react2.useRef)(null);
+    const scaleValue = scale > 0 ? scale : 1;
+    (0, import_react2.useEffect)(() => {
+      setDraft(box);
+    }, [box]);
+    const normalize3 = (0, import_react2.useCallback)(
+      (value) => {
+        let [x0, y0, x1, y1] = value;
+        x0 = clampNumber(x0, 0, pageWidth);
+        y0 = clampNumber(y0, 0, pageHeight);
+        x1 = clampNumber(x1, 0, pageWidth);
+        y1 = clampNumber(y1, 0, pageHeight);
+        if (x1 - x0 < 8) x1 = Math.min(pageWidth, x0 + 8);
+        if (y1 - y0 < 8) y1 = Math.min(pageHeight, y0 + 8);
+        return [x0, y0, x1, y1];
+      },
+      [pageHeight, pageWidth]
+    );
+    (0, import_react2.useEffect)(() => {
+      const onKeyDown = (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          onCancel();
+        }
+      };
+      window.addEventListener("keydown", onKeyDown, true);
+      return () => window.removeEventListener("keydown", onKeyDown, true);
+    }, [onCancel]);
+    const startDrag = (handle) => (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dragRef.current = {
+        handle,
+        startX: event.clientX,
+        startY: event.clientY,
+        box: [...draft]
+      };
+      const move = (moveEvent) => {
+        const drag = dragRef.current;
+        if (drag === null) return;
+        const dx = (moveEvent.clientX - drag.startX) / scaleValue;
+        const dy = (moveEvent.clientY - drag.startY) / scaleValue;
+        let [x0, y0, x1, y1] = drag.box;
+        if (handle === "move") {
+          x0 += dx;
+          x1 += dx;
+          y0 += dy;
+          y1 += dy;
+        } else {
+          if (handle.includes("w")) x0 += dx;
+          if (handle.includes("e")) x1 += dx;
+          if (handle.includes("n")) y0 += dy;
+          if (handle.includes("s")) y1 += dy;
+        }
+        const threshold = 6 / scaleValue;
+        if (handle !== "move") {
+          if (handle.includes("w")) x0 = nearestSnap(x0, targets.xs, threshold);
+          if (handle.includes("e")) x1 = nearestSnap(x1, targets.xs, threshold);
+          if (handle.includes("n")) y0 = nearestSnap(y0, targets.ys, threshold);
+          if (handle.includes("s")) y1 = nearestSnap(y1, targets.ys, threshold);
+        }
+        const next = normalize3([Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)]);
+        setDraft(next);
+        const viewer = viewerRef.current;
+        if (viewer !== null) {
+          const rect = viewer.getBoundingClientRect();
+          const margin = 38;
+          if (moveEvent.clientY < rect.top + margin) viewer.scrollTop -= 14;
+          else if (moveEvent.clientY > rect.bottom - margin) viewer.scrollTop += 14;
+          if (moveEvent.clientX < rect.left + margin) viewer.scrollLeft -= 14;
+          else if (moveEvent.clientX > rect.right - margin) viewer.scrollLeft += 14;
+        }
+      };
+      const end = () => {
+        dragRef.current = null;
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", end);
+        window.removeEventListener("pointercancel", end);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", end);
+      window.addEventListener("pointercancel", end);
+    };
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-fig-editor", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+        "div",
+        {
+          className: "pmr-fig-editor-box",
+          style: {
+            left: draft[0] * scaleValue,
+            top: draft[1] * scaleValue,
+            width: (draft[2] - draft[0]) * scaleValue,
+            height: (draft[3] - draft[1]) * scaleValue
+          },
+          onPointerDown: startDrag("move"),
+          children: FIGURE_HANDLES.map(([name, left, top]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "div",
+            {
+              className: "pmr-fig-editor-handle",
+              style: { left: `${left}%`, top: `${top}%`, cursor: figureCursor(name) },
+              onPointerDown: startDrag(name)
+            },
+            name
+          ))
+        }
+      ),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-fig-editor-actions", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-fig-editor-hint", children: tt("figure.adjustHint") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "button",
+          {
+            type: "button",
+            className: "pmr-btn pmr-btn-primary",
+            onClick: () => onSave(normalize3(draft)),
+            children: tt("figure.save")
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: onCancel, children: tt("figure.cancel") })
+      ] })
+    ] });
+  }
   function EquationBlock({
     tt,
     equation,
@@ -7043,14 +8298,6 @@ var PdfMathReaderPlugin = (() => {
       displayWidth,
       cacheVersion
     });
-    (0, import_react2.useEffect)(() => {
-      if (!zoomOpen) return void 0;
-      const onKeyDown = (event) => {
-        if (event.key === "Escape") setZoomOpen(false);
-      };
-      window.addEventListener("keydown", onKeyDown);
-      return () => window.removeEventListener("keydown", onKeyDown);
-    }, [zoomOpen]);
     const label = equation.equationNumber === null || equation.equationNumber === void 0 ? tt("equation.unnumbered") : tt("equation.numbered", { number: equation.equationNumber });
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
       "section",
@@ -7138,30 +8385,19 @@ $$`),
             }
           ),
           /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("footer", { className: "pmr-eq-foot", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: tt("equation.hint") }) }),
-          zoomOpen && image.status === "ready" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal", role: "dialog", "aria-label": label, onClick: () => setZoomOpen(false), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-body", onClick: (event) => event.stopPropagation(), children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-head", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label }),
-              /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-                "button",
-                {
-                  type: "button",
-                  className: "pmr-iconbtn",
-                  onClick: () => setZoomOpen(false),
-                  "aria-label": tt("action.close"),
-                  children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 14 })
-                }
-              )
-            ] }),
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal-scroll", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-              "img",
-              {
-                src: image.dataUrl,
-                alt: equation.text,
-                style: { width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: "none" },
-                draggable: false
-              }
-            ) })
-          ] }) })
+          zoomOpen && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            RegionViewer,
+            {
+              tt,
+              pdf,
+              pageIndex,
+              bbox: equation.bbox,
+              label,
+              caption: equation.text,
+              preview: image.status === "ready" ? image.dataUrl : "",
+              onClose: () => setZoomOpen(false)
+            }
+          )
         ]
       }
     );
@@ -7177,12 +8413,15 @@ $$`),
     active,
     onLocate,
     onRemove,
+    onAdjust,
+    onRestore,
     onCopy
   }) {
     const [zoomOpen, setZoomOpen] = (0, import_react2.useState)(false);
+    const isTable = figure.kind === "table";
     const cropBbox = figure.imageBbox ?? figure.bbox;
     const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0]);
-    const displayWidth = Math.min(760, Math.max(160, bboxWidth * 1.7));
+    const displayWidth = Math.min(isTable ? 960 : 760, Math.max(160, bboxWidth * 1.7));
     const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
     const cacheKey = [
       fingerprint,
@@ -7201,21 +8440,14 @@ $$`),
       displayWidth,
       cacheVersion
     });
-    (0, import_react2.useEffect)(() => {
-      if (!zoomOpen) return void 0;
-      const onKeyDown = (event) => {
-        if (event.key === "Escape") setZoomOpen(false);
-      };
-      window.addEventListener("keydown", onKeyDown);
-      return () => window.removeEventListener("keydown", onKeyDown);
-    }, [zoomOpen]);
-    const label = figure.figureNumber === null || figure.figureNumber === void 0 ? tt("figure.unnumbered") : tt("figure.numbered", { number: figure.figureNumber });
+    const label = isTable ? figure.tableNumber === null || figure.tableNumber === void 0 ? tt("table.unnumbered") : tt("table.numbered", { number: figure.tableNumber }) : figure.figureNumber === null || figure.figureNumber === void 0 ? tt("figure.unnumbered") : tt("figure.numbered", { number: figure.figureNumber });
     const labels = Array.isArray(figure.labels) ? figure.labels : [];
     const labelText = labels.map((line) => line.text).join("\n");
     return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: `pmr-eq-card pmr-fig-card ${active ? "is-active" : ""}`, "aria-label": label, children: [
       /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "pmr-eq-head", children: [
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-label", children: label }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-badge", children: tt("figure.auto") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-badge", children: isTable ? tt("figure.table") : tt("figure.auto") }),
+        figure.detectionSource === "manual" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-badge is-manual", children: tt("figure.manual") }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-actions", children: [
           labelText !== "" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
             "button",
@@ -7241,10 +8473,19 @@ $$`),
             "button",
             {
               type: "button",
+              onClick: () => onAdjust(figure),
+              title: tt("figure.adjust"),
+              "aria-label": tt("figure.adjust"),
+              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "crop", size: 12 })
+            }
+          ),
+          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+            "button",
+            {
+              type: "button",
               onClick: () => setZoomOpen(true),
               title: tt("figure.zoom"),
               "aria-label": tt("figure.zoom"),
-              disabled: image.status !== "ready",
               children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "expand", size: 12 })
             }
           ),
@@ -7254,8 +8495,8 @@ $$`),
               type: "button",
               className: "pmr-eq-remove",
               onClick: () => onRemove(figure),
-              title: tt("figure.notFigure"),
-              "aria-label": tt("figure.notFigure"),
+              title: tt(isTable ? "table.notTable" : "figure.notFigure"),
+              "aria-label": tt(isTable ? "table.notTable" : "figure.notFigure"),
               children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 11 })
             }
           )
@@ -7291,34 +8532,28 @@ $$`),
         }
       ),
       labels.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("details", { className: "pmr-fig-labels", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("summary", { children: tt("figure.labels", { count: labels.length }) }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "pmr-fig-note", children: tt("figure.labelsHint") }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("summary", { children: tt(isTable ? "table.labels" : "figure.labels", { count: labels.length }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "pmr-fig-note", children: tt(isTable ? "table.labelsHint" : "figure.labelsHint") }),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-fig-label-list", children: labels.map((line, index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-fig-label", children: line.text }, `${figure.id}-label-${index}`)) })
       ] }),
-      zoomOpen && image.status === "ready" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal", role: "dialog", "aria-label": label, onClick: () => setZoomOpen(false), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-body", onClick: (event) => event.stopPropagation(), children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-eq-modal-head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-            "button",
-            {
-              type: "button",
-              className: "pmr-iconbtn",
-              onClick: () => setZoomOpen(false),
-              "aria-label": tt("action.close"),
-              children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "close", size: 14 })
-            }
-          )
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-modal-scroll", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
-          "img",
-          {
-            src: image.dataUrl,
-            alt: figure.caption ?? label,
-            style: { width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: "none" },
-            draggable: false
-          }
-        ) })
-      ] }) })
+      isTable && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-foot", children: tt("figure.tableHint") }),
+      figure.detectionSource === "manual" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-eq-reset", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", className: "pmr-btn pmr-btn-ghost", onClick: () => onRestore(figure), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "refresh", size: 11 }),
+        tt("equation.restore")
+      ] }) }),
+      zoomOpen && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+        RegionViewer,
+        {
+          tt,
+          pdf,
+          pageIndex,
+          bbox: figure.bbox,
+          label,
+          caption: figure.caption ?? "",
+          preview: image.status === "ready" ? image.dataUrl : "",
+          onClose: () => setZoomOpen(false)
+        }
+      )
     ] });
   }
   var ReaderErrorBoundary = class extends import_react2.Component {
@@ -7462,6 +8697,9 @@ $$`),
     const [activeEquation, setActiveEquation] = (0, import_react2.useState)(null);
     const [equationSelectMode, setEquationSelectMode] = (0, import_react2.useState)(false);
     const [equationRect, setEquationRect] = (0, import_react2.useState)(null);
+    const [figureSelectMode, setFigureSelectMode] = (0, import_react2.useState)(false);
+    const [figureRect, setFigureRect] = (0, import_react2.useState)(null);
+    const [figureEdit, setFigureEdit] = (0, import_react2.useState)(null);
     const [translationErrors, setTranslationErrors] = (0, import_react2.useState)({});
     const [searchQuery, setSearchQuery] = (0, import_react2.useState)("");
     const [searchState, setSearchState] = (0, import_react2.useState)(EMPTY_SEARCH);
@@ -7502,6 +8740,7 @@ $$`),
     equationOverridesRef.current = equationOverrides;
     const equationImageCacheRef = (0, import_react2.useRef)(/* @__PURE__ */ new Map());
     const equationDragRef = (0, import_react2.useRef)(null);
+    const figureDragRef = (0, import_react2.useRef)(null);
     const searchInputRef = (0, import_react2.useRef)(null);
     const searchAbortRef = (0, import_react2.useRef)(null);
     const searchSeqRef = (0, import_react2.useRef)(0);
@@ -7538,7 +8777,7 @@ $$`),
       () => pageOverridesFor(equationOverrides, docFingerprint, pageIndex),
       [docFingerprint, equationOverrides, pageIndex]
     );
-    const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0 || pageOverrides.figures.length > 0;
+    const hasPageOverrides = pageOverrides.added.length > 0 || pageOverrides.removed.length > 0 || pageOverrides.figures.length > 0 || pageOverrides.manualFigures.length > 0;
     const activeOverlayBlock = blocks.find((block) => block.id === activeEquation);
     const docNotes = (0, import_react2.useMemo)(
       () => notes.filter((note) => note.doc === docFingerprint),
@@ -7563,6 +8802,35 @@ $$`),
       Math.round(viewerWidth),
       renderNonce
     ].join(":");
+    const snapTargets = (0, import_react2.useMemo)(() => {
+      const xs = /* @__PURE__ */ new Set();
+      const ys = /* @__PURE__ */ new Set();
+      for (const atom of pageModel?.atoms ?? []) {
+        if (!Number.isFinite(atom.x) || !Number.isFinite(atom.y)) continue;
+        xs.add(atom.x);
+        xs.add(atom.endX);
+        ys.add(atom.top);
+        ys.add(atom.bottom);
+      }
+      return { xs: [...xs], ys: [...ys] };
+    }, [pageModel]);
+    (0, import_react2.useEffect)(() => {
+      setFigureSelectMode(false);
+      setFigureRect(null);
+      setFigureEdit(null);
+    }, [docFingerprint, pageIndex]);
+    (0, import_react2.useEffect)(() => {
+      if (!figureSelectMode) return void 0;
+      const onKeyDown = (event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        setFigureSelectMode(false);
+        setFigureRect(null);
+        figureDragRef.current = null;
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    }, [figureSelectMode]);
     const notify = (0, import_react2.useCallback)((message, kind = "info") => {
       window.clearTimeout(toastTimerRef.current);
       setToast({ message, kind, id: Date.now() });
@@ -8328,6 +9596,7 @@ $$`),
       if (doc === null) return void 0;
       const onKeyDown = (event) => {
         if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+        if (figureEdit !== null || figureSelectMode) return;
         if (isEditableTarget(event.target)) return;
         const key = event.key.toLowerCase();
         if (event.key === "Escape") {
@@ -8371,7 +9640,7 @@ $$`),
       };
       window.addEventListener("keydown", onKeyDown);
       return () => window.removeEventListener("keydown", onKeyDown);
-    }, [clearTextSelection, doc, goToPage, pageIndex]);
+    }, [clearTextSelection, doc, figureEdit, figureSelectMode, goToPage, pageIndex]);
     (0, import_react2.useEffect)(() => {
       if (doc === null) return void 0;
       const onKeyDown = (event) => {
@@ -8487,14 +9756,21 @@ $$`),
         });
         setEquationOverrides((previous) => {
           const pages = { ...previous[fingerprint] ?? {} };
-          const current = pages[pageIndex] ?? { added: [], removed: [], figures: [] };
+          const current = pages[pageIndex] ?? {
+            added: [],
+            removed: [],
+            figures: [],
+            manualFigures: []
+          };
           const updated = mutator({
+            v: 2,
             added: [...current.added ?? []],
             removed: [...current.removed ?? []],
-            figures: [...current.figures ?? []]
+            figures: [...current.figures ?? []],
+            manualFigures: [...current.manualFigures ?? []]
           });
           const nextPages = { ...pages };
-          if (updated.added.length === 0 && updated.removed.length === 0 && (updated.figures?.length ?? 0) === 0) {
+          if (updated.added.length === 0 && updated.removed.length === 0 && (updated.figures?.length ?? 0) === 0 && (updated.manualFigures?.length ?? 0) === 0) {
             delete nextPages[pageIndex];
           } else {
             nextPages[pageIndex] = updated;
@@ -8587,17 +9863,96 @@ $$`),
       (figure) => {
         commitPageOverrides((previous) => ({
           ...previous,
+          manualFigures: previous.manualFigures.filter(
+            (entry) => figure.manualId ? entry.id !== figure.manualId : overlapRatio(entry.bbox, figure.bbox) <= 0.3
+          ),
           figures: [
             ...previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3),
             figure.bbox
           ]
         }));
-        notify(tt("figure.removed"));
+        notify(tt(figure.kind === "table" ? "table.removed" : "figure.removed"));
+      },
+      [commitPageOverrides, notify, tt]
+    );
+    const addManualFigure = (0, import_react2.useCallback)(
+      (box) => {
+        const id = `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+        const replaced = figures.find(
+          (figure) => figure.detectionSource !== "manual" && overlapRatio(figure.bbox, box) > 0.5
+        );
+        commitPageOverrides((previous) => ({
+          ...previous,
+          manualFigures: [
+            ...previous.manualFigures,
+            { id, bbox: box, ...replaced === void 0 ? {} : { replaces: replaced.bbox } }
+          ]
+        }));
+        notify(tt("figure.selected"));
+      },
+      [commitPageOverrides, figures, notify, tt]
+    );
+    const beginFigureEdit = (0, import_react2.useCallback)(
+      (figure) => {
+        setFigureEdit({ figure, box: [...figure.bbox] });
+        setFigureSelectMode(false);
+        setFigureRect(null);
+        setEquationSelectMode(false);
+        setEquationRect(null);
+        setActiveEquation(figure.id);
+        setActiveParagraph(null);
+        clearTextSelection();
+        scrollToEquation(figure);
+        notify(tt("figure.adjustHint"));
+      },
+      [clearTextSelection, notify, scrollToEquation, tt]
+    );
+    const saveFigureEdit = (0, import_react2.useCallback)(
+      (box) => {
+        const editing = figureEdit;
+        if (editing === null) return;
+        commitPageOverrides((previous) => {
+          const figure = editing.figure;
+          const manualFigures = [...previous.manualFigures];
+          const index = manualFigures.findIndex(
+            (entry) => figure.manualId ? entry.id === figure.manualId : figure.detectionSource === "manual" && overlapRatio(entry.bbox, figure.bbox) > 0.5
+          );
+          if (index >= 0) {
+            manualFigures[index] = { ...manualFigures[index], bbox: box };
+          } else {
+            manualFigures.push({
+              id: `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+              bbox: box,
+              replaces: figure.bbox
+            });
+          }
+          return { ...previous, manualFigures };
+        });
+        setFigureEdit(null);
+        notify(tt("figure.saved"));
+      },
+      [commitPageOverrides, figureEdit, notify, tt]
+    );
+    const restoreFigure = (0, import_react2.useCallback)(
+      (figure) => {
+        commitPageOverrides((previous) => ({
+          ...previous,
+          manualFigures: previous.manualFigures.filter(
+            (entry) => figure.manualId ? entry.id !== figure.manualId : overlapRatio(entry.bbox, figure.bbox) <= 0.3
+          ),
+          figures: previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3)
+        }));
+        notify(tt("equation.reset"));
       },
       [commitPageOverrides, notify, tt]
     );
     const resetPageEquations = (0, import_react2.useCallback)(() => {
-      commitPageOverrides(() => ({ added: [], removed: [], figures: [] }));
+      commitPageOverrides(() => ({
+        added: [],
+        removed: [],
+        figures: [],
+        manualFigures: []
+      }));
       notify(tt("equation.reset"));
     }, [commitPageOverrides, notify, tt]);
     const beginEquationSelection = (0, import_react2.useCallback)(() => {
@@ -8608,11 +9963,31 @@ $$`),
         return;
       }
       setEquationSelectMode(true);
+      setFigureSelectMode(false);
+      setFigureRect(null);
+      setFigureEdit(null);
       setActiveEquation(null);
       setActiveParagraph(null);
       clearTextSelection();
       notify(tt("equation.selectHint"));
     }, [clearTextSelection, equationSelectMode, notify, tt]);
+    const beginFigureSelection = (0, import_react2.useCallback)(() => {
+      if (figureSelectMode) {
+        setFigureSelectMode(false);
+        setFigureRect(null);
+        figureDragRef.current = null;
+        return;
+      }
+      setFigureSelectMode(true);
+      setFigureRect(null);
+      setEquationSelectMode(false);
+      setEquationRect(null);
+      setFigureEdit(null);
+      setActiveEquation(null);
+      setActiveParagraph(null);
+      clearTextSelection();
+      notify(tt("figure.selectHint"));
+    }, [clearTextSelection, figureSelectMode, notify, tt]);
     const pagePointFromEvent = (0, import_react2.useCallback)(
       (event) => {
         const rect = event.currentTarget.getBoundingClientRect();
@@ -8668,6 +10043,73 @@ $$`),
         addManualEquation(box);
       },
       [addManualEquation, notify, pageModel, pagePointFromEvent, tt]
+    );
+    const autoScrollViewer = (0, import_react2.useCallback)((clientX, clientY) => {
+      const viewer = viewerRef.current;
+      if (viewer === null) return;
+      const rect = viewer.getBoundingClientRect();
+      const margin = 38;
+      if (clientY < rect.top + margin) viewer.scrollTop -= 14;
+      else if (clientY > rect.bottom - margin) viewer.scrollTop += 14;
+      if (clientX < rect.left + margin) viewer.scrollLeft -= 14;
+      else if (clientX > rect.right - margin) viewer.scrollLeft += 14;
+    }, []);
+    const onFigurePointerDown = (0, import_react2.useCallback)(
+      (event) => {
+        if (!figureSelectMode || pageModel === null) return;
+        if (event.button !== 0) return;
+        event.preventDefault();
+        const point = pagePointFromEvent(event);
+        figureDragRef.current = { x0: point.x, y0: point.y };
+        setFigureRect({ x0: point.x, y0: point.y, x1: point.x, y1: point.y });
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+      },
+      [figureSelectMode, pageModel, pagePointFromEvent]
+    );
+    const onFigurePointerMove = (0, import_react2.useCallback)(
+      (event) => {
+        const drag = figureDragRef.current;
+        if (drag === null || pageModel === null) return;
+        const point = pagePointFromEvent(event);
+        setFigureRect({ x0: drag.x0, y0: drag.y0, x1: point.x, y1: point.y });
+        autoScrollViewer(event.clientX, event.clientY);
+      },
+      [autoScrollViewer, pageModel, pagePointFromEvent]
+    );
+    const onFigurePointerUp = (0, import_react2.useCallback)(
+      (event) => {
+        const drag = figureDragRef.current;
+        if (drag === null || pageModel === null) return;
+        figureDragRef.current = null;
+        const point = pagePointFromEvent(event);
+        const threshold = 6 / (currentScale > 0 ? currentScale : 1);
+        const x0 = nearestSnap(Math.min(drag.x0, point.x), snapTargets.xs, threshold);
+        const x1 = nearestSnap(Math.max(drag.x0, point.x), snapTargets.xs, threshold);
+        const y0 = nearestSnap(Math.min(drag.y0, point.y), snapTargets.ys, threshold);
+        const y1 = nearestSnap(Math.max(drag.y0, point.y), snapTargets.ys, threshold);
+        const box = [
+          Math.min(x0, x1),
+          Math.min(y0, y1),
+          Math.max(x0, x1),
+          Math.max(y0, y1)
+        ];
+        setFigureRect(null);
+        if (box[2] - box[0] < 8 || box[3] - box[1] < 8) {
+          notify(tt("figure.tooSmall"), "error");
+          return;
+        }
+        setFigureSelectMode(false);
+        addManualFigure(box);
+      },
+      [
+        addManualFigure,
+        currentScale,
+        notify,
+        pageModel,
+        pagePointFromEvent,
+        snapTargets,
+        tt
+      ]
     );
     const handleTextMouseUp = (0, import_react2.useCallback)(
       (event) => {
@@ -9408,14 +10850,15 @@ ${text.slice(-5600)}` : text;
               context: context.text,
               contextLabel: context.label,
               skill: skill === null ? void 0 : { name: skill.name, content: skill.content },
-              modelSelection: settings.chatSelection
+              modelSelection: settings.chatSelection,
+              maxTokens: settings.chatMaxTokens
             },
             controller.signal
           );
           if (controller.signal.aborted) return;
           setChatMessages((previous) => [
             ...previous,
-            { role: "assistant", content: response.answer }
+            { role: "assistant", content: response.answer, truncated: response.truncated === true }
           ]);
         } catch (error) {
           if (!controller.signal.aborted && !isAbort(error)) {
@@ -9434,6 +10877,7 @@ ${text.slice(-5600)}` : text;
         chatMessages,
         chatScope,
         settings.chatSelection,
+        settings.chatMaxTokens,
         skill,
         tt
       ]
@@ -9593,11 +11037,17 @@ ${text.slice(-5600)}` : text;
             continue;
           }
           if (block.type === "figure") {
-            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            const isTable = block.kind === "table";
+            const label = isTable ? block.tableNumber ? tt("table.numbered", { number: block.tableNumber }) : tt("table.unnumbered") : block.figureNumber ? tt("figure.numbered", { number: block.figureNumber }) : tt("figure.unnumbered");
             lines.push(`**${label}**`, "");
             const labels = (block.labels ?? []).map((line) => line.text).filter((text) => text !== "");
             if (labels.length > 0) {
-              lines.push(`${tt("figure.labelsInline")}`, "", ...labels.map((text) => `- ${text}`), "");
+              lines.push(
+                `${tt(isTable ? "table.labelsInline" : "figure.labelsInline")}`,
+                "",
+                ...labels.map((text) => `- ${text}`),
+                ""
+              );
             }
             continue;
           }
@@ -9670,7 +11120,8 @@ ${text.slice(-5600)}` : text;
           }
           if (block.type === "figure") {
             const image = images.get(`${page.index}:${block.id}`);
-            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            const isTable = block.kind === "table";
+            const label = isTable ? block.tableNumber ? tt("table.numbered", { number: block.tableNumber }) : tt("table.unnumbered") : block.figureNumber ? tt("figure.numbered", { number: block.figureNumber }) : tt("figure.unnumbered");
             if (image !== void 0) {
               const name = `figures/${block.id}.png`;
               files.push({ name, data: dataUrlToBytes(image.dataUrl) });
@@ -9678,7 +11129,12 @@ ${text.slice(-5600)}` : text;
             }
             const labels = (block.labels ?? []).map((line) => line.text).filter((text) => text !== "");
             if (labels.length > 0) {
-              lines.push(`${tt("figure.labelsInline")}`, "", ...labels.map((text) => `- ${text}`), "");
+              lines.push(
+                `${tt(isTable ? "table.labelsInline" : "figure.labelsInline")}`,
+                "",
+                ...labels.map((text) => `- ${text}`),
+                ""
+              );
             }
             continue;
           }
@@ -9742,13 +11198,16 @@ ${text.slice(-5600)}` : text;
           }
           if (block.type === "figure") {
             const image = images.get(`${page.index}:${block.id}`);
-            const label = block.figureNumber ? `${tt("figure.label")} ${block.figureNumber}` : tt("figure.unnumbered");
+            const isTable = block.kind === "table";
+            const label = isTable ? block.tableNumber ? tt("table.numbered", { number: block.tableNumber }) : tt("table.unnumbered") : block.figureNumber ? tt("figure.numbered", { number: block.figureNumber }) : tt("figure.unnumbered");
             const preview = image !== void 0 ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">` : "";
             const labels = (block.labels ?? []).map((line) => `<li>${escapeHtml(line.text)}</li>`).join("");
             return `<figure class="figure">${preview}<figcaption>${escapeHtml(
               label
             )}</figcaption>${labels !== "" ? `<details><summary>${escapeHtml(
-              tt("figure.labels", { count: (block.labels ?? []).length })
+              tt(isTable ? "table.labels" : "figure.labels", {
+                count: (block.labels ?? []).length
+              })
             )}</summary><ul>${labels}</ul></details>` : ""}</figure>`;
           }
           const paragraph = block.paragraph;
@@ -10114,6 +11573,20 @@ ${body}
                     ]
                   }
                 ),
+                /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(
+                  "button",
+                  {
+                    type: "button",
+                    className: `pmr-btn pmr-eq-select-btn ${figureSelectMode || figureEdit !== null ? "pmr-btn-primary" : "pmr-btn-ghost"}`,
+                    onClick: beginFigureSelection,
+                    title: tt("figure.select"),
+                    disabled: pageModel === null,
+                    children: [
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Icon, { name: "table", size: 14 }),
+                      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-eq-select-text", children: tt("figure.select") })
+                    ]
+                  }
+                ),
                 /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { style: { position: "relative" }, children: [
                   /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                     "button",
@@ -10417,6 +11890,45 @@ ${body}
                         )
                       }
                     ),
+                    figureSelectMode && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                      "div",
+                      {
+                        className: "pmr-eq-selector",
+                        onPointerDown: onFigurePointerDown,
+                        onPointerMove: onFigurePointerMove,
+                        onPointerUp: onFigurePointerUp,
+                        onPointerCancel: () => {
+                          figureDragRef.current = null;
+                          setFigureRect(null);
+                        },
+                        children: figureRect !== null && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                          "div",
+                          {
+                            className: "pmr-eq-box",
+                            style: {
+                              left: Math.min(figureRect.x0, figureRect.x1) * currentScale,
+                              top: Math.min(figureRect.y0, figureRect.y1) * currentScale,
+                              width: Math.abs(figureRect.x1 - figureRect.x0) * currentScale,
+                              height: Math.abs(figureRect.y1 - figureRect.y0) * currentScale
+                            }
+                          }
+                        )
+                      }
+                    ),
+                    figureEdit !== null && pageSize !== null && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                      FigureBoundsEditor,
+                      {
+                        tt,
+                        box: figureEdit.box,
+                        scale: currentScale,
+                        pageWidth: pageSize.width / currentScale,
+                        pageHeight: pageSize.height / currentScale,
+                        targets: snapTargets,
+                        viewerRef,
+                        onSave: saveFigureEdit,
+                        onCancel: () => setFigureEdit(null)
+                      }
+                    ),
                     renderState === "loading" && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-page-loading", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { style: { display: "inline-flex", alignItems: "center", gap: 7 }, children: [
                       /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "pmr-spinner" }),
                       tt("status.rendering")
@@ -10718,6 +12230,8 @@ ${body}
                                   active: activeEquation === block.id,
                                   onLocate: focusEquation,
                                   onRemove: removeFigure,
+                                  onAdjust: beginFigureEdit,
+                                  onRestore: restoreFigure,
                                   onCopy: copyText
                                 },
                                 block.id
@@ -11047,6 +12561,19 @@ ${body}
                             children: [
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-msg-role", children: message.role === "user" ? "You" : "AI" }),
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "pmr-msg-body", children: message.content }),
+                              message.truncated && /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "pmr-help", role: "status", children: [
+                                tt("reading.truncated"),
+                                index === chatMessages.length - 1 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+                                  "button",
+                                  {
+                                    type: "button",
+                                    className: "pmr-btn pmr-btn-ghost",
+                                    disabled: chatBusy,
+                                    onClick: () => sendChat(tt("reading.continuePrompt")),
+                                    children: tt("reading.continue")
+                                  }
+                                )
+                              ] }),
                               /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
                                 CopyButton,
                                 {

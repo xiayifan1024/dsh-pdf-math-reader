@@ -9,6 +9,7 @@ import {
   translateSegments,
 } from './api'
 import { Icon } from './icons'
+import { CHAT_TOKEN_STEPS, normalizeChatTokens } from '../lib/chat-settings.js'
 import {
   buildAtoms,
   buildPageModel,
@@ -66,7 +67,7 @@ const SETTINGS_KEY = 'pdf-math-reader.settings.v1'
 const NOTES_KEY = 'pdf-math-reader.notes.v1'
 const EQUATIONS_KEY = 'pdf-math-reader.equations.v1'
 const PANEL_ID = 'pdf-math-reader'
-const EMPTY_OVERRIDES = { added: [], removed: [], figures: [] }
+const EMPTY_OVERRIDES = { added: [], removed: [], figures: [], manualFigures: [] }
 const EMPTY_SEARCH = {
   status: 'idle',
   query: '',
@@ -230,6 +231,7 @@ function loadSettings() {
     readingFontSize: 16,
     translationSelection: null,
     chatSelection: null,
+    chatMaxTokens: 8192,
   }
   try {
     const raw = window.localStorage?.getItem(SETTINGS_KEY)
@@ -254,6 +256,7 @@ function loadSettings() {
       readingFontSize: width(parsed?.readingFontSize, 13, 22, fallback.readingFontSize),
       translationSelection: normalizeModelSelection(parsed?.translationSelection),
       chatSelection: normalizeModelSelection(parsed?.chatSelection),
+      chatMaxTokens: normalizeChatTokens(parsed?.chatMaxTokens),
     }
   } catch {
     return fallback
@@ -301,8 +304,30 @@ function loadEquationOverrides() {
         const figures = Array.isArray(entry?.figures)
           ? entry.figures.map(normalizeBox).filter((box) => box !== null).slice(0, 200)
           : []
-        if (added.length === 0 && removed.length === 0 && figures.length === 0) continue
-        pageMap[index] = { added, removed, figures }
+        const manualFigures = Array.isArray(entry?.manualFigures)
+          ? entry.manualFigures
+              .map((item) => {
+                const bbox = normalizeBox(item?.bbox)
+                if (bbox === null) return null
+                const replaces = normalizeBox(item?.replaces)
+                return {
+                  id: typeof item?.id === 'string' ? item.id.slice(0, 64) : '',
+                  bbox,
+                  ...(replaces === null ? {} : { replaces }),
+                }
+              })
+              .filter((item) => item !== null)
+              .slice(0, 200)
+          : []
+        if (
+          added.length === 0 &&
+          removed.length === 0 &&
+          figures.length === 0 &&
+          manualFigures.length === 0
+        ) {
+          continue
+        }
+        pageMap[index] = { v: 2, added, removed, figures, manualFigures }
       }
       if (Object.keys(pageMap).length > 0) output[fingerprint] = pageMap
     }
@@ -320,6 +345,7 @@ function pageOverridesFor(all, fingerprint, pageIndex) {
     added: Array.isArray(entry.added) ? entry.added : [],
     removed: Array.isArray(entry.removed) ? entry.removed : [],
     figures: Array.isArray(entry.figures) ? entry.figures : [],
+    manualFigures: Array.isArray(entry.manualFigures) ? entry.manualFigures : [],
   }
 }
 
@@ -526,6 +552,22 @@ function SettingsPanel({ tt, settings, onChange, onClose, onClearCache, onClearP
           <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{modelText}</span>
         </div>
         <div className="pmr-help">{tt('settings.modelHint')}</div>
+      </div>
+      <div className="pmr-field">
+        <label className="pmr-label" htmlFor="pmr-chat-tokens">{tt('settings.chatTokens')}</label>
+        <input
+          id="pmr-chat-tokens"
+          type="range"
+          min="0"
+          max={CHAT_TOKEN_STEPS.length - 1}
+          step="1"
+          value={CHAT_TOKEN_STEPS.indexOf(settings.chatMaxTokens)}
+          aria-valuetext={`${settings.chatMaxTokens} tokens`}
+          onChange={(event) => onChange({ chatMaxTokens: CHAT_TOKEN_STEPS[Number(event.target.value)] })}
+          style={{ width: '100%' }}
+        />
+        <div className="pmr-help">{settings.chatMaxTokens} tokens · {tt(`settings.chatTokens.${settings.chatMaxTokens}`)}</div>
+        <div className="pmr-help">{tt('settings.chatTokensHint')}</div>
       </div>
       <div className="pmr-field">
         <span className="pmr-label">{tt('settings.readingPosition')}</span>
@@ -1351,6 +1393,556 @@ function useCropImage({ pdf, pageIndex, cache, cacheKey, cropBbox, displayWidth,
   return image
 }
 
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function nearestSnap(value, targets, threshold) {
+  let best = value
+  let bestDistance = threshold
+  for (const target of targets) {
+    const distance = Math.abs(target - value)
+    if (distance < bestDistance) {
+      best = target
+      bestDistance = distance
+    }
+  }
+  return best
+}
+
+function useElementSize(ref) {
+  const [size, setSize] = useState({ width: 0, height: 0 })
+  useEffect(() => {
+    const element = ref.current
+    if (element === null) return undefined
+    const update = () => {
+      const rect = element.getBoundingClientRect()
+      setSize((previous) => {
+        const next = { width: Math.round(rect.width), height: Math.round(rect.height) }
+        return previous.width === next.width && previous.height === next.height ? previous : next
+      })
+    }
+    update()
+    if (typeof ResizeObserver !== 'function') {
+      window.addEventListener('resize', update)
+      return () => window.removeEventListener('resize', update)
+    }
+    const observer = new ResizeObserver(update)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+  return size
+}
+
+/**
+ * Full-window region viewer shared by equations and figures.
+ *
+ * It renders a fresh crop at a resolution derived from the on-screen size, so
+ * zooming never has to stretch the sidebar thumbnail. Rotation is local to the
+ * viewer and never touches the page's reading direction.
+ */
+function RegionViewer({ tt, pdf, pageIndex, bbox, label, caption, preview, onClose }) {
+  const stageRef = useRef(null)
+  const closeRef = useRef(null)
+  const dragRef = useRef(null)
+  const lastRenderKeyRef = useRef('')
+  const closeHandlerRef = useRef(onClose)
+  closeHandlerRef.current = onClose
+  const [rotation, setRotation] = useState(0)
+  const [mode, setMode] = useState('contain')
+  const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState({ x: 0, y: 0 })
+  const [panning, setPanning] = useState(false)
+  const [image, setImage] = useState(
+    typeof preview === 'string' && preview !== ''
+      ? { status: 'preview', dataUrl: preview }
+      : { status: 'loading' },
+  )
+  const stage = useElementSize(stageRef)
+  const quarterTurn = rotation % 180 !== 0
+  const naturalWidth = Math.max(1, quarterTurn ? bbox[3] - bbox[1] : bbox[2] - bbox[0])
+  const naturalHeight = Math.max(1, quarterTurn ? bbox[2] - bbox[0] : bbox[3] - bbox[1])
+  const availableWidth = Math.max(120, stage.width - 36)
+  const availableHeight = Math.max(120, stage.height - 36)
+  const containScale = Math.min(
+    availableWidth / naturalWidth,
+    availableHeight / naturalHeight,
+  )
+  const fitWidth = mode === 'width' ? availableWidth : naturalWidth * containScale
+  const fitHeight =
+    mode === 'width'
+      ? (availableWidth * naturalHeight) / naturalWidth
+      : naturalHeight * containScale
+  const displayWidth = Math.max(32, fitWidth * zoom)
+  const displayHeight = Math.max(32, fitHeight * zoom)
+  const maxPanX = Math.max(0, (displayWidth - availableWidth) / 2) + 48
+  const maxPanY = Math.max(0, (displayHeight - availableHeight) / 2) + 48
+  const offsetX = clampNumber(pan.x, -maxPanX, maxPanX)
+  const offsetY = clampNumber(pan.y, -maxPanY, maxPanY)
+  const quality = zoom <= 1.5 ? 2 : zoom <= 3 ? 3 : 4
+  const renderWidth = Math.max(240, Math.min(4096, Math.round(fitWidth * quality)))
+  const renderKey = `${pageIndex}:${bbox.join(',')}:${rotation}:${renderWidth}`
+
+  useEffect(() => {
+    if (stage.width === 0 || fitWidth <= 0) return undefined
+    if (lastRenderKeyRef.current === renderKey) return undefined
+    lastRenderKeyRef.current = renderKey
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      pdf
+        .getPage(pageIndex + 1)
+        .then((page) =>
+          renderEquationCrop(page, bbox, {
+            rotation,
+            displayWidth: renderWidth,
+            devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+            maxPixels: 16000000,
+            maxScale: 10,
+          }),
+        )
+        .then((result) => {
+          if (!cancelled) setImage({ status: 'ready', ...result })
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setImage((previous) =>
+              previous.status === 'ready' || previous.status === 'preview'
+                ? previous
+                : { status: 'error' },
+            )
+          }
+        })
+    }, 80)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      if (lastRenderKeyRef.current === renderKey) lastRenderKeyRef.current = ''
+    }
+  }, [bbox, fitWidth, pageIndex, pdf, renderKey, renderWidth, rotation, stage.width])
+
+  const rotateBy = useCallback((delta) => {
+    setRotation((value) => ((value + delta) % 360 + 360) % 360)
+    setPan({ x: 0, y: 0 })
+    setZoom(1)
+    // The existing crop belongs to the old orientation; a preview would be
+    // stretched into the new aspect ratio, so wait for the rotated render.
+    setImage({ status: 'loading' })
+  }, [])
+
+  const resetView = useCallback(() => {
+    setRotation(0)
+    setMode('contain')
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+    if (rotation !== 0) setImage({ status: 'loading' })
+  }, [rotation])
+  const resetViewRef = useRef(resetView)
+  resetViewRef.current = resetView
+
+  useEffect(() => {
+    const previousFocus = document.activeElement
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    closeRef.current?.focus?.()
+    const onKeyDown = (event) => {
+      // The viewer owns the keyboard while it is open; otherwise the reader's
+      // page-turn shortcuts would fire underneath it.
+      event.stopPropagation()
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeHandlerRef.current()
+        return
+      }
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault()
+        setZoom((value) => clampNumber(value * 1.2, 0.4, 6))
+        return
+      }
+      if (event.key === '-') {
+        event.preventDefault()
+        setZoom((value) => clampNumber(value / 1.2, 0.4, 6))
+        return
+      }
+      if (event.key === '0') {
+        event.preventDefault()
+        resetViewRef.current()
+        return
+      }
+      if (event.key === 'r' || event.key === 'R') {
+        event.preventDefault()
+        rotateBy(event.shiftKey ? -90 : 90)
+        return
+      }
+      const step = event.shiftKey ? 60 : 24
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        setPan((value) => ({ ...value, x: value.x + step }))
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        setPan((value) => ({ ...value, x: value.x - step }))
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault()
+        setPan((value) => ({ ...value, y: value.y + step }))
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        setPan((value) => ({ ...value, y: value.y - step }))
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true)
+      document.body.style.overflow = previousOverflow
+      if (previousFocus instanceof HTMLElement) previousFocus.focus?.()
+    }
+  }, [rotateBy])
+
+  useEffect(() => {
+    const element = stageRef.current
+    if (element === null) return undefined
+    const onWheel = (event) => {
+      event.preventDefault()
+      const factor = Math.exp(-event.deltaY * 0.0015)
+      setZoom((value) => clampNumber(value * factor, 0.4, 6))
+    }
+    element.addEventListener('wheel', onWheel, { passive: false })
+    return () => element.removeEventListener('wheel', onWheel)
+  }, [])
+
+  const onPointerDown = (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    dragRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      panX: offsetX,
+      panY: offsetY,
+    }
+    setPanning(true)
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+  }
+
+  const onPointerMove = (event) => {
+    const drag = dragRef.current
+    if (drag === null) return
+    setPan({
+      x: drag.panX + (event.clientX - drag.x),
+      y: drag.panY + (event.clientY - drag.y),
+    })
+  }
+
+  const onPointerUp = (event) => {
+    dragRef.current = null
+    setPanning(false)
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+  }
+
+  return (
+    <div
+      className="pmr-figure-viewer-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={label}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      <div className="pmr-viewer-panel">
+        <div className="pmr-viewer-head">
+          <span className="pmr-viewer-title">{label}</span>
+          {typeof caption === 'string' && caption !== '' && (
+            <span className="pmr-viewer-caption" title={caption}>
+              {caption}
+            </span>
+          )}
+          <div className="pmr-viewer-tools">
+            <button
+              type="button"
+              onClick={() => rotateBy(-90)}
+              title={tt('viewer.rotateLeft')}
+              aria-label={tt('viewer.rotateLeft')}
+            >
+              <Icon name="rotateLeft" size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => rotateBy(90)}
+              title={tt('viewer.rotateRight')}
+              aria-label={tt('viewer.rotateRight')}
+            >
+              <Icon name="rotateRight" size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoom((value) => clampNumber(value / 1.2, 0.4, 6))}
+              title={tt('viewer.zoomOut')}
+              aria-label={tt('viewer.zoomOut')}
+            >
+              <Icon name="minus" size={14} />
+            </button>
+            <button
+              type="button"
+              className="pmr-viewer-percent"
+              onClick={() => setZoom(1)}
+              title={tt('viewer.zoomReset')}
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoom((value) => clampNumber(value * 1.2, 0.4, 6))}
+              title={tt('viewer.zoomIn')}
+              aria-label={tt('viewer.zoomIn')}
+            >
+              <Icon name="plus" size={14} />
+            </button>
+            <button
+              type="button"
+              className={mode === 'contain' ? 'is-active' : ''}
+              onClick={() => {
+                setMode('contain')
+                setZoom(1)
+                setPan({ x: 0, y: 0 })
+              }}
+              title={tt('viewer.fit')}
+            >
+              <Icon name="fit" size={14} />
+            </button>
+            <button
+              type="button"
+              className={mode === 'width' ? 'is-active' : ''}
+              onClick={() => {
+                setMode('width')
+                setZoom(1)
+                setPan({ x: 0, y: 0 })
+              }}
+              title={tt('viewer.width')}
+            >
+              <Icon name="columns" size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={resetView}
+              title={tt('viewer.reset')}
+              aria-label={tt('viewer.reset')}
+            >
+              <Icon name="refresh" size={14} />
+            </button>
+            <button
+              ref={closeRef}
+              type="button"
+              onClick={onClose}
+              title={tt('action.close')}
+              aria-label={tt('action.close')}
+            >
+              <Icon name="close" size={14} />
+            </button>
+          </div>
+        </div>
+        <div
+          className={`pmr-viewer-stage ${panning ? 'is-panning' : ''}`}
+          ref={stageRef}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+          onDoubleClick={() => setZoom((value) => (value > 1.05 ? 1 : 2))}
+        >
+          {(image.status === 'ready' || image.status === 'preview') && (
+            <img
+              className="pmr-viewer-image"
+              src={image.dataUrl}
+              alt={caption ?? label}
+              draggable={false}
+              style={{
+                width: displayWidth,
+                height: displayHeight,
+                transform: `translate(-50%, -50%) translate(${offsetX}px, ${offsetY}px)`,
+              }}
+            />
+          )}
+          {image.status === 'loading' && (
+            <div className="pmr-viewer-loading">
+              <span className="pmr-spinner" />
+              {tt('viewer.loading')}
+            </div>
+          )}
+          {image.status === 'error' && (
+            <div className="pmr-viewer-loading">{tt('viewer.failed')}</div>
+          )}
+        </div>
+        <div className="pmr-viewer-foot">
+          <span>{tt('viewer.hint')}</span>
+          <span className="pmr-viewer-angle">{rotation}°</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const FIGURE_HANDLES = [
+  ['nw', 0, 0],
+  ['n', 50, 0],
+  ['ne', 100, 0],
+  ['w', 0, 50],
+  ['e', 100, 50],
+  ['sw', 0, 100],
+  ['s', 50, 100],
+  ['se', 100, 100],
+]
+
+function figureCursor(handle) {
+  if (handle === 'n' || handle === 's') return 'ns-resize'
+  if (handle === 'e' || handle === 'w') return 'ew-resize'
+  if (handle === 'nw' || handle === 'se') return 'nwse-resize'
+  return 'nesw-resize'
+}
+
+/**
+ * Drag the eight edges of an existing figure region, with snapping to nearby
+ * text-line edges and auto-scrolling while the pointer approaches the viewer
+ * edge. The draft stays in canonical page points, so the saved box is
+ * independent of the current zoom.
+ */
+function FigureBoundsEditor({
+  tt,
+  box,
+  scale,
+  pageWidth,
+  pageHeight,
+  targets,
+  viewerRef,
+  onSave,
+  onCancel,
+}) {
+  const [draft, setDraft] = useState(box)
+  const dragRef = useRef(null)
+  const scaleValue = scale > 0 ? scale : 1
+
+  useEffect(() => {
+    setDraft(box)
+  }, [box])
+
+  const normalize = useCallback(
+    (value) => {
+      let [x0, y0, x1, y1] = value
+      x0 = clampNumber(x0, 0, pageWidth)
+      y0 = clampNumber(y0, 0, pageHeight)
+      x1 = clampNumber(x1, 0, pageWidth)
+      y1 = clampNumber(y1, 0, pageHeight)
+      if (x1 - x0 < 8) x1 = Math.min(pageWidth, x0 + 8)
+      if (y1 - y0 < 8) y1 = Math.min(pageHeight, y0 + 8)
+      return [x0, y0, x1, y1]
+    },
+    [pageHeight, pageWidth],
+  )
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        onCancel()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [onCancel])
+
+  const startDrag = (handle) => (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    dragRef.current = {
+      handle,
+      startX: event.clientX,
+      startY: event.clientY,
+      box: [...draft],
+    }
+    const move = (moveEvent) => {
+      const drag = dragRef.current
+      if (drag === null) return
+      const dx = (moveEvent.clientX - drag.startX) / scaleValue
+      const dy = (moveEvent.clientY - drag.startY) / scaleValue
+      let [x0, y0, x1, y1] = drag.box
+      if (handle === 'move') {
+        x0 += dx
+        x1 += dx
+        y0 += dy
+        y1 += dy
+      } else {
+        if (handle.includes('w')) x0 += dx
+        if (handle.includes('e')) x1 += dx
+        if (handle.includes('n')) y0 += dy
+        if (handle.includes('s')) y1 += dy
+      }
+      const threshold = 6 / scaleValue
+      if (handle !== 'move') {
+        if (handle.includes('w')) x0 = nearestSnap(x0, targets.xs, threshold)
+        if (handle.includes('e')) x1 = nearestSnap(x1, targets.xs, threshold)
+        if (handle.includes('n')) y0 = nearestSnap(y0, targets.ys, threshold)
+        if (handle.includes('s')) y1 = nearestSnap(y1, targets.ys, threshold)
+      }
+      const next = normalize([Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)])
+      setDraft(next)
+      const viewer = viewerRef.current
+      if (viewer !== null) {
+        const rect = viewer.getBoundingClientRect()
+        const margin = 38
+        if (moveEvent.clientY < rect.top + margin) viewer.scrollTop -= 14
+        else if (moveEvent.clientY > rect.bottom - margin) viewer.scrollTop += 14
+        if (moveEvent.clientX < rect.left + margin) viewer.scrollLeft -= 14
+        else if (moveEvent.clientX > rect.right - margin) viewer.scrollLeft += 14
+      }
+    }
+    const end = () => {
+      dragRef.current = null
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', end)
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', end)
+  }
+
+  return (
+    <div className="pmr-fig-editor">
+      <div
+        className="pmr-fig-editor-box"
+        style={{
+          left: draft[0] * scaleValue,
+          top: draft[1] * scaleValue,
+          width: (draft[2] - draft[0]) * scaleValue,
+          height: (draft[3] - draft[1]) * scaleValue,
+        }}
+        onPointerDown={startDrag('move')}
+      >
+        {FIGURE_HANDLES.map(([name, left, top]) => (
+          <div
+            key={name}
+            className="pmr-fig-editor-handle"
+            style={{ left: `${left}%`, top: `${top}%`, cursor: figureCursor(name) }}
+            onPointerDown={startDrag(name)}
+          />
+        ))}
+      </div>
+      <div className="pmr-fig-editor-actions">
+        <span className="pmr-fig-editor-hint">{tt('figure.adjustHint')}</span>
+        <button
+          type="button"
+          className="pmr-btn pmr-btn-primary"
+          onClick={() => onSave(normalize(draft))}
+        >
+          {tt('figure.save')}
+        </button>
+        <button type="button" className="pmr-btn pmr-btn-ghost" onClick={onCancel}>
+          {tt('figure.cancel')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function EquationBlock({
   tt,
   equation,
@@ -1386,15 +1978,6 @@ function EquationBlock({
     displayWidth,
     cacheVersion,
   })
-
-  useEffect(() => {
-    if (!zoomOpen) return undefined
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape') setZoomOpen(false)
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [zoomOpen])
 
   const label =
     equation.equationNumber === null || equation.equationNumber === undefined
@@ -1486,30 +2069,17 @@ function EquationBlock({
         <span>{tt('equation.hint')}</span>
       </footer>
 
-      {zoomOpen && image.status === 'ready' && (
-        <div className="pmr-eq-modal" role="dialog" aria-label={label} onClick={() => setZoomOpen(false)}>
-          <div className="pmr-eq-modal-body" onClick={(event) => event.stopPropagation()}>
-            <div className="pmr-eq-modal-head">
-              <span>{label}</span>
-              <button
-                type="button"
-                className="pmr-iconbtn"
-                onClick={() => setZoomOpen(false)}
-                aria-label={tt('action.close')}
-              >
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div className="pmr-eq-modal-scroll">
-              <img
-                src={image.dataUrl}
-                alt={equation.text}
-                style={{ width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: 'none' }}
-                draggable={false}
-              />
-            </div>
-          </div>
-        </div>
+      {zoomOpen && (
+        <RegionViewer
+          tt={tt}
+          pdf={pdf}
+          pageIndex={pageIndex}
+          bbox={equation.bbox}
+          label={label}
+          caption={equation.text}
+          preview={image.status === 'ready' ? image.dataUrl : ''}
+          onClose={() => setZoomOpen(false)}
+        />
       )}
     </section>
   )
@@ -1533,12 +2103,15 @@ function FigureBlock({
   active,
   onLocate,
   onRemove,
+  onAdjust,
+  onRestore,
   onCopy,
 }) {
   const [zoomOpen, setZoomOpen] = useState(false)
+  const isTable = figure.kind === 'table'
   const cropBbox = figure.imageBbox ?? figure.bbox
   const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
-  const displayWidth = Math.min(760, Math.max(160, bboxWidth * 1.7))
+  const displayWidth = Math.min(isTable ? 960 : 760, Math.max(160, bboxWidth * 1.7))
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
   const cacheKey = [
     fingerprint,
@@ -1558,17 +2131,11 @@ function FigureBlock({
     cacheVersion,
   })
 
-  useEffect(() => {
-    if (!zoomOpen) return undefined
-    const onKeyDown = (event) => {
-      if (event.key === 'Escape') setZoomOpen(false)
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [zoomOpen])
-
-  const label =
-    figure.figureNumber === null || figure.figureNumber === undefined
+  const label = isTable
+    ? figure.tableNumber === null || figure.tableNumber === undefined
+      ? tt('table.unnumbered')
+      : tt('table.numbered', { number: figure.tableNumber })
+    : figure.figureNumber === null || figure.figureNumber === undefined
       ? tt('figure.unnumbered')
       : tt('figure.numbered', { number: figure.figureNumber })
   const labels = Array.isArray(figure.labels) ? figure.labels : []
@@ -1578,7 +2145,10 @@ function FigureBlock({
     <section className={`pmr-eq-card pmr-fig-card ${active ? 'is-active' : ''}`} aria-label={label}>
       <header className="pmr-eq-head">
         <span className="pmr-eq-label">{label}</span>
-        <span className="pmr-eq-badge">{tt('figure.auto')}</span>
+        <span className="pmr-eq-badge">{isTable ? tt('figure.table') : tt('figure.auto')}</span>
+        {figure.detectionSource === 'manual' && (
+          <span className="pmr-eq-badge is-manual">{tt('figure.manual')}</span>
+        )}
         <div className="pmr-eq-actions">
           {labelText !== '' && (
             <button
@@ -1600,10 +2170,17 @@ function FigureBlock({
           </button>
           <button
             type="button"
+            onClick={() => onAdjust(figure)}
+            title={tt('figure.adjust')}
+            aria-label={tt('figure.adjust')}
+          >
+            <Icon name="crop" size={12} />
+          </button>
+          <button
+            type="button"
             onClick={() => setZoomOpen(true)}
             title={tt('figure.zoom')}
             aria-label={tt('figure.zoom')}
-            disabled={image.status !== 'ready'}
           >
             <Icon name="expand" size={12} />
           </button>
@@ -1611,8 +2188,8 @@ function FigureBlock({
             type="button"
             className="pmr-eq-remove"
             onClick={() => onRemove(figure)}
-            title={tt('figure.notFigure')}
-            aria-label={tt('figure.notFigure')}
+            title={tt(isTable ? 'table.notTable' : 'figure.notFigure')}
+            aria-label={tt(isTable ? 'table.notTable' : 'figure.notFigure')}
           >
             <Icon name="close" size={11} />
           </button>
@@ -1652,8 +2229,12 @@ function FigureBlock({
 
       {labels.length > 0 && (
         <details className="pmr-fig-labels">
-          <summary>{tt('figure.labels', { count: labels.length })}</summary>
-          <p className="pmr-fig-note">{tt('figure.labelsHint')}</p>
+          <summary>
+            {tt(isTable ? 'table.labels' : 'figure.labels', { count: labels.length })}
+          </summary>
+          <p className="pmr-fig-note">
+            {tt(isTable ? 'table.labelsHint' : 'figure.labelsHint')}
+          </p>
           <div className="pmr-fig-label-list">
             {labels.map((line, index) => (
               <span key={`${figure.id}-label-${index}`} className="pmr-fig-label">
@@ -1664,30 +2245,28 @@ function FigureBlock({
         </details>
       )}
 
-      {zoomOpen && image.status === 'ready' && (
-        <div className="pmr-eq-modal" role="dialog" aria-label={label} onClick={() => setZoomOpen(false)}>
-          <div className="pmr-eq-modal-body" onClick={(event) => event.stopPropagation()}>
-            <div className="pmr-eq-modal-head">
-              <span>{label}</span>
-              <button
-                type="button"
-                className="pmr-iconbtn"
-                onClick={() => setZoomOpen(false)}
-                aria-label={tt('action.close')}
-              >
-                <Icon name="close" size={14} />
-              </button>
-            </div>
-            <div className="pmr-eq-modal-scroll">
-              <img
-                src={image.dataUrl}
-                alt={figure.caption ?? label}
-                style={{ width: Math.min(1800, Math.round(image.width * 2.2)), maxWidth: 'none' }}
-                draggable={false}
-              />
-            </div>
-          </div>
+      {isTable && <div className="pmr-eq-foot">{tt('figure.tableHint')}</div>}
+
+      {figure.detectionSource === 'manual' && (
+        <div className="pmr-eq-reset">
+          <button type="button" className="pmr-btn pmr-btn-ghost" onClick={() => onRestore(figure)}>
+            <Icon name="refresh" size={11} />
+            {tt('equation.restore')}
+          </button>
         </div>
+      )}
+
+      {zoomOpen && (
+        <RegionViewer
+          tt={tt}
+          pdf={pdf}
+          pageIndex={pageIndex}
+          bbox={figure.bbox}
+          label={label}
+          caption={figure.caption ?? ''}
+          preview={image.status === 'ready' ? image.dataUrl : ''}
+          onClose={() => setZoomOpen(false)}
+        />
       )}
     </section>
   )
@@ -1846,6 +2425,9 @@ export function PdfReaderPage({ t }) {
   const [activeEquation, setActiveEquation] = useState(null)
   const [equationSelectMode, setEquationSelectMode] = useState(false)
   const [equationRect, setEquationRect] = useState(null)
+  const [figureSelectMode, setFigureSelectMode] = useState(false)
+  const [figureRect, setFigureRect] = useState(null)
+  const [figureEdit, setFigureEdit] = useState(null)
   const [translationErrors, setTranslationErrors] = useState({})
   const [searchQuery, setSearchQuery] = useState('')
   const [searchState, setSearchState] = useState(EMPTY_SEARCH)
@@ -1892,6 +2474,7 @@ export function PdfReaderPage({ t }) {
   equationOverridesRef.current = equationOverrides
   const equationImageCacheRef = useRef(new Map())
   const equationDragRef = useRef(null)
+  const figureDragRef = useRef(null)
   const searchInputRef = useRef(null)
   const searchAbortRef = useRef(null)
   const searchSeqRef = useRef(0)
@@ -1939,7 +2522,8 @@ export function PdfReaderPage({ t }) {
   const hasPageOverrides =
     pageOverrides.added.length > 0 ||
     pageOverrides.removed.length > 0 ||
-    pageOverrides.figures.length > 0
+    pageOverrides.figures.length > 0 ||
+    pageOverrides.manualFigures.length > 0
   // Equations and figures share the highlight/active state; only their bbox
   // and card differ.
   const activeOverlayBlock = blocks.find((block) => block.id === activeEquation)
@@ -1977,6 +2561,41 @@ export function PdfReaderPage({ t }) {
     Math.round(viewerWidth),
     renderNonce,
   ].join(':')
+  // Edges of every reconstructed text line, used to snap a manual figure box
+  // onto real content instead of a few pixels of whitespace.
+  const snapTargets = useMemo(() => {
+    const xs = new Set()
+    const ys = new Set()
+    // Atoms, not paragraphs: a table's rows are figure labels once classified,
+    // so paragraph lines would no longer describe where its cell edges are.
+    for (const atom of pageModel?.atoms ?? []) {
+      if (!Number.isFinite(atom.x) || !Number.isFinite(atom.y)) continue
+      xs.add(atom.x)
+      xs.add(atom.endX)
+      ys.add(atom.top)
+      ys.add(atom.bottom)
+    }
+    return { xs: [...xs], ys: [...ys] }
+  }, [pageModel])
+
+  useEffect(() => {
+    setFigureSelectMode(false)
+    setFigureRect(null)
+    setFigureEdit(null)
+  }, [docFingerprint, pageIndex])
+
+  useEffect(() => {
+    if (!figureSelectMode) return undefined
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      setFigureSelectMode(false)
+      setFigureRect(null)
+      figureDragRef.current = null
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [figureSelectMode])
 
   const notify = useCallback((message, kind = 'info') => {
     window.clearTimeout(toastTimerRef.current)
@@ -2916,6 +3535,7 @@ export function PdfReaderPage({ t }) {
     if (doc === null) return undefined
     const onKeyDown = (event) => {
       if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return
+      if (figureEdit !== null || figureSelectMode) return
       if (isEditableTarget(event.target)) return
       const key = event.key.toLowerCase()
       if (event.key === 'Escape') {
@@ -2959,7 +3579,7 @@ export function PdfReaderPage({ t }) {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [clearTextSelection, doc, goToPage, pageIndex])
+  }, [clearTextSelection, doc, figureEdit, figureSelectMode, goToPage, pageIndex])
 
   // Ctrl/Cmd+F belongs to the open document rather than the browser page, but
   // not while the user is typing in a note, the glossary, or another editor.
@@ -3115,17 +3735,25 @@ export function PdfReaderPage({ t }) {
       })
       setEquationOverrides((previous) => {
         const pages = { ...(previous[fingerprint] ?? {}) }
-        const current = pages[pageIndex] ?? { added: [], removed: [], figures: [] }
+        const current = pages[pageIndex] ?? {
+          added: [],
+          removed: [],
+          figures: [],
+          manualFigures: [],
+        }
         const updated = mutator({
+          v: 2,
           added: [...(current.added ?? [])],
           removed: [...(current.removed ?? [])],
           figures: [...(current.figures ?? [])],
+          manualFigures: [...(current.manualFigures ?? [])],
         })
         const nextPages = { ...pages }
         if (
           updated.added.length === 0 &&
           updated.removed.length === 0 &&
-          (updated.figures?.length ?? 0) === 0
+          (updated.figures?.length ?? 0) === 0 &&
+          (updated.manualFigures?.length ?? 0) === 0
         ) {
           delete nextPages[pageIndex]
         } else {
@@ -3225,18 +3853,109 @@ export function PdfReaderPage({ t }) {
     (figure) => {
       commitPageOverrides((previous) => ({
         ...previous,
+        manualFigures: previous.manualFigures.filter((entry) =>
+          figure.manualId
+            ? entry.id !== figure.manualId
+            : overlapRatio(entry.bbox, figure.bbox) <= 0.3,
+        ),
         figures: [
           ...previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3),
           figure.bbox,
         ],
       }))
-      notify(tt('figure.removed'))
+      notify(tt(figure.kind === 'table' ? 'table.removed' : 'figure.removed'))
+    },
+    [commitPageOverrides, notify, tt],
+  )
+
+  const addManualFigure = useCallback(
+    (box) => {
+      const id = `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      // Re-boxing an existing automatic figure replaces it instead of adding a
+      // second card over the same artwork.
+      const replaced = figures.find(
+        (figure) => figure.detectionSource !== 'manual' && overlapRatio(figure.bbox, box) > 0.5,
+      )
+      commitPageOverrides((previous) => ({
+        ...previous,
+        manualFigures: [
+          ...previous.manualFigures,
+          { id, bbox: box, ...(replaced === undefined ? {} : { replaces: replaced.bbox }) },
+        ],
+      }))
+      notify(tt('figure.selected'))
+    },
+    [commitPageOverrides, figures, notify, tt],
+  )
+
+  const beginFigureEdit = useCallback(
+    (figure) => {
+      setFigureEdit({ figure, box: [...figure.bbox] })
+      setFigureSelectMode(false)
+      setFigureRect(null)
+      setEquationSelectMode(false)
+      setEquationRect(null)
+      setActiveEquation(figure.id)
+      setActiveParagraph(null)
+      clearTextSelection()
+      scrollToEquation(figure)
+      notify(tt('figure.adjustHint'))
+    },
+    [clearTextSelection, notify, scrollToEquation, tt],
+  )
+
+  const saveFigureEdit = useCallback(
+    (box) => {
+      const editing = figureEdit
+      if (editing === null) return
+      commitPageOverrides((previous) => {
+        const figure = editing.figure
+        const manualFigures = [...previous.manualFigures]
+        const index = manualFigures.findIndex((entry) =>
+          figure.manualId
+            ? entry.id === figure.manualId
+            : figure.detectionSource === 'manual' && overlapRatio(entry.bbox, figure.bbox) > 0.5,
+        )
+        if (index >= 0) {
+          manualFigures[index] = { ...manualFigures[index], bbox: box }
+        } else {
+          manualFigures.push({
+            id: `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+            bbox: box,
+            replaces: figure.bbox,
+          })
+        }
+        return { ...previous, manualFigures }
+      })
+      setFigureEdit(null)
+      notify(tt('figure.saved'))
+    },
+    [commitPageOverrides, figureEdit, notify, tt],
+  )
+
+  const restoreFigure = useCallback(
+    (figure) => {
+      commitPageOverrides((previous) => ({
+        ...previous,
+        manualFigures: previous.manualFigures.filter((entry) =>
+          figure.manualId
+            ? entry.id !== figure.manualId
+            : overlapRatio(entry.bbox, figure.bbox) <= 0.3,
+        ),
+        figures: previous.figures.filter((box) => overlapRatio(box, figure.bbox) <= 0.3),
+      }))
+      notify(tt('equation.reset'))
     },
     [commitPageOverrides, notify, tt],
   )
 
   const resetPageEquations = useCallback(() => {
-    commitPageOverrides(() => ({ added: [], removed: [], figures: [] }))
+    commitPageOverrides(() => ({
+      added: [],
+      removed: [],
+      figures: [],
+      manualFigures: [],
+    }))
     notify(tt('equation.reset'))
   }, [commitPageOverrides, notify, tt])
 
@@ -3248,11 +3967,32 @@ export function PdfReaderPage({ t }) {
       return
     }
     setEquationSelectMode(true)
+    setFigureSelectMode(false)
+    setFigureRect(null)
+    setFigureEdit(null)
     setActiveEquation(null)
     setActiveParagraph(null)
     clearTextSelection()
     notify(tt('equation.selectHint'))
   }, [clearTextSelection, equationSelectMode, notify, tt])
+
+  const beginFigureSelection = useCallback(() => {
+    if (figureSelectMode) {
+      setFigureSelectMode(false)
+      setFigureRect(null)
+      figureDragRef.current = null
+      return
+    }
+    setFigureSelectMode(true)
+    setFigureRect(null)
+    setEquationSelectMode(false)
+    setEquationRect(null)
+    setFigureEdit(null)
+    setActiveEquation(null)
+    setActiveParagraph(null)
+    clearTextSelection()
+    notify(tt('figure.selectHint'))
+  }, [clearTextSelection, figureSelectMode, notify, tt])
 
   /**
    * Pointer position in page points. The page box is laid out in display pixels
@@ -3317,6 +4057,77 @@ export function PdfReaderPage({ t }) {
       addManualEquation(box)
     },
     [addManualEquation, notify, pageModel, pagePointFromEvent, tt],
+  )
+
+  const autoScrollViewer = useCallback((clientX, clientY) => {
+    const viewer = viewerRef.current
+    if (viewer === null) return
+    const rect = viewer.getBoundingClientRect()
+    const margin = 38
+    if (clientY < rect.top + margin) viewer.scrollTop -= 14
+    else if (clientY > rect.bottom - margin) viewer.scrollTop += 14
+    if (clientX < rect.left + margin) viewer.scrollLeft -= 14
+    else if (clientX > rect.right - margin) viewer.scrollLeft += 14
+  }, [])
+
+  const onFigurePointerDown = useCallback(
+    (event) => {
+      if (!figureSelectMode || pageModel === null) return
+      if (event.button !== 0) return
+      event.preventDefault()
+      const point = pagePointFromEvent(event)
+      figureDragRef.current = { x0: point.x, y0: point.y }
+      setFigureRect({ x0: point.x, y0: point.y, x1: point.x, y1: point.y })
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+    },
+    [figureSelectMode, pageModel, pagePointFromEvent],
+  )
+
+  const onFigurePointerMove = useCallback(
+    (event) => {
+      const drag = figureDragRef.current
+      if (drag === null || pageModel === null) return
+      const point = pagePointFromEvent(event)
+      setFigureRect({ x0: drag.x0, y0: drag.y0, x1: point.x, y1: point.y })
+      autoScrollViewer(event.clientX, event.clientY)
+    },
+    [autoScrollViewer, pageModel, pagePointFromEvent],
+  )
+
+  const onFigurePointerUp = useCallback(
+    (event) => {
+      const drag = figureDragRef.current
+      if (drag === null || pageModel === null) return
+      figureDragRef.current = null
+      const point = pagePointFromEvent(event)
+      const threshold = 6 / (currentScale > 0 ? currentScale : 1)
+      const x0 = nearestSnap(Math.min(drag.x0, point.x), snapTargets.xs, threshold)
+      const x1 = nearestSnap(Math.max(drag.x0, point.x), snapTargets.xs, threshold)
+      const y0 = nearestSnap(Math.min(drag.y0, point.y), snapTargets.ys, threshold)
+      const y1 = nearestSnap(Math.max(drag.y0, point.y), snapTargets.ys, threshold)
+      const box = [
+        Math.min(x0, x1),
+        Math.min(y0, y1),
+        Math.max(x0, x1),
+        Math.max(y0, y1),
+      ]
+      setFigureRect(null)
+      if (box[2] - box[0] < 8 || box[3] - box[1] < 8) {
+        notify(tt('figure.tooSmall'), 'error')
+        return
+      }
+      setFigureSelectMode(false)
+      addManualFigure(box)
+    },
+    [
+      addManualFigure,
+      currentScale,
+      notify,
+      pageModel,
+      pagePointFromEvent,
+      snapTargets,
+      tt,
+    ],
   )
 
   const handleTextMouseUp = useCallback(
@@ -4141,13 +4952,14 @@ export function PdfReaderPage({ t }) {
             contextLabel: context.label,
             skill: skill === null ? undefined : { name: skill.name, content: skill.content },
             modelSelection: settings.chatSelection,
+            maxTokens: settings.chatMaxTokens,
           },
           controller.signal,
         )
         if (controller.signal.aborted) return
         setChatMessages((previous) => [
           ...previous,
-          { role: 'assistant', content: response.answer },
+          { role: 'assistant', content: response.answer, truncated: response.truncated === true },
         ])
       } catch (error) {
         if (!controller.signal.aborted && !isAbort(error)) {
@@ -4166,6 +4978,7 @@ export function PdfReaderPage({ t }) {
       chatMessages,
       chatScope,
       settings.chatSelection,
+      settings.chatMaxTokens,
       skill,
       tt,
     ],
@@ -4338,15 +5151,25 @@ export function PdfReaderPage({ t }) {
           continue
         }
         if (block.type === 'figure') {
-          const label = block.figureNumber
-            ? `${tt('figure.label')} ${block.figureNumber}`
-            : tt('figure.unnumbered')
+          const isTable = block.kind === 'table'
+          const label = isTable
+            ? block.tableNumber
+              ? tt('table.numbered', { number: block.tableNumber })
+              : tt('table.unnumbered')
+            : block.figureNumber
+              ? tt('figure.numbered', { number: block.figureNumber })
+              : tt('figure.unnumbered')
           lines.push(`**${label}**`, '')
           const labels = (block.labels ?? [])
             .map((line) => line.text)
             .filter((text) => text !== '')
           if (labels.length > 0) {
-            lines.push(`${tt('figure.labelsInline')}`, '', ...labels.map((text) => `- ${text}`), '')
+            lines.push(
+              `${tt(isTable ? 'table.labelsInline' : 'figure.labelsInline')}`,
+              '',
+              ...labels.map((text) => `- ${text}`),
+              '',
+            )
           }
           continue
         }
@@ -4425,9 +5248,14 @@ export function PdfReaderPage({ t }) {
         }
         if (block.type === 'figure') {
           const image = images.get(`${page.index}:${block.id}`)
-          const label = block.figureNumber
-            ? `${tt('figure.label')} ${block.figureNumber}`
-            : tt('figure.unnumbered')
+          const isTable = block.kind === 'table'
+          const label = isTable
+            ? block.tableNumber
+              ? tt('table.numbered', { number: block.tableNumber })
+              : tt('table.unnumbered')
+            : block.figureNumber
+              ? tt('figure.numbered', { number: block.figureNumber })
+              : tt('figure.unnumbered')
           if (image !== undefined) {
             const name = `figures/${block.id}.png`
             files.push({ name, data: dataUrlToBytes(image.dataUrl) })
@@ -4437,7 +5265,12 @@ export function PdfReaderPage({ t }) {
             .map((line) => line.text)
             .filter((text) => text !== '')
           if (labels.length > 0) {
-            lines.push(`${tt('figure.labelsInline')}`, '', ...labels.map((text) => `- ${text}`), '')
+            lines.push(
+              `${tt(isTable ? 'table.labelsInline' : 'figure.labelsInline')}`,
+              '',
+              ...labels.map((text) => `- ${text}`),
+              '',
+            )
           }
           continue
         }
@@ -4533,9 +5366,14 @@ export function PdfReaderPage({ t }) {
             }
             if (block.type === 'figure') {
               const image = images.get(`${page.index}:${block.id}`)
-              const label = block.figureNumber
-                ? `${tt('figure.label')} ${block.figureNumber}`
-                : tt('figure.unnumbered')
+              const isTable = block.kind === 'table'
+              const label = isTable
+                ? block.tableNumber
+                  ? tt('table.numbered', { number: block.tableNumber })
+                  : tt('table.unnumbered')
+                : block.figureNumber
+                  ? tt('figure.numbered', { number: block.figureNumber })
+                  : tt('figure.unnumbered')
               const preview =
                 image !== undefined
                   ? `<img src="${image.dataUrl}" alt="${escapeHtml(label)}">`
@@ -4548,7 +5386,9 @@ export function PdfReaderPage({ t }) {
               )}</figcaption>${
                 labels !== ''
                   ? `<details><summary>${escapeHtml(
-                      tt('figure.labels', { count: (block.labels ?? []).length }),
+                      tt(isTable ? 'table.labels' : 'figure.labels', {
+                        count: (block.labels ?? []).length,
+                      }),
                     )}</summary><ul>${labels}</ul></details>`
                   : ''
               }</figure>`
@@ -4929,6 +5769,19 @@ ${body}
                 <span className="pmr-eq-select-text">{tt('equation.select')}</span>
               </button>
 
+              <button
+                type="button"
+                className={`pmr-btn pmr-eq-select-btn ${
+                  figureSelectMode || figureEdit !== null ? 'pmr-btn-primary' : 'pmr-btn-ghost'
+                }`}
+                onClick={beginFigureSelection}
+                title={tt('figure.select')}
+                disabled={pageModel === null}
+              >
+                <Icon name="table" size={14} />
+                <span className="pmr-eq-select-text">{tt('figure.select')}</span>
+              </button>
+
               <div style={{ position: 'relative' }}>
                 <button
                   type="button"
@@ -5251,6 +6104,43 @@ ${body}
                       )}
                     </div>
                   )}
+                  {figureSelectMode && (
+                    <div
+                      className="pmr-eq-selector"
+                      onPointerDown={onFigurePointerDown}
+                      onPointerMove={onFigurePointerMove}
+                      onPointerUp={onFigurePointerUp}
+                      onPointerCancel={() => {
+                        figureDragRef.current = null
+                        setFigureRect(null)
+                      }}
+                    >
+                      {figureRect !== null && (
+                        <div
+                          className="pmr-eq-box"
+                          style={{
+                            left: Math.min(figureRect.x0, figureRect.x1) * currentScale,
+                            top: Math.min(figureRect.y0, figureRect.y1) * currentScale,
+                            width: Math.abs(figureRect.x1 - figureRect.x0) * currentScale,
+                            height: Math.abs(figureRect.y1 - figureRect.y0) * currentScale,
+                          }}
+                        />
+                      )}
+                    </div>
+                  )}
+                  {figureEdit !== null && pageSize !== null && (
+                    <FigureBoundsEditor
+                      tt={tt}
+                      box={figureEdit.box}
+                      scale={currentScale}
+                      pageWidth={pageSize.width / currentScale}
+                      pageHeight={pageSize.height / currentScale}
+                      targets={snapTargets}
+                      viewerRef={viewerRef}
+                      onSave={saveFigureEdit}
+                      onCancel={() => setFigureEdit(null)}
+                    />
+                  )}
                   {renderState === 'loading' && (
                     <div className="pmr-page-loading">
                       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7 }}>
@@ -5561,6 +6451,8 @@ ${body}
                             active={activeEquation === block.id}
                             onLocate={focusEquation}
                             onRemove={removeFigure}
+                            onAdjust={beginFigureEdit}
+                            onRestore={restoreFigure}
                             onCopy={copyText}
                           />
                         )
@@ -5899,6 +6791,17 @@ ${body}
                             {message.role === 'user' ? 'You' : 'AI'}
                           </div>
                           <div className="pmr-msg-body">{message.content}</div>
+                          {message.truncated && (
+                            <div className="pmr-help" role="status">
+                              {tt('reading.truncated')}
+                              {index === chatMessages.length - 1 && (
+                                <button type="button" className="pmr-btn pmr-btn-ghost" disabled={chatBusy}
+                                  onClick={() => sendChat(tt('reading.continuePrompt'))}>
+                                  {tt('reading.continue')}
+                                </button>
+                              )}
+                            </div>
+                          )}
                           <CopyButton
                             tt={tt}
                             text={message.content}

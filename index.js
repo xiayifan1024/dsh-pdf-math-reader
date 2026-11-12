@@ -9,10 +9,12 @@
  * The reader itself is local: the PDF never leaves the browser. Only the text
  * segments the user explicitly translates are posted here.
  */
+import { readFileSync } from 'node:fs'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chatPrompt, normalizeHistory } from './lib/chat.js'
+import { chatTimeoutMsFor, normalizeChatTokens } from './lib/chat-settings.js'
 import {
   cacheKey,
   normalizeGlossary,
@@ -26,7 +28,15 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ASSETS = join(HERE, 'assets')
 const ROUTE = '/pdf-reader'
 const ASSET_PREFIX = '/pdf-reader/assets/'
-const VERSION = '1.3.0'
+const VERSION = readVersion()
+
+function readVersion() {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
 
 const DEFAULTS = {
   provider: '',
@@ -37,7 +47,7 @@ const DEFAULTS = {
   timeoutMs: 180000,
   chatMaxChars: 24000,
   chatTimeoutMs: 150000,
-  chatMaxTokens: 2048,
+  chatMaxTokens: 8192,
   cacheEntries: 600,
 }
 
@@ -107,8 +117,8 @@ function readConfig(config) {
     maxTextChars: number('maxTextChars', DEFAULTS.maxTextChars, 400, 30000),
     timeoutMs: number('timeoutMs', DEFAULTS.timeoutMs, 15000, 600000),
     chatMaxChars: number('chatMaxChars', DEFAULTS.chatMaxChars, 2000, 60000),
-    chatTimeoutMs: number('chatTimeoutMs', DEFAULTS.chatTimeoutMs, 15000, 600000),
-    chatMaxTokens: number('chatMaxTokens', DEFAULTS.chatMaxTokens, 256, 8192),
+    chatTimeoutMs: number('chatTimeoutMs', DEFAULTS.chatTimeoutMs, 15000, 900000),
+    chatMaxTokens: number('chatMaxTokens', DEFAULTS.chatMaxTokens, 256, 65536),
     cacheEntries: number('cacheEntries', DEFAULTS.cacheEntries, 0, 5000),
   }
 }
@@ -568,11 +578,13 @@ async function handleChat(ctx, config, body, signal) {
     if (signal.aborted) controller.abort()
     else signal.addEventListener('abort', onOuterAbort, { once: true })
   }
+  const maxTokens = normalizeChatTokens(body.maxTokens, config.chatMaxTokens)
+  const timeoutMs = chatTimeoutMsFor(config.chatTimeoutMs, maxTokens)
   let timedOut = false
   const timer = setTimeout(() => {
     timedOut = true
     controller.abort()
-  }, config.chatTimeoutMs)
+  }, timeoutMs)
   let answer = ''
   let finish
   const started = Date.now()
@@ -584,7 +596,7 @@ async function handleChat(ctx, config, body, signal) {
         ? { reasoningEffort: selection.reasoningEffort }
         : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-      maxTokens: config.chatMaxTokens,
+      maxTokens,
       signal: controller.signal,
     })
     for await (const chunk of stream) {
@@ -595,7 +607,7 @@ async function handleChat(ctx, config, body, signal) {
     if (timedOut) {
       throw new PluginError(
         'CHAT_TIMEOUT',
-        `The model did not finish within ${Math.round(config.chatTimeoutMs / 1000)}s.`,
+        `The model did not finish within ${Math.round(timeoutMs / 1000)}s.`,
         504,
       )
     }
@@ -623,11 +635,26 @@ async function handleChat(ctx, config, body, signal) {
   }
   const text = answer.trim()
   if (text === '') {
-    throw new PluginError('EMPTY_ANSWER', 'The model returned an empty answer.', 502)
+    if (timedOut) {
+      throw new PluginError('CHAT_TIMEOUT', 'AI 阅读等待超时，尚未收到回答正文。请降低推理强度或缩小提问范围后重试。', 504)
+    }
+    if (finish?.kind === 'max-tokens') {
+      throw new PluginError(
+        'CHAT_REASONING_LIMIT',
+        '模型已达到输出额度，但尚未生成回答正文。推理过程可能耗尽了额度，请降低推理强度（例如从 Max 调低），或在设置中提高回答长度上限后重试。',
+        502,
+      )
+    }
+    throw new PluginError(
+      'EMPTY_ANSWER',
+      `模型服务未返回回答正文（结束状态：${finish?.kind ?? '未收到结束事件'}）。请重试或切换模型；若持续出现，请检查模型服务连接。`,
+      502,
+    )
   }
   return {
     ok: true,
     answer: text,
+    truncated: finish?.kind === 'max-tokens',
     provider: selection.provider,
     model: selection.model,
     reasoningEffort: selection.reasoningEffort,

@@ -1035,6 +1035,164 @@ export const CSS = String.raw`
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
   pointer-events: none;
 }
+.pmr-fig-editor {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+.pmr-fig-editor-box {
+  position: absolute;
+  border: 1.5px solid var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);
+  box-shadow: 0 0 0 9999px rgba(15, 23, 42, .22);
+  cursor: move;
+  touch-action: none;
+  pointer-events: auto;
+}
+.pmr-fig-editor-handle {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 1.5px solid var(--dsw-alias-brand-primary);
+  border-radius: 2px;
+  background: #fff;
+  pointer-events: auto;
+  touch-action: none;
+}
+.pmr-fig-editor-actions {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, .22);
+  pointer-events: auto;
+  white-space: nowrap;
+}
+.pmr-fig-editor-actions .pmr-btn { height: 24px; padding: 0 9px; font-size: 10.5px; }
+.pmr-fig-editor-hint { color: var(--dsw-alias-label-secondary); font-size: 9.5px; }
+.pmr-figure-viewer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(15, 23, 42, .7);
+}
+.pmr-viewer-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(96vw, 1520px);
+  height: min(93vh, 1040px);
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-overlay);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .4);
+}
+.pmr-viewer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.pmr-viewer-title { flex: 0 0 auto; font-size: 11.5px; font-weight: 650; white-space: nowrap; }
+.pmr-viewer-caption {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+}
+.pmr-viewer-tools {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-left: auto;
+}
+.pmr-viewer-tools button {
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.pmr-viewer-tools button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-viewer-tools button.is-active {
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+.pmr-viewer-tools .pmr-viewer-percent {
+  min-width: 48px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.pmr-viewer-stage {
+  position: relative;
+  flex: 1 1 auto;
+  overflow: hidden;
+  background: #fff;
+  cursor: grab;
+  touch-action: none;
+}
+.pmr-viewer-stage.is-panning { cursor: grabbing; }
+.pmr-viewer-image {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+.pmr-viewer-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  color: #64748b;
+  font-size: 11px;
+  pointer-events: none;
+}
+.pmr-viewer-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+}
+.pmr-viewer-angle { font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) {
+  .pmr-figure-viewer-overlay { padding: 0; }
+  .pmr-viewer-panel { width: 100vw; height: 100vh; border-radius: 0; }
+  .pmr-viewer-caption { display: none; }
+  .pmr-fig-editor-hint { display: none; }
+}
 .pmr-eq-modal {
   position: fixed;
   inset: 0;

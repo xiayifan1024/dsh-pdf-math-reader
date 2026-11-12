@@ -46,6 +46,9 @@ const PATHS = {
   search: ['M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14z', 'M16 16l4.5 4.5'],
   quote: ['M7 7h4v4H7z', 'M13 7h4v4h-4z', 'M7 11v4a2 2 0 0 0 2 2', 'M13 11v4a2 2 0 0 0 2 2'],
   crop: ['M4 4h5', 'M15 4h5', 'M4 20h5', 'M15 20h5', 'M4 9v6', 'M20 9v6'],
+  table: ['M4 5h16v14H4z', 'M4 10h16', 'M10 10v9', 'M15 10v9'],
+  rotateLeft: ['M20 12a8 8 0 1 1-2.3-5.7', 'M20 4v5h-5'],
+  rotateRight: ['M4 12a8 8 0 1 0 2.3-5.7', 'M4 4v5h5'],
   expand: ['M4 9V4h5', 'M20 9V4h-5', 'M4 15v5h5', 'M20 15v5h-5'],
   columns: ['M4 4h16v16H4z', 'M12 4v16'],
 }

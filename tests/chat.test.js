@@ -2,6 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { chatPrompt, normalizeHistory } from '../lib/chat.js'
 
+test('continuations receive the end of a long assistant answer', () => {
+  const content = 'Beginning'.repeat(500) + 'The actual stopping point'
+  const [entry] = normalizeHistory([{ role: 'assistant', content }])
+  assert.equal(entry.content.length, 2400)
+  assert.ok(entry.content.endsWith('The actual stopping point'))
+})
+
 test('normalizes history roles, empties and length', () => {
   const history = normalizeHistory([
     { role: 'user', content: '  hello  ' },

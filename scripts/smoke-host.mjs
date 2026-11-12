@@ -61,8 +61,20 @@ const ctx = {
           }
           const prompt = options.messages[0].content[0].text
           if (prompt.includes('research assistant')) {
+            assert.equal(
+              options.maxTokens,
+              prompt.includes('__BUDGET__') ? 16384 : prompt.includes('__MAXBUDGET__') ? 65536 : 8192,
+            )
+            if (prompt.includes('__EMPTY_LIMIT__')) {
+              yield { type: 'finish', reason: { kind: 'max-tokens' } }
+              return
+            }
+            if (prompt.includes('__EMPTY_STOP__')) {
+              yield { type: 'finish', reason: { kind: 'stop' } }
+              return
+            }
             yield { type: 'text-delta', index: 0, text: 'The paper proposes a new method.' }
-            yield { type: 'finish', reason: { kind: 'stop' } }
+            yield { type: 'finish', reason: { kind: prompt.includes('__TRUNCATED__') ? 'max-tokens' : 'stop' } }
             return
           }
           assert.ok(prompt.includes('Translate every segment'))
@@ -437,6 +449,36 @@ try {
   const chatBody = await chat.json()
   assert.equal(chatBody.ok, true)
   assert.ok(chatBody.answer.length > 0)
+  assert.equal(chatBody.truncated, false)
+
+  const truncatedChat = await fetch(`${origin}/pdf-reader/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ question: '__TRUNCATED__', context: 'Paper context.' }),
+  })
+  assert.equal(truncatedChat.status, 200)
+  const truncatedBody = await truncatedChat.json()
+  assert.equal(truncatedBody.truncated, true)
+  assert.equal(truncatedBody.answer, 'The paper proposes a new method.')
+
+  for (const [question, code] of [['__EMPTY_LIMIT__', 'CHAT_REASONING_LIMIT'], ['__EMPTY_STOP__', 'EMPTY_ANSWER']]) {
+    const response = await fetch(`${origin}/pdf-reader/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ question, context: 'Paper context.' }),
+    })
+    assert.equal(response.status, 502)
+    assert.ok((await response.text()).includes(code))
+  }
+
+  for (const [question, maxTokens] of [['__BUDGET__', 16384], ['__MAXBUDGET__', 65536], ['invalid budget', 999999]]) {
+    const response = await fetch(`${origin}/pdf-reader/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ question, maxTokens, context: 'Paper context.' }),
+    })
+    assert.equal(response.status, 200, await response.text())
+  }
 
   const selectedChat = await fetch(`${origin}/pdf-reader/api/chat`, {
     method: 'POST',

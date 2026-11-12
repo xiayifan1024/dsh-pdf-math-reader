@@ -122,22 +122,33 @@ The image above is the actual crop produced from `tests/fixtures/attention.pdf`:
 the `T` and `d_k` scripts in equation (1) are not clipped, the scripts in equation (2) are complete,
 and the equation number is shown separately in the card title.
 
-### Figures
+### Figures and tables
 
-- Figures are detected from the page's **drawing operations**, not from its text: raster image
-  XObjects and dense vector paths define the artwork region. Table rules, icons and full-page scans
-  are not treated as figures.
+- Figures and tables are classified separately. Figures come from the page's **drawing
+  operations** (raster images and dense vector paths); tables also use the "Table N" caption,
+  rules, column alignment and row spacing. Booktabs tables (rules only), captioned coloured
+  headers (fill only) and **text-only tables** all become a "Table N" card instead of a
+  header-only crop.
+- A table crop grows over its data rows, keeping header, row labels and data together. Table
+  captions and notes stay translatable body paragraphs.
 - In-figure text is attributed by **visual row**: a row whose text mostly falls inside the artwork
   (or sits right above/below it as a panel title) becomes one of that figure's labels. Captions
-  (`Figure 1:` / `Fig. 1`) stay translatable body paragraphs.
+  (`Figure 1:` / `Fig. 1` / `Table 2:`) never become labels.
 - Figure labels no longer become body paragraphs, and annotation rows such as `Input → Output` are
   no longer detected as display equations.
-- Each figure is one card: a high-resolution crop, its number (from the nearest caption) and a
-  collapsed list of its labels, so labels do not pile up in the translation pane.
+- Each figure is one card: a high-resolution crop, its figure/table number and a collapsed list of
+  its labels, so labels do not pile up in the translation pane.
 - Clicking the card or the label area on the page locates and highlights the artwork; long figures
-  scroll horizontally and can be viewed enlarged.
-- A false positive can be dismissed with **Not a figure**, which returns its text to the body flow.
-  Corrections persist per **document fingerprint + page number**, and auto-detection can be restored.
+  scroll horizontally.
+- **Zoom** is now a full-window viewer: a fresh high-resolution crop, 90° rotation both ways,
+  zoom, drag-to-pan, **Fit whole / Fit width** and reset. Its rotation is local to the viewer and
+  never changes the page's reading direction; closing returns to the same reading position.
+- The toolbar's **Select figure** draws a complete figure/table region (auto-scrolling at the
+  window edge, snapping to text-line edges). **Adjust bounds** on a card provides eight handles;
+  saving updates the card, the viewer and exported images.
+- A false positive can be dismissed with **Not a figure**, returning its text to the body flow.
+  Manual regions and bounds persist per **document fingerprint + page number**. Each correction can
+  be restored individually, and the whole page can be reset to auto-detection.
 
 <p align="center">
   <img src="docs/figures-preview.png" alt="Attention paper Figure 3 detected as one figure block, its labels collapsed into a list, with the caption still a translatable paragraph" width="46%">
@@ -190,13 +201,27 @@ and the caption remains a normal translatable paragraph.
 
 ### Installing in DSH
 
+`--profile` is the profile you actually boot. A profile name is a directory under
+`~/.dsh/profiles/` (`%USERPROFILE%\.dsh\profiles\` on Windows):
+
+| How you start DSH | What `--profile` takes |
+|---|---|
+| DSH Desktop app | `desktop` |
+| `dsh web` on the command line | `web` |
+| Keeping the reader separate from your daily setup | any name, e.g. `reader`, then start with `dsh --profile reader web` |
+
+The plugin only loads in the profile it was installed into: installed into `web`, it will not appear
+in the desktop app, and vice versa. The name in the command must match the name you start DSH with.
+If you are unsure which profiles exist, list that directory.
+
 Installing directly from GitHub is recommended:
 
 ```bash
-dsh plugin --profile <your profile> add github:xiayifan1024/dsh-pdf-math-reader
+dsh plugin --profile desktop add github:xiayifan1024/dsh-pdf-math-reader
 ```
 
-You can also clone the repository and install the local bundle:
+You can also clone the repository and install the local bundle (the in-app Plugin Manager acts on the
+running profile, so there is no profile name to pass):
 
 ```text
 plugin_manager install_bundle target=<absolute path to this repository>
@@ -218,6 +243,48 @@ GET /pdf-reader/api/health
 ```
 
 to confirm the model service, provider, model and request limits.
+
+### Updating
+
+How you update depends on how the plugin was installed: a `github:` source pins an exact commit in
+the lockfile, so a plain `pnpm install` never re-resolves it; a `link:` source points at a local
+directory and has no version to resolve.
+
+**Installed from GitHub** — re-resolve the dependency in the same profile:
+
+```bash
+dsh plugin --profile desktop update dsh-pdf-math-reader
+```
+
+You can also reinstall with an explicit tag (changing the tag is also how you roll back):
+
+```bash
+dsh plugin --profile desktop add github:xiayifan1024/dsh-pdf-math-reader#v1.5.0
+```
+
+Do not rely on `dsh plugin --profile desktop install` alone: when the specifier is unchanged, pnpm
+answers `Lockfile is up to date`, the locked commit stays put, and the old code keeps loading.
+
+**Installed from a local directory (`link:`)** — rebuild, no reinstall needed:
+
+```bash
+npm run build
+```
+
+**Installed with the in-app Plugin Manager** — follow its own advice for third-party plugins and
+reinstall: `remove_bundle`, then `install_bundle` with the same target (the manager offers in-place
+Update only for Official entries). `list_bundles` shows which version is installed.
+
+Confirm the update took effect:
+
+- Host-half changes (`index.js`, `lib/`) need a **DSH restart**; `client.js`-only changes need a hard
+  refresh (`Ctrl+Shift+R`).
+- `GET /pdf-reader/api/health` returns the `version` the Host half is running.
+- To prove the GitHub source really moved, check the `codeload.github.com/…/tar.gz/<commit>` commit
+  in `~/.dsh/profiles/<profile>/pnpm-lock.yaml`.
+
+Uninstall with `dsh plugin --profile desktop remove dsh-pdf-math-reader`, which drops the dependency
+and the `dsh.profile.bundles` entry together, or use `remove_bundle` in the Plugin Manager.
 
 ### Usage
 
@@ -257,7 +324,7 @@ config:
   cacheEntries: 600
   chatMaxChars: 24000
   chatTimeoutMs: 150000
-  chatMaxTokens: 2048
+  chatMaxTokens: 8192
 ```
 
 | Field | Default | Description |
@@ -270,8 +337,8 @@ config:
 | `timeoutMs` | `180000` | Translation request timeout (ms) |
 | `cacheEntries` | `600` | Number of translation results kept in memory |
 | `chatMaxChars` | `24000` | Maximum AI reading context characters |
-| `chatTimeoutMs` | `150000` | AI reading request timeout (ms) |
-| `chatMaxTokens` | `2048` | Maximum output tokens for AI reading |
+| `chatTimeoutMs` | `150000` | Minimum wait for an AI reading answer; grows with the output budget (15-minute ceiling) |
+| `chatMaxTokens` | `8192` | Default output tokens when an AI reading request has no valid answer-length selection; readers can choose 2048–65536 in settings, including values above this configuration |
 
 `maxSegmentsPerRequest` and `maxCharsPerRequest` are lowered by the bundled `cordis.patch.yml`;
 without that patch the code fallbacks are `6` and `4200`.
@@ -523,14 +590,15 @@ Figure detection on the same sample:
 |---:|---|---|
 | 3 | Transformer architecture (one full raster image) | 1 figure, number 1, 0 labels (its text is rasterised) |
 | 4 | Scaled Dot-Product / Multi-Head Attention diagrams | 2 figures, both numbered 2; each panel title is a label |
-| 8 | Tables 2/3 | 0 figures (table rules do not qualify as vector artwork) |
+| 6 | Table 1 (text-only, no artwork) | 1 "Table 1" card; header and data rows are cropped together, the caption stays translatable |
+| 8 | Table 2 (text-only, spans two columns) | 1 "Table 2" card with 13 table strings; the caption stays translatable |
 | 13 | Attention-visualisation heat map (vector artwork with text along lines) | 1 figure, number 3, 13 label rows; the caption stays a translatable paragraph |
 | 14 / 15 | Two attention-head visualisations | 1 figure each, numbers 4 / 5, 21 label rows each |
 
-The regression suite covers the figure bbox, number, caption retention, labels staying out of body
-paragraphs, arrow annotations staying out of the equation list, and **Not a figure** returning the
-text to the body flow. Vector thresholds were calibrated on this sample and synthetic cases; unusual
-layouts may still need the manual dismissal.
+The regression suite covers figure bboxes, figure/table numbers, caption retention, labels staying
+out of body paragraphs, arrow annotations staying out of the equation list, table growth, manual
+selection/replacement, and **Not a figure** returning the text to the body flow. Thresholds were
+calibrated on this sample and synthetic cases; unusual layouts may still need manual correction.
 
 ## Limitations and roadmap
 
@@ -542,12 +610,16 @@ layouts may still need the manual dismissal.
 - The boundary between inline math and body text, including baselines and line breaks, is the next
   task; display equations and placeholder validation are prioritised for now.
 - Automatic detection is heuristic and needs evaluation on more papers. Manual correction is
-  available through **Select equation**, **Not an equation**, **Not a figure** and **Restore
-  auto-detection**.
-- Figure labels are kept as reference text and are not translated; captions are translated as body
-  paragraphs. Figure regions whose artwork is only thin strokes without a caption may be missed.
-- Scanned PDFs without a text layer are not OCR'd; the page reports that no text was found.
-- Two-column and multi-column layouts use heuristic reconstruction; unusual layouts may need manual
+  available through **Select equation**, **Select figure**, **Adjust bounds**, **Not an equation**,
+  **Not a figure** and **Restore auto-detection**.
+- Table detection handles coloured headers, rule-based tables, grids and text-only tables;
+  continued tables across pages are cropped per page and not merged yet.
+- Figure labels and table cells are kept as reference text and are not translated; figure and table
+  captions are translated as body paragraphs.
+- Scanned PDFs without a text layer are not OCR'd; the page reports that no text was found, and a
+  table can still be captured with **Select figure**.
+- Page-level rotation is not implemented yet; this release provides rotation inside the viewer only.
+  Two-column and multi-column layouts use heuristic reconstruction; unusual layouts may need manual
   paragraph-boundary fixes.
 - AI conversations live in the current document session and reset when the document changes; notes,
   glossary and equation corrections persist in browser storage.
@@ -558,7 +630,8 @@ layouts may still need the manual dismissal.
 
 **The "PDF reader" icon is missing after installation.**  
 Refresh the Web UI or reopen the panel, and confirm that `plugin_manager install_bundle` returned
-`application: applied`.
+`application: applied`. Also confirm the plugin went into the profile you actually boot
+(see [Installing in DSH](#installing-in-dsh)).
 
 **"Rendering page…" appears while paging.**  
 That is a normal page-rendering indicator, not a model request. The model is only called for
@@ -567,6 +640,13 @@ translation, AI Q&A and the health check when the panel opens.
 **The model is unavailable / translation fails.**  
 Check `llm`, `provider` and `model` in the `/pdf-reader/api/health` response, make sure the current
 profile has a signed-in model available, or override `provider` / `model` in the configuration.
+
+**The AI reading answer is empty or cut off.**
+
+The output budget covers thinking plus the answer: at a higher reasoning effort thinking can consume
+all of it, so the 2048 / 4096 steps often return no text at all. Raise **Answer length limit** to
+16384 or more, or lower the reasoning effort; the 65,536 step is meant for full-paper deep reads, and
+the wait limit grows with the budget automatically.
 
 **A scanned PDF has no text.**  
 This version does not do OCR; the page reports that no text was found. OCR support is tracked on the

@@ -16,6 +16,7 @@ import {
 } from './equations.js'
 import {
   assignFigureLabels,
+  classifyRegions,
   collectFigureRegions,
   detectFigureRegions,
 } from './figures.js'
@@ -251,14 +252,49 @@ export function drawPdfRaster(canvas, image, width, height, signal) {
 }
 
 /**
+ * Map a canonical scale-1 box (intrinsic page orientation) into a viewport that
+ * carries an extra reading rotation. Rotations are multiples of 90 degrees, so
+ * the result stays axis-aligned.
+ */
+export function rotateRegionBox(page, bbox, rotationDelta = 0) {
+  const delta = ((Math.round(rotationDelta / 90) * 90) % 360 + 360) % 360
+  if (delta === 0 || typeof page?.getViewport !== 'function') {
+    return { box: [bbox[0], bbox[1], bbox[2], bbox[3]], rotation: undefined }
+  }
+  const intrinsic = Number.isFinite(page?.rotate) ? page.rotate : 0
+  const targetRotation = ((intrinsic + delta) % 360 + 360) % 360
+  const base = page.getViewport({ scale: 1 })
+  const rotated = page.getViewport({ scale: 1, rotation: targetRotation })
+  const corners = [
+    [bbox[0], bbox[1]],
+    [bbox[2], bbox[1]],
+    [bbox[0], bbox[3]],
+    [bbox[2], bbox[3]],
+  ]
+  const points = corners.map(([x, y]) =>
+    rotated.convertToViewportPoint(base.convertToPdfPoint(x, y)),
+  )
+  const xs = points.map((point) => point[0])
+  const ys = points.map((point) => point[1])
+  return {
+    box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+    rotation: targetRotation,
+  }
+}
+
+/**
  * Render an equation region from an independently rendered page canvas.
  *
  * The crop never depends on the reader's visible canvas or current zoom. It is
  * sized from the requested display width and device pixel ratio, then clamped
  * by a pixel budget so a very large region cannot exhaust browser memory.
+ *
+ * `options.rotation` adds a viewer-only rotation (0/90/180/270) on top of the
+ * page's intrinsic `/Rotate`, without touching the reader's page orientation.
  */
 export async function renderEquationCrop(page, bbox, options = {}, signal) {
-  const metrics = cropMetrics(bbox, options)
+  const target = rotateRegionBox(page, bbox, options.rotation)
+  const metrics = cropMetrics(target.box, options)
   const canvas = document.createElement('canvas')
   canvas.width = metrics.pixelWidth
   canvas.height = metrics.pixelHeight
@@ -268,11 +304,13 @@ export async function renderEquationCrop(page, bbox, options = {}, signal) {
   context.fillRect(0, 0, canvas.width, canvas.height)
   // Shift the viewport by the crop origin. The offset is in device pixels and
   // therefore also correct for rotated pages.
-  const viewport = page.getViewport({
+  const viewportOptions = {
     scale: metrics.renderScale,
-    offsetX: -bbox[0] * metrics.renderScale,
-    offsetY: -bbox[1] * metrics.renderScale,
-  })
+    offsetX: -target.box[0] * metrics.renderScale,
+    offsetY: -target.box[1] * metrics.renderScale,
+  }
+  if (target.rotation !== undefined) viewportOptions.rotation = target.rotation
+  const viewport = page.getViewport(viewportOptions)
   const task = page.render({ canvasContext: context, viewport })
   const cancel = () => task.cancel()
   if (signal !== undefined) {
@@ -397,7 +435,12 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
   const bodyFont = options.bodyFont ?? dominantFont(atoms)
   const bodySize = options.bodySize ?? bodyFontSize(atoms)
   const resolvedFigures = resolveFigureRegions(options, pageWidth, pageHeight)
-  const figureRegions = resolvedFigures.regions
+  const figureRegions = classifyRegions(atoms, resolvedFigures.regions, {
+    bodySize,
+    pageWidth,
+    pageHeight,
+    removed: options.overrides?.figures,
+  })
   const figureInfo = assignFigureLabels(atoms, figureRegions, { bodySize })
   const contentAtoms = atoms.filter((atom) => !figureInfo.atomIds.has(atom.index))
   const analysis = analyzeEquations(contentAtoms, {
@@ -707,16 +750,19 @@ export function buildPageModel(library, textContent, viewport, options = {}) {
     figureBlocks.push({
       id: `${pageKey}-figure${index + 1}`,
       type: 'figure',
+      kind: figure.kind ?? 'figure',
       pageIndex,
       bbox: figure.bbox,
       imageBbox: figure.imageBbox,
-      figureNumber: figure.number,
+      figureNumber: figure.kind === 'table' ? null : figure.number,
+      tableNumber: figure.kind === 'table' ? figure.number : null,
       caption: figure.caption?.text ?? null,
       captionBbox: figure.caption?.bbox ?? null,
       labels: figure.labels.map((line) => ({ text: line.text, bbox: line.bbox })),
       labelCount: figure.labels.length,
       source: figure.source,
-      detectionSource: 'automatic',
+      manualId: figure.manualId ?? null,
+      detectionSource: figure.source === 'manual' ? 'manual' : 'automatic',
       text: figure.labels.map((line) => line.text).join(' ') || figure.caption?.text || '',
       order,
     })
@@ -774,13 +820,36 @@ function resolveFigureRegions(options, pageWidth, pageHeight) {
   }
   const detected = regions
   const removed = Array.isArray(options.overrides?.figures) ? options.overrides.figures : []
-  const filtered =
+  let filtered =
     removed.length === 0
-      ? detected
+      ? [...detected]
       : detected.filter(
           (region) =>
             !removed.some((box) => Array.isArray(box) && overlapRatio(box, region.bbox) > 0.3),
         )
+  // Manual regions replace the automatic region they were drawn over (when the
+  // entry carries a `replaces` box) and otherwise add a new figure. They are
+  // re-applied on every model build, so undo is simply dropping the entry.
+  const manual = Array.isArray(options.overrides?.manualFigures)
+    ? options.overrides.manualFigures
+    : []
+  for (const entry of manual) {
+    if (!Array.isArray(entry?.bbox) || entry.bbox.length !== 4) continue
+    const bbox = entry.bbox.map(Number)
+    if (!bbox.every(Number.isFinite)) continue
+    if (Array.isArray(entry.replaces)) {
+      filtered = filtered.filter(
+        (region) => overlapRatio(entry.replaces, region.bbox) <= 0.3,
+      )
+    }
+    filtered.push({
+      bbox,
+      source: 'manual',
+      manualId: typeof entry.id === 'string' ? entry.id : null,
+      replaces: Array.isArray(entry.replaces) ? entry.replaces : null,
+    })
+  }
+  filtered.sort((left, right) => left.bbox[1] - right.bbox[1] || left.bbox[0] - right.bbox[0])
   return { regions: filtered, raw: detected }
 }
 
