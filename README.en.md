@@ -143,6 +143,18 @@ and the equation number is shown separately in the card title.
 - **Zoom** is now a full-window viewer: a fresh high-resolution crop, 90° rotation both ways,
   zoom, drag-to-pan, **Fit whole / Fit width** and reset. Its rotation is local to the viewer and
   never changes the page's reading direction; closing returns to the same reading position.
+- Both the figure card and the **Zoom** viewer export PNG at 300 dpi (default) or 600 dpi,
+  or an image-only PDF rendered at 600 dpi. The crop includes axis labels and legends within
+  the figure bounds. Exports render independently from the opened document, preserving viewer
+  rotation without depending on window size or zoom.
+- Image-only PDFs embed only the rendered crop, without hidden full-page content or editable
+  vectors and text. Encrypted PDFs already unlocked in the reader use the same rendering path
+  without asking for the password again.
+- Filenames include the document name, page and figure/table number. Repeated or missing numbers
+  on figures and equations receive ordinals in display order. Format selection supports keyboard
+  controls; closing the viewer cancels an unfinished export.
+- Both PNG and image-only PDF rendering are limited to 32 million pixels and 8192 pixels per side,
+  so oversized crops may use a lower resolution. Existing raster images cannot gain detail.
 - The toolbar's **Select figure** draws a complete figure/table region (auto-scrolling at the
   window edge, snapping to text-line edges). **Adjust bounds** on a card provides eight handles;
   saving updates the card, the viewer and exported images.
@@ -515,6 +527,7 @@ src/plugin.jsx           Main panel, reader, equation blocks, notes and AI readi
 src/pdf.js               PDF.js loading, text reconstruction, equation crops, thumbnails, outline
 src/equations.js         Equation region detection, bbox/crop sizing, manual correction merging
 src/figures.js           Figure region detection (images/vector paths), label attribution, captions
+src/figure-export.js     Crop export filenames, DPI options and image-only PDF creation
 src/references.js        Reference-section lookup, numbered entry splitting and continuation joining
 src/search.js            Full-text keyword matching, snippets and hit-rectangle mapping
 src/reading-position.js  Per-document last-read-page storage and restoration
@@ -546,6 +559,7 @@ Test coverage:
 - Manual correction: deleting an automatic equation, re-boxing a region and restoring the original
   text items.
 - Equation crop sizing: DPR, maximum pixel budget and the long-edge limit.
+- Figure saving: filename sanitizing and duplicate ordinals, 300/600 dpi crop options, image-only PDF output, cancellation and rotated box mapping.
 - Central directory and local blocks of the Markdown + images ZIP.
 - Host routes, strict translation JSON parsing, skill loading, asset path traversal and
   client-disconnect cancellation.

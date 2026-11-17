@@ -57,7 +57,8 @@
     "test": "node --test && node scripts/smoke-host.mjs && node scripts/smoke-artifact.mjs && node scripts/smoke-text.mjs"
   },
   "devDependencies": {
-    "esbuild": "0.25.5"
+    "esbuild": "0.25.5",
+    "pdf-lib": "^1.17.1"
   },
   "engines": {
     "node": ">=18"

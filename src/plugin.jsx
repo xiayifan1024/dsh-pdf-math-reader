@@ -32,6 +32,7 @@ import {
 import { overlapRatio } from './equations'
 import { composeReading } from './article'
 import { collectFigureRegions } from './figures'
+import { exportImagePdf, exportOrdinals, saveFileName, saveRenderOptions } from './figure-export'
 import {
   createPageCaches,
   disposeCaches,
@@ -364,6 +365,62 @@ function downloadBlob(content, filename, type) {
   anchor.click()
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 1500)
+}
+
+function ImageExport({ tt, pdf, pageIndex, bbox, saveName, rotation = 0, onNotify }) {
+  const [format, setFormat] = useState('300')
+  const [saving, setSaving] = useState(false)
+  const exportAbortRef = useRef(null)
+  useEffect(() => {
+    setSaving(false)
+    return () => exportAbortRef.current?.abort()
+  }, [pdf, pageIndex, bbox, rotation])
+  const save = async () => {
+    if (exportAbortRef.current && !exportAbortRef.current.signal.aborted) return
+    const controller = new AbortController()
+    exportAbortRef.current = controller
+    const { signal } = controller
+    setSaving(true)
+    try {
+      const filename = format === 'pdf' ? saveName.replace(/\.png$/i, '.pdf') : saveName
+      const page = await pdf.getPage(pageIndex + 1)
+      signal.throwIfAborted()
+      const result = await renderEquationCrop(page, bbox,
+        saveRenderOptions(format === 'pdf' ? 600 : Number(format), rotation), signal)
+      signal.throwIfAborted()
+      if (!result.dataUrl?.startsWith('data:image/png')) throw new Error('Empty crop')
+      if (format === 'pdf') {
+        const bytes = await exportImagePdf(result, bbox, rotation, signal)
+        signal.throwIfAborted()
+        downloadBlob(bytes, filename, 'application/pdf')
+      } else {
+        downloadBlob(dataUrlToBytes(result.dataUrl), filename, 'image/png')
+      }
+      onNotify?.(tt('toast.imageSaved', { name: filename }))
+    } catch (error) {
+      if (!signal.aborted && !isAbort(error)) onNotify?.(tt('toast.imageSaveFailed'), 'error')
+    } finally {
+      if (exportAbortRef.current === controller) {
+        exportAbortRef.current = null
+        if (!signal.aborted) setSaving(false)
+      }
+    }
+  }
+  return (
+    <span className="pmr-image-export">
+      <select aria-label={tt('image.format')} title={tt('image.qualityHint')}
+        value={format} onChange={(event) => setFormat(event.target.value)} disabled={saving}>
+        <option value="300">PNG · 300 dpi</option>
+        <option value="600">PNG · 600 dpi</option>
+        <option value="pdf">{tt('image.imagePdf')}</option>
+      </select>
+      <button type="button" onClick={save} disabled={saving}
+        title={tt(saving ? 'image.saving' : 'image.save')}
+        aria-label={tt(saving ? 'image.saving' : 'image.save')}>
+        {saving ? <span className="pmr-spinner" /> : <Icon name="download" size={12} />}
+      </button>
+    </span>
+  )
 }
 
 function escapeHtml(value) {
@@ -1441,7 +1498,18 @@ function useElementSize(ref) {
  * zooming never has to stretch the sidebar thumbnail. Rotation is local to the
  * viewer and never touches the page's reading direction.
  */
-function RegionViewer({ tt, pdf, pageIndex, bbox, label, caption, preview, onClose }) {
+function RegionViewer({
+  tt,
+  pdf,
+  pageIndex,
+  bbox,
+  label,
+  caption,
+  preview,
+  saveName,
+  onNotify,
+  onClose,
+}) {
   const stageRef = useRef(null)
   const closeRef = useRef(null)
   const dragRef = useRef(null)
@@ -1545,6 +1613,9 @@ function RegionViewer({ tt, pdf, pageIndex, bbox, label, caption, preview, onClo
     document.body.style.overflow = 'hidden'
     closeRef.current?.focus?.()
     const onKeyDown = (event) => {
+      // Native controls own their keys. The reader already ignores editable
+      // targets, so allow select arrows and type-ahead to reach the control.
+      if (event.key !== 'Escape' && isEditableTarget(event.target)) return
       // The viewer owns the keyboard while it is open; otherwise the reader's
       // page-turn shortcuts would fire underneath it.
       event.stopPropagation()
@@ -1727,6 +1798,8 @@ function RegionViewer({ tt, pdf, pageIndex, bbox, label, caption, preview, onClo
             >
               <Icon name="refresh" size={14} />
             </button>
+            {saveName && <ImageExport tt={tt} pdf={pdf} pageIndex={pageIndex}
+              bbox={bbox} rotation={rotation} saveName={saveName} onNotify={onNotify} />}
             <button
               ref={closeRef}
               type="button"
@@ -1947,6 +2020,7 @@ function EquationBlock({
   tt,
   equation,
   pdf,
+  documentName,
   fingerprint,
   pageIndex,
   cache,
@@ -1955,6 +2029,8 @@ function EquationBlock({
   onLocate,
   onRemove,
   onCopy,
+  onNotify,
+  saveOrdinal = 0,
 }) {
   const [zoomOpen, setZoomOpen] = useState(false)
   const cropBbox = equation.imageBbox ?? equation.bbox
@@ -1983,6 +2059,13 @@ function EquationBlock({
     equation.equationNumber === null || equation.equationNumber === undefined
       ? tt('equation.unnumbered')
       : tt('equation.numbered', { number: equation.equationNumber })
+  const saveName = saveFileName({
+    documentName,
+    pageIndex,
+    kind: 'equation',
+    ordinal: saveOrdinal,
+    number: equation.equationNumber,
+  })
 
   return (
     <section
@@ -2078,6 +2161,8 @@ function EquationBlock({
           label={label}
           caption={equation.text}
           preview={image.status === 'ready' ? image.dataUrl : ''}
+          saveName={saveName}
+          onNotify={onNotify}
           onClose={() => setZoomOpen(false)}
         />
       )}
@@ -2096,6 +2181,7 @@ function FigureBlock({
   tt,
   figure,
   pdf,
+  documentName,
   fingerprint,
   pageIndex,
   cache,
@@ -2106,10 +2192,12 @@ function FigureBlock({
   onAdjust,
   onRestore,
   onCopy,
+  onNotify,
+  saveOrdinal = 0,
 }) {
   const [zoomOpen, setZoomOpen] = useState(false)
   const isTable = figure.kind === 'table'
-  const cropBbox = figure.imageBbox ?? figure.bbox
+  const cropBbox = figure.bbox
   const bboxWidth = Math.max(1, cropBbox[2] - cropBbox[0])
   const displayWidth = Math.min(isTable ? 960 : 760, Math.max(160, bboxWidth * 1.7))
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5)
@@ -2140,6 +2228,13 @@ function FigureBlock({
       : tt('figure.numbered', { number: figure.figureNumber })
   const labels = Array.isArray(figure.labels) ? figure.labels : []
   const labelText = labels.map((line) => line.text).join('\n')
+  const saveName = saveFileName({
+    documentName,
+    pageIndex,
+    kind: isTable ? 'table' : 'figure',
+    number: isTable ? figure.tableNumber : figure.figureNumber,
+    ordinal: saveOrdinal,
+  })
 
   return (
     <section className={`pmr-eq-card pmr-fig-card ${active ? 'is-active' : ''}`} aria-label={label}>
@@ -2184,6 +2279,8 @@ function FigureBlock({
           >
             <Icon name="expand" size={12} />
           </button>
+          <ImageExport tt={tt} pdf={pdf} pageIndex={pageIndex} bbox={cropBbox}
+            saveName={saveName} onNotify={onNotify} />
           <button
             type="button"
             className="pmr-eq-remove"
@@ -2261,10 +2358,12 @@ function FigureBlock({
           tt={tt}
           pdf={pdf}
           pageIndex={pageIndex}
-          bbox={figure.bbox}
+          bbox={cropBbox}
           label={label}
           caption={figure.caption ?? ''}
           preview={image.status === 'ready' ? image.dataUrl : ''}
+          saveName={saveName}
+          onNotify={onNotify}
           onClose={() => setZoomOpen(false)}
         />
       )}
@@ -2494,6 +2593,7 @@ export function PdfReaderPage({ t }) {
     [pageModel],
   )
   const readingBlocks = reading.blocks
+  const saveOrdinals = useMemo(() => exportOrdinals(readingBlocks), [readingBlocks])
   const readingUnits = reading.units
   const unitById = useMemo(
     () => new Map(readingUnits.map((unit) => [unit.id, unit])),
@@ -5080,7 +5180,7 @@ export function PdfReaderPage({ t }) {
       }
       for (const block of pageBlocks) {
         try {
-          const cropBox = block.imageBbox ?? block.bbox
+          const cropBox = block.type === 'figure' ? block.bbox : block.imageBbox ?? block.bbox
           const result = await renderEquationCrop(pdfPage, cropBox, {
             displayWidth: Math.min(
               1400,
@@ -6426,6 +6526,7 @@ ${body}
                             tt={tt}
                             equation={block}
                             pdf={doc.pdf}
+                            documentName={doc.name}
                             fingerprint={docFingerprint}
                             pageIndex={pageIndex}
                             cache={equationImageCacheRef}
@@ -6434,6 +6535,8 @@ ${body}
                             onLocate={focusEquation}
                             onRemove={removeEquation}
                             onCopy={copyText}
+                            onNotify={notify}
+                            saveOrdinal={saveOrdinals.get(block.id) ?? 0}
                           />
                         )
                       }
@@ -6444,6 +6547,7 @@ ${body}
                             tt={tt}
                             figure={block}
                             pdf={doc.pdf}
+                            documentName={doc.name}
                             fingerprint={docFingerprint}
                             pageIndex={pageIndex}
                             cache={equationImageCacheRef}
@@ -6454,6 +6558,8 @@ ${body}
                             onAdjust={beginFigureEdit}
                             onRestore={restoreFigure}
                             onCopy={copyText}
+                            onNotify={notify}
+                            saveOrdinal={saveOrdinals.get(block.id) ?? 0}
                           />
                         )
                       }

@@ -959,7 +959,19 @@ export const CSS = String.raw`
   border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);
 }
-.pmr-eq-actions { margin-left: auto; display: inline-flex; gap: 1px; }
+.pmr-eq-actions { margin-left: auto; display: inline-flex; gap: 1px; flex-wrap: wrap; justify-content: flex-end; }
+.pmr-image-export { display: inline-flex; align-items: center; gap: 2px; }
+.pmr-image-export select {
+  max-width: 140px;
+  min-width: 0;
+  height: 24px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 4px;
+}
 .pmr-eq-actions button {
   width: 22px;
   height: 22px;
@@ -1139,6 +1151,7 @@ export const CSS = String.raw`
   cursor: pointer;
 }
 .pmr-viewer-tools button:hover { background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.pmr-viewer-tools button:disabled { opacity: .35; cursor: default; }
 .pmr-viewer-tools button.is-active {
   border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 40%, var(--dsw-alias-border-l1));
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);

@@ -271,9 +271,10 @@ export function rotateRegionBox(page, bbox, rotationDelta = 0) {
     [bbox[0], bbox[3]],
     [bbox[2], bbox[3]],
   ]
-  const points = corners.map(([x, y]) =>
-    rotated.convertToViewportPoint(base.convertToPdfPoint(x, y)),
-  )
+  const points = corners.map(([x, y]) => {
+    const [pdfX, pdfY] = base.convertToPdfPoint(x, y)
+    return rotated.convertToViewportPoint(pdfX, pdfY)
+  })
   const xs = points.map((point) => point[0])
   const ys = points.map((point) => point[1])
   return {
@@ -293,6 +294,7 @@ export function rotateRegionBox(page, bbox, rotationDelta = 0) {
  * page's intrinsic `/Rotate`, without touching the reader's page orientation.
  */
 export async function renderEquationCrop(page, bbox, options = {}, signal) {
+  signal?.throwIfAborted()
   const target = rotateRegionBox(page, bbox, options.rotation)
   const metrics = cropMetrics(target.box, options)
   const canvas = document.createElement('canvas')
@@ -322,6 +324,7 @@ export async function renderEquationCrop(page, bbox, options = {}, signal) {
   }
   try {
     await task.promise
+    signal?.throwIfAborted()
   } finally {
     signal?.removeEventListener?.('abort', cancel)
   }

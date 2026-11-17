@@ -928,7 +928,11 @@ export function cropMetrics(bbox, options = {}) {
   const dpr = clamp(Number.isFinite(options.devicePixelRatio) ? options.devicePixelRatio : 1, 1, 4)
   const maxScale = Number.isFinite(options.maxScale) ? options.maxScale : 6
   const maxPixels = Number.isFinite(options.maxPixels) ? options.maxPixels : 4000000
-  let renderScale = Math.max(Math.min(displayScale * dpr, maxScale), 0.6)
+  // Exports request pixels per canonical page point directly; previews retain
+  // their CSS-width/DPR sizing. Both paths share the same memory limits.
+  const requestedScale = Number.isFinite(options.renderScale) && options.renderScale > 0
+    ? options.renderScale : displayScale * dpr
+  let renderScale = Math.max(Math.min(requestedScale, maxScale), 0.6)
   const area = width * height
   if (area * renderScale * renderScale > maxPixels) {
     // The memory budget wins over the readability floor.
